@@ -49,6 +49,15 @@ def _on_gfx1x() -> bool:
     return on_gfx1x()
 
 
+def _on_gfx10x() -> bool:
+    if not current_platform.is_rocm():
+        return False
+
+    from vllm.platforms.rocm import on_gfx10x
+
+    return on_gfx10x()
+
+
 def _on_gfx1151() -> bool:
     if not current_platform.is_rocm():
         return False
@@ -61,6 +70,12 @@ def _on_gfx1151() -> bool:
 # up to 5).  When M is below this AND K*M fits in LDS, the skinny kernel is
 # used; otherwise the Triton prefill path handles the GEMM.
 MAX_SKINNY_BATCH_SIZE = 5
+
+# At and above this M, dequantize to dense and use the vendor GEMM (rocBLAS via
+# torch.nn.functional.linear) instead of the fused Triton kernel. The dequant
+# pass costs ~2.5 bytes/element of traffic, amortized over M rows; the vendor
+# GEMM beats the fused kernel by ~3x at prefill shapes on gfx1030 (T36).
+DENSE_MATMUL_MIN_M = 256
 # 64 KiB per-workgroup LDS limit expressed in fp16 elements.
 # (AMD RDNA has 128 KiB total LDS per CU, but 64 KiB per workgroup.)
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
@@ -302,6 +317,35 @@ def triton_w4a16_skinny_fmt_gemm(
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 512, 32, 16
             else:
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
+    elif _on_gfx10x():
+        # gfx1030 (Navi 21, 72 CUs, wave32): start from the gfx1151 wave32
+        # heuristics (same wavefront width and LDS budget). Default pipelining
+        # halves occupancy on gfx10's 64 KiB LDS, so force single-stage
+        # launches throughout — the standing gfx1030 Triton rule.
+        num_stages = 1
+        if M <= 32:
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 32, 32, 128, 4
+        elif M <= 64:
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 32, 4
+        elif M <= 128:
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 16, 64, 1
+            elif N > K:  # wide N (e.g. qkv_proj, gate_up_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 4
+            else:  # N ~= K (e.g. o_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 4
+        elif M <= 1024:
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 4
+            elif N >= 4 * K:  # very wide N (e.g. gate_up_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 128, 32, 4
+        else:
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 512, 32, 16
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
     else:
         num_warps = 4
         if M <= 32:
@@ -345,6 +389,102 @@ def triton_w4a16_skinny_fmt_gemm(
 # ---------------------------------------------------------------------------
 # Weight packing
 # ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dequant_w4_skinny_kernel(
+    b_ptr,  # [N, K//8]  int32 packed (ExLlama shuffle, K is packed dim)
+    scales_ptr,  # [N, K//G]  fp16/bf16 scales (skinny layout)
+    zp_ptr,  # [N, K//G]  fp16/bf16 raw zero-points (when HAS_ZP=True)
+    out_ptr,  # [N, K]  fp16/bf16 dequantized weights
+    N,
+    K,
+    K8,  # K // 8
+    num_groups,  # K // group_size
+    group_size,
+    ZP_BIAS: tl.constexpr,
+    HAS_ZP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Dequantize skinny-format W4 to a dense [N, K] matrix.
+
+    Unpacking mirrors _triton_w4a16_skinny_fmt_kernel's B-load path exactly;
+    unlike the GEMM kernel, scales/zero-points are gathered per element so
+    BLOCK_K may span multiple quantization groups.
+    """
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    # ExLlama unshuffle shifts: shift[j] = (j//2)*4 + (j%2)*16
+    exllama_shifts_row = (tl.arange(0, 8) // 2) * 4 + (tl.arange(0, 8) % 2) * 16
+    shifts_1d = tl.reshape(
+        tl.broadcast_to(exllama_shifts_row[None, :], (BLOCK_K // 8, 8)),
+        (BLOCK_K,),
+    )
+    shifts_full = tl.broadcast_to(shifts_1d[None, :], (BLOCK_N, BLOCK_K))
+
+    offs_k8 = pid_k * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
+    b_ptrs = b_ptr + offs_n[:, None] * K8 + offs_k8[None, :]
+    mask_b = (offs_n[:, None] < N) & (offs_k8[None, :] < K8)
+    b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
+
+    b = tl.interleave(b_packed, b_packed)
+    b = tl.interleave(b, b)
+    b = tl.interleave(b, b)
+    nib = (b >> shifts_full) & 0xF
+
+    g_idx = offs_k // group_size
+    mask_nk = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+    s_ptrs = scales_ptr + offs_n[:, None] * num_groups + g_idx[None, :]
+    scales = tl.load(s_ptrs, mask=mask_nk, other=1.0)
+
+    if HAS_ZP:
+        zp_ptrs = zp_ptr + offs_n[:, None] * num_groups + g_idx[None, :]
+        zp_raw = tl.load(zp_ptrs, mask=mask_nk, other=0.0)
+        w = (nib.to(scales.dtype) - zp_raw) * scales
+    else:
+        w = (nib - ZP_BIAS).to(scales.dtype) * scales
+
+    out_ptrs = out_ptr + offs_n[:, None] * K + offs_k[None, :]
+    tl.store(out_ptrs, w.to(out_ptr.type.element_ty), mask=mask_nk)
+
+
+def dequant_w4_skinny_to_dense(
+    b_q: torch.Tensor,  # [N, K//8] int32 (ExLlama shuffle packed)
+    scales: torch.Tensor,  # [N, K//G]
+    group_size: int,
+    zp: torch.Tensor | None = None,  # [N, K//G]
+    zp_bias: int = 8,
+) -> torch.Tensor:
+    """Expand skinny-format W4 to dense [N, K] in the scales' dtype."""
+    N, K8 = b_q.shape
+    K = K8 * 8
+    num_groups = K // group_size
+    out = torch.empty((N, K), dtype=scales.dtype, device=b_q.device)
+    BLOCK_N, BLOCK_K = 64, 256
+    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
+    _dequant_w4_skinny_kernel[grid](
+        b_q,
+        scales,
+        zp if zp is not None else b_q,
+        out,
+        N,
+        K,
+        K8,
+        num_groups,
+        group_size,
+        ZP_BIAS=zp_bias,
+        HAS_ZP=zp is not None,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
 
 
 def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
@@ -398,6 +538,18 @@ def _rdna_hybrid_w4a16_apply_impl(
         )
         with ctx:
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
+
+    if M >= DENSE_MATMUL_MIN_M:
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"hybrid_dequant_matmul {M}x{N}x{K}")
+        )
+        with ctx:
+            w_dense = dequant_w4_skinny_to_dense(
+                w_q.view(torch.int32), w_s, group_size, zp=w_zp
+            )
+            return torch.nn.functional.linear(x_2d, w_dense, bias)
 
     ctx = (
         nullcontext()
@@ -463,8 +615,8 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         if not current_platform.is_rocm():
             return False, "RDNAHybridW4A16LinearKernel only targets ROCm"
 
-        if not _on_gfx1x():
-            return False, "RDNAHybridW4A16LinearKernel only targets gfx11/gfx12"
+        if not (_on_gfx1x() or _on_gfx10x()):
+            return False, "RDNAHybridW4A16LinearKernel only targets gfx10/gfx11/gfx12"
 
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
             return (

@@ -208,8 +208,13 @@ def triton_w4a16_gemm(
     # Provide a dummy pointer when HAS_ZP=False (Triton requires a valid ptr)
     zeros_ptr = qzeros if has_zp else b_q
 
+    launch_extra = {}
     if current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx1x, on_gfx10x
+
+        if on_gfx10x():
+            # gfx1030: 64 KiB LDS; default pipelining stages halve occupancy
+            launch_extra = {"num_warps": 4, "num_stages": 1}
 
         if on_gfx1x() or on_gfx10x():
             # Tuned for RDNA 3.5 (gfx1151, 40 CUs, 32-wide wavefronts).
@@ -266,6 +271,7 @@ def triton_w4a16_gemm(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        **launch_extra,
     )
     return c
 

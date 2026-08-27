@@ -12,8 +12,9 @@
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
 
-// Combined RDNA macro (gfx11 + gfx12) - both use 32-wide wavefronts
-#if defined(__GFX11__) || defined(__GFX12__)
+// Combined RDNA macro (gfx10 + gfx11 + gfx12) - all use 32-wide wavefronts.
+// gfx10.3 (Navi 21) qualifies: wave32, 64 KiB LDS, v_dot2_f32_f16, DPP row_shr.
+#if defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__)
   #define __HIP__GFX1X__
 #endif
 
@@ -74,14 +75,31 @@ struct scalar<c10::BFloat16> {
   using type = __hip_bfloat16;
 };
 
+#if defined(__GFX10__)
+// gfx10 has no bf16 dot instruction; a scalar fallback keeps the bf16
+// template instantiation compilable (unused in practice: fp16 serving only).
+  #define DOT2C_BF16(V0, V2, V3)                                        \
+    {                                                                   \
+      __hip_bfloat162 _da = *((__hip_bfloat162*)(&(V2)));               \
+      __hip_bfloat162 _db = *((__hip_bfloat162*)(&(V3)));               \
+      V0 += __bfloat162float(_da.x) * __bfloat162float(_db.x) +         \
+            __bfloat162float(_da.y) * __bfloat162float(_db.y);          \
+    }
+#else
+  #define DOT2C_BF16(V0, V2, V3)                                        \
+    {                                                                   \
+      typedef short __attribute__((ext_vector_type(2))) bf16x2_t;       \
+      V0 = __builtin_amdgcn_fdot2_f32_bf16(                             \
+          *((bf16x2_t*)(&(V2))), *((bf16x2_t*)(&(V3))), V0, false);     \
+    }
+#endif
+
 #define DOT2C(V0, V2, V3)                                                   \
   if constexpr (std::is_same_v<scalar_t, half>) {                           \
     V0 = __builtin_amdgcn_fdot2(*((half2*)(&(V2))), *((half2*)(&(V3))), V0, \
                                 false);                                     \
   } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {          \
-    typedef short __attribute__((ext_vector_type(2))) bf16x2_t;             \
-    V0 = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_t*)(&(V2))),             \
-                                         *((bf16x2_t*)(&(V3))), V0, false); \
+    DOT2C_BF16(V0, V2, V3)                                                  \
   }
 
 // DPP-based wave32 reduction for GFX1X (matches skinny_gemms.cu).
