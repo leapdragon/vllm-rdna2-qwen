@@ -215,6 +215,7 @@ def _get_gcn_arch() -> str:
 _GCN_ARCH = _get_gcn_arch()
 
 _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
+_ON_GFX10X = any(arch in _GCN_ARCH for arch in ["gfx10"])
 _ON_GFX11 = "gfx11" in _GCN_ARCH
 _ON_GFX1100 = "gfx1100" in _GCN_ARCH
 _ON_GFX1151 = "gfx1151" in _GCN_ARCH
@@ -305,6 +306,10 @@ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
 
 def on_gfx1x() -> bool:
     return _ON_GFX1X and not _ON_CDNA
+
+
+def on_gfx10x() -> bool:
+    return _ON_GFX10X
 
 
 def on_gfx11() -> bool:
@@ -424,7 +429,7 @@ def use_rocm_custom_paged_attention(
 
 @cache
 def flash_attn_triton_available() -> bool:
-    if not on_gfx1x():
+    if not (on_gfx1x() or on_gfx10x()):
         return False
     try:
         from importlib.util import find_spec
@@ -757,9 +762,9 @@ class RocmPlatform(Platform):
             logger.info_once("Using Flash Attention backend for ViT model.")
             return AttentionBackendEnum.FLASH_ATTN
 
-        # RDNA3/RDNA4 (gfx11xx/gfx12xx): Use Flash Attention Triton backend
+        # RDNA2/RDNA3/RDNA4 (gfx10xx/gfx11xx/gfx12xx): Use Flash Attention Triton backend
         if (
-            on_gfx1x()
+            (on_gfx1x() or on_gfx10x())
             and flash_attn_triton_available()
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
@@ -987,7 +992,18 @@ class RocmPlatform(Platform):
     @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        if any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"]):
+            return True
+        # RDNA opt-in (off by default, identical behaviour unless requested).
+        # gfx1030 has no XGMI, but PCIe P2P here is direct and complete:
+        # peer read/write from kernels and peer atomicAdd/CAS all verified on
+        # devices 1+3 of this host (14.04 GB/s, 28.4 us @ 10KB) — and peer
+        # atomics are what the one-shot all-reduce barrier needs.
+        # See projects/vllm-rdna2/OPTIMIZATION-PHASE.md section 1a.
+        import os
+        if os.getenv("VLLM_ROCM_FORCE_CUSTOM_ALLREDUCE", "0") == "1":
+            return "gfx1" in _GCN_ARCH
+        return False
 
     @classmethod
     def opaque_attention_op(cls) -> bool:
