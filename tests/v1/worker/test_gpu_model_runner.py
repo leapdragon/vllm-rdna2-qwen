@@ -2,14 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
-from contextlib import nullcontext
+import queue
+import threading
+from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
+import torch.multiprocessing as torch_mp
+import zmq
 
+import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
@@ -52,6 +57,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.block_table import (
@@ -71,14 +77,177 @@ NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
 
 
-@pytest.fixture(autouse=True)
-def _restore_default_dtype():
-    """Several tests here set the process-wide default dtype to float16 and
-    previously leaked it, corrupting later float-sensitive tests in the same
-    pytest process (torch.randn silently produced fp16)."""
-    old = torch.get_default_dtype()
-    yield
-    torch.set_default_dtype(old)
+def test_ple_offload_h2h_uses_bound_input_buffers() -> None:
+    """Stage MRV1 inputs from allocations bound during connector setup."""
+    source_input_ids = torch.tensor([7, -1, 11, -1], dtype=torch.int32)
+    source_query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+    socket = Mock()
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.tp_rank = 0
+    connector.dp_rank = 0
+    connector._input_ids_buf = torch.full((4,), -99, dtype=torch.int32)
+    connector._query_start_loc_buf = torch.full((3,), -99, dtype=torch.int32)
+    connector._ngram_context_buf = None
+    connector._input_ids_source = source_input_ids
+    connector._query_start_loc_source = source_query_start_loc
+    connector._ngram_context_source = None
+    connector._uses_cuda_inputs = False
+    connector._validate_input_sources()
+    connector._request_queue = queue.Queue(maxsize=1)
+
+    connector._launch(num_reqs=2, num_tokens=4)
+
+    # launch only queues MRV1 work; the notifier thread performs the H2H copy.
+    assert connector._input_ids_buf.tolist() == [-99, -99, -99, -99]
+    request = connector._request_queue.get_nowait()
+    assert request is not None
+    connector._process_request(request, socket)
+
+    assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
+    assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
+    assert source_input_ids.tolist() == [7, -1, 11, -1]
+    socket.send.assert_called_once()
+
+
+def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
+    """Keep MRV1 H2H and request publication off the model thread."""
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.tp_rank = 0
+    connector.dp_rank = 0
+    connector._input_ids_buf = torch.empty(4, dtype=torch.int32)
+    connector._query_start_loc_buf = torch.empty(3, dtype=torch.int32)
+    connector._ngram_context_buf = None
+    connector._input_ids_source = torch.tensor([7, 8, 9, 10], dtype=torch.int32)
+    connector._query_start_loc_source = torch.tensor([0, 2, 4], dtype=torch.int32)
+    connector._ngram_context_source = None
+    connector._uses_cuda_inputs = False
+    connector._pinned_input_buffers = []
+    connector._d2h_stream = None
+    connector._input_ready_event = None
+    connector._d2h_done_event = None
+    connector._request_queue = queue.Queue(maxsize=1)
+    connector._request_thread = None
+    connector._request_thread_ready = threading.Event()
+    connector._zmq_ctx = zmq.Context()
+    connector._registration_socket = None
+
+    ipc_addr = f"inproc://ple-offload-{id(connector)}"
+    pull_socket = connector._zmq_ctx.socket(zmq.PULL)
+    pull_socket.setsockopt(zmq.RCVTIMEO, 3000)
+    pull_socket.bind(ipc_addr)
+    try:
+        connector._start_request_thread(ipc_addr)
+        connector._launch(num_reqs=2, num_tokens=4)
+
+        assert pull_socket.recv()
+        assert connector._input_ids_buf.tolist() == [7, 8, 9, 10]
+        assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
+    finally:
+        pull_socket.close(linger=0)
+        connector.close()
+        connector.close()
+
+    assert connector._request_thread is None
+    assert connector._zmq_ctx is None
+
+
+def test_ple_offload_request_thread_failure_exits_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat a request-thread failure as a fatal worker error."""
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector._zmq_ctx = None
+    connector._request_thread_ready = threading.Event()
+    exit_mock = Mock(side_effect=SystemExit(1))
+    monkeypatch.setattr(ple_offload_connector_module.os, "_exit", exit_mock)
+
+    with pytest.raises(SystemExit):
+        connector._request_loop("inproc://unused")
+
+    exit_mock.assert_called_once_with(1)
+
+
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU is required")
+def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
+    """Keep MRV2 D2H asynchronous without a second CPU staging buffer."""
+    socket = Mock()
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.device = torch.device("cuda:0")
+    connector.tp_rank = 0
+    connector.dp_rank = 0
+    original_strategy = torch_mp.get_sharing_strategy()
+    try:
+        torch_mp.set_sharing_strategy("file_descriptor")
+        connector._input_ids_buf = torch.full(
+            (4,), -99, dtype=torch.int32
+        ).share_memory_()
+        connector._query_start_loc_buf = torch.full(
+            (3,), -99, dtype=torch.int32
+        ).share_memory_()
+        connector._ngram_context_buf = torch.full(
+            (2, 3), -99, dtype=torch.int32
+        ).share_memory_()
+        input_buffers = (
+            connector._input_ids_buf,
+            connector._query_start_loc_buf,
+            connector._ngram_context_buf,
+        )
+        initial_ptrs = tuple(buffer.data_ptr() for buffer in input_buffers)
+
+        torch_mp.set_sharing_strategy("file_system")
+        ForkingPickler.dumps(input_buffers)
+    finally:
+        torch_mp.set_sharing_strategy(original_strategy)
+    final_ptrs = tuple(buffer.data_ptr() for buffer in input_buffers)
+    assert final_ptrs != initial_ptrs
+
+    connector._pinned_input_buffers = []
+    connector._request_queue = queue.Queue(maxsize=1)
+
+    with torch.accelerator.device_index(connector.device.index):
+        input_ids = torch.tensor(
+            [7, -1, 11, -1], dtype=torch.int32, device=connector.device
+        )
+        query_start_loc = torch.tensor(
+            [0, 2, 4], dtype=torch.int32, device=connector.device
+        )
+        ngram_context = torch.tensor(
+            [[1, 2, 3], [4, 5, 6]],
+            dtype=torch.int32,
+            device=connector.device,
+        )
+        connector._input_ids_source = input_ids
+        connector._query_start_loc_source = query_start_loc
+        connector._ngram_context_source = ngram_context
+        connector._uses_cuda_inputs = True
+        connector._validate_input_sources()
+        connector._pin_input_buffers()
+        assert (
+            tuple(buffer.data_ptr() for buffer in connector._pinned_input_buffers)
+            == final_ptrs
+        )
+        connector._d2h_stream = torch.cuda.Stream(device=connector.device)
+        connector._input_ready_event = torch.cuda.Event()
+        connector._d2h_done_event = torch.cuda.Event()
+        try:
+            connector._launch(num_reqs=2, num_tokens=4)
+
+            # The model thread only records input readiness and queues metadata.
+            assert connector._input_ids_buf.tolist() == [-99, -99, -99, -99]
+            request = connector._request_queue.get_nowait()
+            assert request is not None
+            connector._process_request(request, socket)
+
+            assert connector._input_ids_buf.tolist() == [7, -1, 11, -1]
+            assert connector._query_start_loc_buf.tolist() == [0, 2, 4]
+            assert connector._ngram_context_buf.tolist() == [
+                [1, 2, 3],
+                [4, 5, 6],
+            ]
+            socket.send.assert_called_once()
+        finally:
+            torch.accelerator.synchronize(connector.device)
+            connector._unpin_input_buffers()
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
@@ -95,12 +264,7 @@ def initialize_kv_cache(runner: GPUModelRunner):
     kv_cache_config = KVCacheConfig(
         num_blocks=NUM_BLOCKS,
         kv_cache_tensors=[
-            KVCacheTensor(
-                size=tensor_size,
-                layers=["layer.0"],
-                layer_stride=tensor_size,
-                block_stride=attn_spec.page_size_bytes,
-            ),
+            KVCacheTensor(size=tensor_size, shared_by=["layer.0"]),
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=attn_spec)
@@ -139,7 +303,6 @@ def get_vllm_config():
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
     )
-    cache_config.kv_cache_layout = "LBNHC"
     parallel_config = ParallelConfig()
     vllm_config = VllmConfig(
         model_config=model_config,
@@ -848,6 +1011,56 @@ def test_update_states_pp_async_multi_request_keeps_rank_state_consistent(
         )
 
 
+def test_kv_cache_stride_order(monkeypatch, model_runner):
+    # This test checks if GPUModelRunner initializes correctly when an attention
+    # backend enforces a non-default KV cache stride order.
+    n_heads = model_runner.model_config.get_num_kv_heads(model_runner.parallel_config)
+    head_size = model_runner.model_config.get_head_size()
+
+    # Get the expected shape from the backend's get_kv_cache_shape method
+    # to ensure compatibility with different backends (triton vs flexattention)
+    attn_backend = None
+    for attn_group in model_runner._attn_group_iterator():
+        attn_backend = attn_group.backend
+        break
+
+    assert attn_backend is not None, "No attention backend found"
+    expected_kv_cache_shape = list(
+        attn_backend.get_kv_cache_shape(NUM_BLOCKS, BLOCK_SIZE, n_heads, head_size)
+    )
+
+    # TODO mla test
+    default_stride = tuple(range(len(expected_kv_cache_shape)))
+    non_default_stride = (*default_stride[1:], default_stride[0])
+    # Permutation that gets you back to expected kv shape
+    for test_stride in (non_default_stride, default_stride):
+
+        def rnd_stride_order(
+            include_num_layers_dimension: bool = False, test_stride=test_stride
+        ):
+            assert not include_num_layers_dimension
+            return test_stride
+
+        # Patch the attention backend class and re-trigger the KV cache creation
+        for attn_group in model_runner._attn_group_iterator():
+            attn_backend = attn_group.backend
+            monkeypatch.setattr(
+                attn_backend, "get_kv_cache_stride_order", rnd_stride_order
+            )
+
+        model_runner.attn_groups = []
+        model_runner.kv_caches = []
+        model_runner.initialize_kv_cache(model_runner.kv_cache_config)
+
+        # Shape is unchanged, but layout may differ
+        kv_cache_shape = model_runner.kv_caches[0].shape
+        assert list(kv_cache_shape) == expected_kv_cache_shape
+        if default_stride == test_stride:
+            assert all(kv.is_contiguous() for kv in model_runner.kv_caches)
+        else:
+            assert all(not kv.is_contiguous() for kv in model_runner.kv_caches)
+
+
 def test_update_config(model_runner):
     # Simple update
     model_runner.update_config({"load_config": {"load_format": "dummy"}})
@@ -1083,22 +1296,21 @@ def test_init_kv_cache_without_kv_sharing(default_vllm_config):
         vllm_config, [kv_cache_spec], [available_memory]
     )[0]
     assert kv_cache_config.num_blocks == num_expected_blocks
-    assert len(kv_cache_config.kv_cache_tensors) == 1
-    assert kv_cache_config.kv_cache_tensors[0].size == available_memory
+    assert len(kv_cache_config.kv_cache_tensors) == 2
+    assert kv_cache_config.kv_cache_tensors[0].size == available_memory // 2
+    assert kv_cache_config.kv_cache_tensors[1].size == available_memory // 2
 
     max_context_len = estimate_max_model_len(vllm_config, kv_cache_spec, 5 * GiB_bytes)
     # max context len with KV sharing should be 2x as large as without
     assert max_context_len == 1310720
 
     # important: override tensor size to prevent large mem alloc during test
-    # this will only allocate 1 block worth of memory per layer (2 layers * 32kb)
+    # this will only allocate 2 block worth of memory (2 * 32kb)
     kv_cache_config.num_blocks = 1
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        page_size = kv_cache_spec[kv_cache_tensor.layers[0]].page_size_bytes
-        kv_cache_tensor.size = page_size * len(kv_cache_tensor.layers)
-        # One block per layer: a layer's region is exactly one page.
-        kv_cache_tensor.layer_stride = page_size
-        kv_cache_tensor.block_stride = page_size
+        kv_cache_tensor.size = kv_cache_spec[
+            kv_cache_tensor.shared_by[0]
+        ].page_size_bytes
 
     runner.initialize_kv_cache(kv_cache_config)
 
@@ -1167,9 +1379,7 @@ def test_init_kv_cache_with_kv_sharing_valid(default_vllm_config):
     # important: override tensor size to prevent large mem alloc during test
     # this will only allocate 1 block worth of memory (32kb)
     kv_cache_config.num_blocks = 1
-    page_size = kv_cache_spec[layer_0].page_size_bytes
-    kv_cache_config.kv_cache_tensors[0].size = page_size
-    kv_cache_config.kv_cache_tensors[0].layer_stride = page_size
+    kv_cache_config.kv_cache_tensors[0].size = kv_cache_spec[layer_0].page_size_bytes
 
     runner.initialize_kv_cache(kv_cache_config)
     kv_cache_config_after_init = runner.kv_cache_config
@@ -1194,7 +1404,7 @@ def test_hybrid_attention_mamba_tensor_shapes():
     """
     The GPU model runner creates different views into the
     KVCacheTensors for the attention and mamba layers
-    (via _allocate_kv_caches). This test verifies
+    (via _reshape_kv_cache_tensors function). This test verifies
     that the views are compatible: writing a mamba block
     will not corrupt an attention block and vice versa
     """
@@ -1232,7 +1442,6 @@ def test_hybrid_attention_mamba_tensor_shapes():
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
     )
-    cache_config.kv_cache_layout = "LBNHC"
     parallel_config = ParallelConfig()
     attention_config = AttentionConfig(backend=AttentionBackendEnum.FLASHINFER)
     vllm_config = VllmConfig(
@@ -1558,7 +1767,6 @@ def test_circular_buffer_uses_custom_slot_mapping(wrap_uniform: bool):
     runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=1)
     runner.vllm_config = SimpleNamespace(reasoning_config=None)
     runner.cache_config = SimpleNamespace(use_replayssm=False)
-    runner.jit_warmup_registry = SimpleNamespace(activate=nullcontext)
     runner.is_pooling_model = False
     runner.input_batch = SimpleNamespace(
         logitsprocs=None,
@@ -1645,12 +1853,7 @@ def test_hybrid_cache_integration(default_vllm_config, dist_init):
     kv_cache_config = KVCacheConfig(
         num_blocks=NUM_BLOCKS,
         kv_cache_tensors=[
-            KVCacheTensor(
-                size=tensor_size,
-                layers=["layer.0"],
-                layer_stride=tensor_size,
-                block_stride=attn_spec.page_size_bytes,
-            ),
+            KVCacheTensor(size=tensor_size, shared_by=["layer.0"]),
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=attn_spec)
@@ -1815,7 +2018,6 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
     )
-    cache_config.kv_cache_layout = "LBNHC"
     parallel_config = ParallelConfig()
     attention_config = AttentionConfig(backend=AttentionBackendEnum.FLASHINFER)
     vllm_config = VllmConfig(

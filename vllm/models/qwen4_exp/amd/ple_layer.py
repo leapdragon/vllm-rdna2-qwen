@@ -18,6 +18,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -69,7 +73,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
+class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
     _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -283,12 +287,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def forward_impl(  # type: ignore[override]
         self,
+        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del hidden_states
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
         num_reqs = query_start_loc.numel() - 1
@@ -304,15 +311,35 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"at most {self.padded_buffer.shape[0]}"
             )
 
+        # The CPU-offload subprocess is never captured by a CUDA Graph, so its
+        # pack workspace can narrow to the actual maximum sequence length. The
+        # regular GPU path retains the static maximum-width buffer for capture.
+        if is_offload_process():
+            if num_reqs <= 0:
+                raise ValueError("PLE CPU offload requires at least one request")
+            max_seq_len = max(
+                1,
+                int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
+            )
+            # The model runner sends the CUDA-graph padded token count together
+            # with an unpadded query_start_loc. Stale padding must not enter the
+            # scatter: its clamped indices would overwrite the last real token.
+            num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
+        else:
+            max_seq_len = self.padded_buffer.shape[1]
+            num_valid_tokens = num_tokens
+
         positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs]
+        packed = self.padded_buffer[:num_reqs, :max_seq_len]
         packed.fill_(self.eos_token_id)
         request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         request_indices.clamp_(max=num_reqs - 1)
         columns = (positions - query_start_loc[request_indices]).clamp(
             0, packed.shape[1] - 1
         )
-        packed[request_indices, columns] = input_ids
+        packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
+            input_ids[:num_valid_tokens]
+        )
         ngram_context = ngram_context[:num_reqs].to(
             device=input_ids.device, dtype=torch.long
         )
@@ -1049,7 +1076,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self.ple_embedding(
+            hidden_states,
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
