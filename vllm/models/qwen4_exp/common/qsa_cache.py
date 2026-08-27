@@ -659,8 +659,12 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
 class QSAStateBackend(AttentionBackend):
     """Key-only dummy backend for out-of-band BF16 QSA side-cache operations."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "float16",
+    ]
 
     @staticmethod
     def get_name() -> str:
@@ -722,8 +726,10 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
         """Adapt the unified [B, H, N, C] view to QSA's [B, N, H, C]."""
         if kv_cache.ndim != 4 or kv_cache.shape[1] != 1:
             raise ValueError("QSA state cache must be [blocks, 1, states, width]")
-        if kv_cache.dtype != torch.bfloat16 or kv_cache.shape[3] != self.head_size:
-            raise ValueError("QSA state cache does not match its packed BF16 spec")
+        if kv_cache.dtype not in (torch.bfloat16, torch.float16) or (
+            kv_cache.shape[3] != self.head_size
+        ):
+            raise ValueError("QSA state cache does not match its packed spec")
         super().bind_kv_cache(kv_cache.transpose(1, 2))
 
     def get_attn_backend(self) -> type[AttentionBackend]:
