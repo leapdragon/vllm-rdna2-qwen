@@ -108,7 +108,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if not is_flash_attn_varlen_func_available():
+        # QSA computes entirely in its own Triton kernels (forward_qsa ->
+        # qsa_sparse_paged_attention); flash_attn_varlen_func is never called
+        # from this impl. The FlashAttention* base classes are reused only for
+        # metadata/plumbing. Requiring a working FA build therefore excludes
+        # platforms that can run QSA perfectly well -- gfx1030 (RDNA2) has no
+        # flash_attn or AITER build but runs the Triton path correctly.
+        if not is_flash_attn_varlen_func_available() and not current_platform.is_rocm():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size != 1:
             raise NotImplementedError(

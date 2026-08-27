@@ -44,7 +44,14 @@ from vllm.v1.attention.ops.dcp import (
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.worker.workspace import current_workspace_manager
 
-if is_flash_attn_varlen_func_available():
+if is_flash_attn_varlen_func_available() or current_platform.is_rocm():
+    # On ROCm, fa_utils defines all four names even when the flash-attn package
+    # is absent: reshape_and_cache_flash comes from vLLM's own C++ op,
+    # get_scheduler_metadata is a stub, and flash_attn_varlen_func raises a
+    # clear ImportError if actually called. Gating the whole import on FA
+    # availability left reshape_and_cache_flash unbound, so backends that
+    # subclass FlashAttention purely for plumbing -- e.g. Qwen4Exp QSA, which
+    # computes in its own Triton kernels -- died with a NameError on gfx1030.
     from vllm.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
         flash_attn_varlen_func,
