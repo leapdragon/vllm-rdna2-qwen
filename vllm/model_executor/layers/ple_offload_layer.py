@@ -36,9 +36,14 @@ try:
 
     PLE_OFFLOAD_DRIVER_AVAILABLE = True
 except ImportError:  # pragma: no cover - platform dependent
-    cuda_driver = None  # type: ignore[assignment]
-    CUstreamWaitValue_flags = None  # type: ignore[assignment]
-    PLE_OFFLOAD_DRIVER_AVAILABLE = False
+    # ROCm: every primitive used here has a direct HIP equivalent, bound from
+    # libamdhip64 by vllm.v1.ple_offload.hip_driver with the same surface.
+    from vllm.v1.ple_offload import hip_driver as cuda_driver  # type: ignore[no-redef]
+    from vllm.v1.ple_offload.hip_driver import (  # type: ignore[no-redef]
+        CUstreamWaitValue_flags,
+    )
+
+    PLE_OFFLOAD_DRIVER_AVAILABLE = cuda_driver.HIP_DRIVER_AVAILABLE
 
 import vllm.envs as envs
 from vllm.utils.torch_utils import direct_register_custom_op

@@ -246,7 +246,11 @@ class Worker(WorkerBase):
         """Reject unsupported PLE offload execution modes."""
         parallel_config = self.parallel_config
         unsupported = []
-        if not current_platform.is_cuda():
+        # ROCm reports device_type "cuda" but is_cuda() is False. The offload
+        # primitives (stream write/wait-value, host register) are bound from
+        # libamdhip64 by vllm.v1.ple_offload.hip_driver and verified working on
+        # gfx1030, so accept CUDA-alike platforms rather than CUDA alone.
+        if not current_platform.is_cuda_alike():
             unsupported.append(f"device={current_platform.device_type}")
         if parallel_config.nnodes != 1:
             unsupported.append(f"nnodes={parallel_config.nnodes}")

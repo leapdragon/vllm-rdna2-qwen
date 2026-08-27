@@ -17,7 +17,7 @@ import zmq
 try:
     from cuda.bindings import driver as cuda_driver
 except ImportError:  # pragma: no cover - platform dependent
-    cuda_driver = None  # type: ignore[assignment]
+    from vllm.v1.ple_offload import hip_driver as cuda_driver  # type: ignore[no-redef]
 
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
