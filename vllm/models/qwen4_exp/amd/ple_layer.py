@@ -237,6 +237,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
         )
+        self._max_total_tokens = int(max_total_tokens)
+        self._max_num_reqs = int(max_num_reqs)
+        # ngram_heads_vocab_sizes/offsets are derived from config (primes above),
+        # not learned. Keep the Python copies so they can be restored verbatim if
+        # the buffers are ever materialized from meta without checkpoint data.
+        self._ngram_sizes = list(sizes)
+        self._ngram_offsets = list(offsets)
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -251,6 +258,42 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             ),
             persistent=False,
         )
+
+    def _materialize_workspace(self, device: torch.device) -> None:
+        """Rebuild the non-persistent workspace buffers off the meta device.
+
+        The PLE offload worker builds the whole model under ``torch.device("meta")``
+        and then materializes only what the checkpoint provides. These two buffers
+        are ``persistent=False`` -- they are workspace, not weights -- so nothing
+        brings them back, and the first forward fails with
+        "Tensor on device cpu is not on the expected device meta".
+        """
+        if (
+            not self.positions_buffer.is_meta
+            and not self.padded_buffer.is_meta
+            and not self.ngram_heads_vocab_sizes.is_meta
+            and int(self.ngram_heads_vocab_sizes.sum()) != 0
+        ):
+            return
+        self.positions_buffer = torch.arange(
+            self._max_total_tokens, dtype=torch.int64, device=device
+        )
+        self.padded_buffer = torch.full(
+            (self._max_num_reqs, self._max_total_tokens),
+            self.eos_token_id,
+            dtype=torch.int64,
+            device=device,
+        )
+        # These two are persistent buffers, so a to_empty() materialization
+        # leaves them uninitialized; a zeroed vocab-size table divides by zero
+        # in the n-gram hash. They are config-derived, so restore them exactly.
+        if int(self.ngram_heads_vocab_sizes.sum()) == 0:
+            self.ngram_heads_vocab_sizes = torch.tensor(
+                self._ngram_sizes, dtype=torch.long, device=device
+            )
+            self.ngram_heads_offsets = torch.tensor(
+                self._ngram_offsets, dtype=torch.long, device=device
+            )
 
     @staticmethod
     def _shift_precompute(
@@ -315,6 +358,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         # pack workspace can narrow to the actual maximum sequence length. The
         # regular GPU path retains the static maximum-width buffer for capture.
         if is_offload_process():
+            self._materialize_workspace(input_ids.device)
             if num_reqs <= 0:
                 raise ValueError("PLE CPU offload requires at least one request")
             max_seq_len = max(
@@ -378,11 +422,22 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             (ngram_ids.shape[0], self.embedding_dim),
             dtype=self.ngram_embedding.params_dtype,
         )
-        torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
-            ngram_ids,
-            output,
-            self.layer_name,
-        )
+        if is_offload_process():
+            # Two reasons the custom op cannot be used in the offload worker:
+            # direct_register_custom_op binds it to the platform dispatch key
+            # ("CUDA" on ROCm) while the worker runs on CPU, and the op resolves
+            # its layer through the forward context, which the worker never sets.
+            # Both are indirections the op only needs on the GPU side -- it
+            # exists to keep the embedding opaque to graph capture, which the
+            # offload process does not do -- and we are already inside the
+            # owning module, so do the lookup directly.
+            output.copy_(self.ngram_embedding(ngram_ids).flatten(-2))
+        else:
+            torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
+                ngram_ids,
+                output,
+                self.layer_name,
+            )
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -418,6 +418,15 @@ class PleOffloadRunner:
                 len(offload_layers),
             )
             for layer in offload_layers.values():
+                # The model was built under torch.device("meta"), and
+                # initialize_dummy_weights fills existing storage -- it cannot
+                # materialize meta tensors. The DefaultModelLoader path gets
+                # storage implicitly by copying checkpoint data in; the dummy
+                # path has to ask for it, or the layer's parameters and its
+                # persistent buffers (layer_multipliers, ngram_heads_*) stay on
+                # meta and the first forward dies with
+                # "Tensor on device meta is not on the expected device cpu".
+                layer.to_empty(device=torch.device("cpu"))
                 initialize_dummy_weights(layer, model_config)
         elif isinstance(loader, DefaultModelLoader):
             all_weights = loader.get_all_weights(model_config, model)
