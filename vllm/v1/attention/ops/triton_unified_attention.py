@@ -987,6 +987,29 @@ def unified_attention(
     if tuned_large_head:
         TILE_SIZE_PREFILL = 128
 
+    # RDNA2 (gfx10xx, e.g. gfx1030) has a 64 KiB LDS limit. With
+    # head_size >= 256 the default TILE 32 plus multi-stage K/V
+    # pipelining overflows shared memory (~136 KiB required) and kills
+    # the engine on the first forward pass. Shrink the KV tile and cap
+    # the pipeline depth to fit. Same failure class as the gemma-4
+    # workaround (vllm#38918).
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx10x
+
+        if on_gfx10x() and head_size >= 256:
+            TILE_SIZE_PREFILL = min(TILE_SIZE_PREFILL, 16)
+            TILE_SIZE_DECODE = min(TILE_SIZE_DECODE, 16)
+            # Swept 2026-08-21 (T32): num_stages=1 is ~2x on prefill-attention
+            # throughput vs the previous 2 (software pipelining doubles the K/V
+            # LDS footprint, and at head_size 256 that halves occupancy). Wider
+            # query tiles (BLOCK_M 32-128) are uniformly WORSE -- the fp32
+            # accumulator is BLOCK_M x 256 per program and register pressure
+            # beats FlashAttention amortization on this chip. warps=4 explicit.
+            # Numerics validated: greedy outputs byte-identical to the previous
+            # config (validate.py 8/8).
+            launch_num_warps = 4
+            launch_num_stages = 1
+
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
     # size (32) is larger than a common ``block_size=16``, so clamp it
