@@ -250,6 +250,46 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if (
+            self.quant_config.use_int4_w4a16
+            and hidden_states.dtype == torch.float16
+            and hidden_states.shape[0] <= 8
+            and activation == MoEActivation.SILU
+            and expert_map is None
+            and not apply_router_weight_on_input
+            and self.quant_config.w1_zp is None
+            and self.block_shape is not None
+        ):
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                _rocm_moe_skinny_available,
+            )
+
+            if _rocm_moe_skinny_available():
+                # gfx1030 decode path: wave-per-row skinny GEMV pair. Writes
+                # the fully topk-combined result into `output`, matching the
+                # invoke+moe_sum tail below.
+                M = hidden_states.shape[0]
+                topk = topk_ids.shape[1]
+                inter = w1.size(1) // 2
+                act_buf = torch.empty(
+                    (M, topk, inter),
+                    dtype=torch.float16,
+                    device=hidden_states.device,
+                )
+                ops.moe_skinny_int4_decode(
+                    hidden_states,
+                    w1,
+                    self.quant_config.w1_scale,
+                    w2,
+                    self.quant_config.w2_scale,
+                    topk_weights.to(torch.float32).contiguous(),
+                    topk_ids.to(torch.int32).contiguous(),
+                    act_buf,
+                    output,
+                    self.block_shape[1],
+                )
+                return
+
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"
@@ -644,6 +684,46 @@ class TritonWNA16Experts(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if (
+            self.quant_config.use_int4_w4a16
+            and hidden_states.dtype == torch.float16
+            and hidden_states.shape[0] <= 8
+            and activation == MoEActivation.SILU
+            and expert_map is None
+            and not apply_router_weight_on_input
+            and self.quant_config.w1_zp is None
+            and self.block_shape is not None
+        ):
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                _rocm_moe_skinny_available,
+            )
+
+            if _rocm_moe_skinny_available():
+                # gfx1030 decode path: wave-per-row skinny GEMV pair. Writes
+                # the fully topk-combined result into `output`, matching the
+                # invoke+moe_sum tail below.
+                M = hidden_states.shape[0]
+                topk = topk_ids.shape[1]
+                inter = w1.size(1) // 2
+                act_buf = torch.empty(
+                    (M, topk, inter),
+                    dtype=torch.float16,
+                    device=hidden_states.device,
+                )
+                ops.moe_skinny_int4_decode(
+                    hidden_states,
+                    w1,
+                    self.quant_config.w1_scale,
+                    w2,
+                    self.quant_config.w2_scale,
+                    topk_weights.to(torch.float32).contiguous(),
+                    topk_ids.to(torch.int32).contiguous(),
+                    act_buf,
+                    output,
+                    self.block_shape[1],
+                )
+                return
+
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), (

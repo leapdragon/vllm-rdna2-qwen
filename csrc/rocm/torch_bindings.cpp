@@ -37,6 +37,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? in_zero_points, Tensor? in_bias, int CuCount, "
       "int group_size) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
+  rocm_ops.def(
+      "moe_skinny_int4_decode(Tensor input, Tensor w13, Tensor w13_scale, "
+      "Tensor w2, Tensor w2_scale, Tensor topk_weights, Tensor topk_ids, "
+      "Tensor! act_buf, Tensor! output, int group_size) -> ()");
+  rocm_ops.impl("moe_skinny_int4_decode", torch::kCUDA, &moe_skinny_int4_decode);
 
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(

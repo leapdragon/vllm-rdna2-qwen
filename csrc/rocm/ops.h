@@ -52,3 +52,10 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+void moe_skinny_int4_decode(const at::Tensor& input, const at::Tensor& w13,
+                            const at::Tensor& w13_scale, const at::Tensor& w2,
+                            const at::Tensor& w2_scale,
+                            const at::Tensor& topk_weights,
+                            const at::Tensor& topk_ids, at::Tensor& act_buf,
+                            at::Tensor& output, const int64_t group_size);

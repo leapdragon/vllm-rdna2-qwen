@@ -1285,6 +1285,22 @@ def get_moe_wna16_block_config(
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
 
 
+_ROCM_MOE_SKINNY: bool | None = None
+
+
+def _rocm_moe_skinny_available() -> bool:
+    global _ROCM_MOE_SKINNY
+    if _ROCM_MOE_SKINNY is None:
+        import os
+
+        _ROCM_MOE_SKINNY = (
+            current_platform.is_rocm()
+            and os.environ.get("VLLM_ROCM_MOE_SKINNY", "1") == "1"
+            and hasattr(torch.ops._rocm_C, "moe_skinny_int4_decode")
+        )
+    return _ROCM_MOE_SKINNY
+
+
 def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
@@ -1609,6 +1625,43 @@ def fused_experts(
     """Run fused MoE expert computation using Triton kernels."""
     if quant_config is None:
         quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
+
+    if (
+        _rocm_moe_skinny_available()
+        and quant_config.use_int4_w4a16
+        and quant_config.w1_zp is None
+        and quant_config.block_shape is not None
+        and expert_map is None
+        and not apply_router_weight_on_input
+        and activation == MoEActivation.SILU
+        and hidden_states.dtype == torch.float16
+        and hidden_states.shape[0] <= 8
+        and global_num_experts in (-1, w1.shape[0])
+    ):
+        # gfx1030 decode path: wave-per-row skinny GEMV pair (~432 GB/s
+        # effective vs ~40 GB/s-class for the tile kernels at these M).
+        M, K = hidden_states.shape
+        topk = topk_ids.shape[1]
+        inter = w1.shape[1] // 2
+        act_buf = torch.empty(
+            (M, topk, inter), dtype=torch.float16, device=hidden_states.device
+        )
+        out = torch.empty(
+            (M, K), dtype=torch.float16, device=hidden_states.device
+        )
+        ops.moe_skinny_int4_decode(
+            hidden_states.contiguous(),
+            w1,
+            quant_config.w1_scale,
+            w2,
+            quant_config.w2_scale,
+            topk_weights.to(torch.float32).contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
+            act_buf,
+            out,
+            quant_config.block_shape[1],
+        )
+        return out
 
     return torch.ops.vllm.fused_experts(
         hidden_states=hidden_states,
