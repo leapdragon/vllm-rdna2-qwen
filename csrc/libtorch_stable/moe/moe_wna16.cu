@@ -13,6 +13,35 @@
 
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
 
+#ifdef USE_ROCM
+// gfx10 has no fp16 global atomic add; CAS on the containing 32-bit word.
+// Only the half instantiation runs on ROCm (bf16 is constexpr-discarded).
+__device__ inline void atomic_add_scalar(__half* address, __half val) {
+  uintptr_t addr_ui = reinterpret_cast<uintptr_t>(address);
+  auto* base = reinterpret_cast<unsigned int*>(addr_ui & ~uintptr_t(2));
+  const bool hi_half = (addr_ui & 2) != 0;
+  unsigned int old = *base, assumed;
+  do {
+    assumed = old;
+    __half cur = __ushort_as_half(
+        hi_half ? (unsigned short)(old >> 16) : (unsigned short)(old & 0xffff));
+    unsigned short sum = __half_as_ushort(__hadd(cur, val));
+    unsigned int updated = hi_half ? ((old & 0x0000ffffu) | ((unsigned int)sum << 16))
+                                   : ((old & 0xffff0000u) | sum);
+    old = atomicCAS(base, assumed, updated);
+  } while (assumed != old);
+}
+__device__ inline void atomic_add_scalar(nv_bfloat16*, nv_bfloat16) {
+  // unreachable on ROCm: the bf16 kernel body is discarded before this point
+  __builtin_trap();
+}
+#else
+template <typename T>
+__device__ inline void atomic_add_scalar(T* address, T val) {
+  atomicAdd(address, val);
+}
+#endif
+
 template <typename scalar_t, int bit, int GROUPS>
 __global__ void moe_wna16_gemm_kernel(
     const scalar_t* __restrict__ input, scalar_t* __restrict__ output,
@@ -193,7 +222,7 @@ __global__ void moe_wna16_gemm_kernel(
       dequant<scalar_t2, bit>(expert_qweight_tmp[tmp_k % 4], weight_half2);
 
       for (int m = 0; m < num_valid_tokens; m++) {
-        res2 = {};
+        res2 = scalar_t2();
 
 #pragma unroll
         for (int i = 0; i < 16 / bit; i++) {
@@ -216,8 +245,8 @@ __global__ void moe_wna16_gemm_kernel(
       if (mul_topk_weight) {
         res[m] *= topk_weights[token_index];
       }
-      atomicAdd(&output[token_index * size_n + offset_n],
-                Dtype::float2num(res[m]));
+      atomic_add_scalar(&output[token_index * size_n + offset_n],
+                        Dtype::float2num(res[m]));
     }
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800

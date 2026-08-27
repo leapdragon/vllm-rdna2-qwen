@@ -2,6 +2,14 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#ifdef USE_ROCM
+// hipify maps the cuda_bf16.h include but not these NVIDIA type names
+#include <hip/hip_bf16.h>
+using nv_bfloat16 = __hip_bfloat16;
+using nv_bfloat162 = __hip_bfloat162;
+#endif
+
+
 template <typename scalar_t>
 class ScalarType {};
 
@@ -78,6 +86,21 @@ class ScalarType<nv_bfloat16> {
 #endif
 };
 
+#ifdef USE_ROCM
+// Portable equivalents of the PTX helpers below. Every lop3 call site in this
+// file uses LUT 0xEA = (a & b) | c, and prmt with these operands is exactly
+// HIP's native __byte_perm (both lower to v_perm_b32 / bitwise ops on AMD).
+template <int lut>
+__device__ inline int lop3(int a, int b, int c) {
+  static_assert(lut == ((0xf0 & 0xcc) | 0xaa), "only (a & b) | c is used");
+  return (a & b) | c;
+}
+
+template <int start_byte, int mask>
+__device__ inline uint32_t prmt(uint32_t a) {
+  return __byte_perm(a, start_byte, mask);
+}
+#else
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
   int res;
@@ -95,6 +118,7 @@ __device__ inline uint32_t prmt(uint32_t a) {
                : "r"(a), "n"(start_byte), "n"(mask));
   return res;
 }
+#endif
 
 template <typename scalar_t2, int bit>
 __device__ inline void dequant(int q, scalar_t2* res) {}

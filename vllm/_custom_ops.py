@@ -2362,9 +2362,9 @@ def moe_wna16_gemm(
     BLOCK_SIZE_K: int,
     bit: int,
 ) -> torch.Tensor:
-    if not current_platform.is_cuda():
+    if not (current_platform.is_cuda() or current_platform.is_rocm()):
         raise NotImplementedError(
-            "The optimized moe_wna16_gemm kernel is only available on CUDA platforms"
+            "The optimized moe_wna16_gemm kernel is only available on CUDA/ROCm"
         )
     torch.ops._moe_C.moe_wna16_gemm(
         input,

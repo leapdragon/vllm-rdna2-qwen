@@ -1275,11 +1275,13 @@ set(VLLM_MOE_EXT_SRC
   "csrc/libtorch_stable/moe/torch_bindings.cpp"
   "csrc/libtorch_stable/moe/moe_align_sum_kernels.cu"
   "csrc/libtorch_stable/moe/topk_softmax_kernels.cu"
-  "csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu")
+  "csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu"
+  # moe_wna16 builds for HIP too: its PTX helpers have portable ROCm
+  # equivalents in moe_wna16_utils.h (gfx1030 W4 MoE decode path)
+  "csrc/libtorch_stable/moe/moe_wna16.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC
-    "csrc/libtorch_stable/moe/moe_wna16.cu"
     "csrc/libtorch_stable/moe/grouped_topk_kernels.cu")
 endif()
 
