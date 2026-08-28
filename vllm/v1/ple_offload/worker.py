@@ -396,7 +396,19 @@ def _ple_disk_attach(layer_name: str, layer: torch.nn.Module,
     parts = pname.split(".")
     for p in parts[:-1]:
         owner = getattr(owner, p)
-    getattr(owner, parts[-1]).data = mapped
+    target = getattr(owner, parts[-1])
+    if target.is_meta:
+        # The offload worker builds the model under torch.device("meta") and this
+        # attach runs before any weights are materialized, so `.data = mapped`
+        # hits set_data's type check (meta is not cpu). Swap the Parameter itself
+        # and carry over vLLM's weight-loading metadata (weight_loader, output_dim,
+        # ...), which set_weight_attrs stores in the instance __dict__.
+        new_param = torch.nn.Parameter(mapped, requires_grad=False)
+        for attr, value in vars(target).items():
+            setattr(new_param, attr, value)
+        setattr(owner, parts[-1], new_param)
+    else:
+        target.data = mapped
     logger.info(
         "PLE disk offload: %s.%s -> %s (%.1f GiB, %s)",
         layer_name, pname, bin_path, nbytes / (1 << 30),
