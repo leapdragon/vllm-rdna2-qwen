@@ -67,8 +67,9 @@ source ~/venvs/vllm-rdna2-qwen/bin/activate
 # with its own bundled ROCm 7.1 runtime — exactly the mixed-ROCm trap; you built torch above)
 uv pip install "cmake>=3.26.1,<4" "packaging>=24.2" "setuptools>=77.0.3,<80" "setuptools-scm>=8" \
             "setuptools-rust>=1.9.0" wheel "jinja2>=3.1.6" ninja -r requirements/common.txt
-uv pip install /opt/rocm/share/amd_smi                # TheRock's own amdsmi Python package (vLLM's ROCm
-                                                     # platform layer imports it; the PyPI pin is for 7.0)
+cp -r /opt/rocm/share/amd_smi /tmp/amd_smi && uv pip install /tmp/amd_smi   # TheRock's own amdsmi Python
+                                                     # package (vLLM's ROCm platform layer imports it; the PyPI
+                                                     # pin is for 7.0). Copy first: setup writes egg-info in place
 export VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1030 ROCM_PATH=/opt/rocm MAX_JOBS=24
 uv pip install -e . --no-build-isolation --no-deps   # ~15 min: _C, _rocm_C (our kernels), _moe_C
 uv pip install -r requirements/rocm.txt --no-deps       # runtime deps (then `pip check` and add what it names)
