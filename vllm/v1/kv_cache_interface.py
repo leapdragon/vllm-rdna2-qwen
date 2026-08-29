@@ -151,6 +151,10 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return True
+
+    @property
     def num_heads(self) -> int:
         raise NotImplementedError
 
@@ -746,6 +750,38 @@ class SlidingWindowSpec(AttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class CircularBufferSpec(AttentionSpec):
+    """One block per request holding the raw keys of the token group that
+    is still being compressed.
+
+    ``block_size`` is the ring capacity. It must exceed the compression ratio
+    by the speculative lookahead: a speculative step stores all of its rows,
+    drafts included, before acceptance is known, while the next step still
+    reads the open group's committed keys from the ring.
+    """
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # The ring occupies one block per request for its whole lifetime.
+        del vllm_config
+        return self.page_size_bytes
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        del vllm_config, max_len
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
+        )
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
@@ -814,11 +850,14 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
-    dtypes: tuple[torch.dtype]
+    dtypes: tuple[torch.dtype, ...]
     page_size_padded: int | None = None
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
+    # rank holds the full state (e.g. the replicated PLE conv state).
+    tp_replicated: bool = False
     num_prefill_checkpoint_blocks: int = 0
     num_heads: int = 1
     tokens_per_state: int = -1
@@ -964,6 +1003,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+
+    @property
+    def first_spec(self) -> KVCacheSpec:
+        """Return the first spec in the group."""
+        return next(iter(self.kv_cache_specs.values()))
+
+    @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
@@ -1015,7 +1063,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         else:
             return None
 
-    # NOTE: below util functions are only used by DeepseekV4 for now.
+    # Helpers for cache formats composed of repeated physical layer tuples.
+    def get_page_sizes(self) -> list[int]:
+        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
+
     def get_num_layer_tuples(self) -> int:
         return Counter(
             spec.page_size_bytes for spec in self.kv_cache_specs.values()
@@ -1212,7 +1263,13 @@ class KVCacheConfig:
 
     @property
     def has_mamba_layers(self) -> bool:
-        return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
+        for group in self.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                group_spec = group_spec.first_spec
+            if isinstance(group_spec, MambaSpec):
+                return True
+        return False
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:

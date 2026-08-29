@@ -17,13 +17,19 @@ import torch
 from vllm.config import CacheConfig
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_bytes_per_block,
+    _max_memory_usage_bytes_from_groups,
     _pool_bytes_per_block,
     get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+    resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -84,6 +90,198 @@ def _expected_bytes_per_block(groups) -> int:
 
 def _bind(config, layout: str):
     return allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout], None)
+
+
+MAIN_KV_PAGE_BYTES = 2_048
+COMPRESSED_PAGE_BYTES = 128
+NUM_CACHE_TUPLES = 3
+BYTES_PER_BLOCK = NUM_CACHE_TUPLES * (MAIN_KV_PAGE_BYTES + COMPRESSED_PAGE_BYTES)
+
+
+def _main_kv_name(layer_index: int) -> str:
+    return f"model.layers.{layer_index}.self_attn"
+
+
+def _compressed_name(layer_index: int) -> str:
+    return f"model.layers.{layer_index}.self_attn.indexer.compressed_key_cache"
+
+
+def _compressor_state_name(layer_index: int) -> str:
+    return f"model.layers.{layer_index}.self_attn.indexer.raw_key_cache"
+
+
+def _make_csa_linear_specs(
+    num_mamba: int = 7,
+    num_tuples: int = NUM_CACHE_TUPLES,
+) -> dict[str, KVCacheSpec]:
+    specs: dict[str, KVCacheSpec] = {}
+    for layer_index in range(num_mamba):
+        specs[f"model.layers.{layer_index}.linear_attn"] = MambaSpec(
+            block_size=16,
+            shapes=((32,),),
+            dtypes=(torch.bfloat16,),
+        )
+    specs["model.layers.0.ple"] = MambaSpec(
+        block_size=16,
+        shapes=((24,),),
+        dtypes=(torch.bfloat16,),
+        tp_replicated=True,
+    )
+    for layer_index in range(num_tuples):
+        specs[_main_kv_name(layer_index)] = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=16,
+            head_size_v=16,
+            dtype=torch.bfloat16,
+        )
+        specs[_compressed_name(layer_index)] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=16,
+            dtype=torch.bfloat16,
+            tokens_per_state=4,
+        )
+        specs[_compressor_state_name(layer_index)] = CircularBufferSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=8,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+        )
+    return specs
+
+
+def _shared_layout_config():
+    config = _mock_vllm_config("BLNHC")
+    config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    config.speculative_config = None
+    config.model_config.max_model_len = 16
+    config.model_config.get_total_num_hidden_layers.return_value = 64
+    config.model_config.get_total_num_kv_heads.return_value = 2
+    config.model_config.get_num_kv_heads.return_value = 2
+    config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = 1
+    config.cache_config.block_size = 16
+    config.cache_config.enable_prefix_caching = False
+    config.cache_config.prefix_match_unit = None
+    config.cache_config.mamba_cache_mode = "none"
+    return config
+
+
+def _placements_by_layer(kv_cache_config) -> dict[str, tuple[int, int]]:
+    return {
+        layer_name: (
+            tensor.offset + index * tensor.layer_stride,
+            tensor.block_stride,
+        )
+        for tensor in kv_cache_config.kv_cache_tensors
+        for index, layer_name in enumerate(tensor.layers)
+    }
+
+
+class TestCSALinearPacking:
+    def test_layer_types_form_compressed_sparse_compressor_state_and_mamba_groups(
+        self,
+    ):
+        groups = get_kv_cache_groups(_shared_layout_config(), _make_csa_linear_specs())
+
+        assert len(groups) == 6
+        compressed_sparse, compressor_state, *mamba = groups
+        assert compressed_sparse.layer_names == [
+            name
+            for i in range(NUM_CACHE_TUPLES)
+            for name in (_main_kv_name(i), _compressed_name(i))
+        ]
+        assert compressor_state.layer_names == [
+            _compressor_state_name(i) for i in range(NUM_CACHE_TUPLES)
+        ]
+        assert [len(group.layer_names) for group in mamba] == [3, 2, 2, 1]
+        assert all(not group.kv_cache_spec.tp_replicated for group in mamba[:-1])
+        assert mamba[-1].kv_cache_spec.tp_replicated
+        assert compressed_sparse.kv_cache_spec.prefix_cacheable
+        assert not compressor_state.kv_cache_spec.prefix_cacheable
+        assert {
+            compressor_state.kv_cache_spec.kv_cache_specs[name].page_size_bytes
+            for name in compressor_state.layer_names
+        } == {COMPRESSED_PAGE_BYTES}
+        assert all(
+            group.kv_cache_spec.page_size_bytes == MAIN_KV_PAGE_BYTES for group in mamba
+        )
+
+    def test_shared_tensors_match_expected_memory_and_ownership(self):
+        config = _shared_layout_config()
+        groups = get_kv_cache_groups(config, _make_csa_linear_specs())
+
+        assert _get_kv_cache_bytes_per_block(groups) == BYTES_PER_BLOCK
+        assert _max_memory_usage_bytes_from_groups(config, groups) == (
+            BYTES_PER_BLOCK * 6
+        )
+        kv_cache_config = get_kv_cache_config_from_groups(
+            config,
+            groups,
+            available_memory=BYTES_PER_BLOCK * 32,
+        )
+
+        assert kv_cache_config.num_blocks == 32
+        assert {tensor.size for tensor in kv_cache_config.kv_cache_tensors} == {
+            BYTES_PER_BLOCK * 32
+        }
+        assert all(
+            tensor.block_stride == BYTES_PER_BLOCK
+            for tensor in kv_cache_config.kv_cache_tensors
+        )
+
+        placements = _placements_by_layer(kv_cache_config)
+        mamba_groups = groups[2:]
+        for index in range(NUM_CACHE_TUPLES):
+            main_placement = placements[_main_kv_name(index)]
+            for group in mamba_groups:
+                if index < len(group.layer_names):
+                    assert placements[group.layer_names[index]] == main_placement
+            assert (
+                placements[_compressed_name(index)]
+                == placements[_compressor_state_name(index)]
+            )
+
+        views = _bind(kv_cache_config, "BLNHC")
+        for index in range(NUM_CACHE_TUPLES):
+            main_view = views[_main_kv_name(index)]
+            assert main_view.stride(0) * main_view.element_size() == BYTES_PER_BLOCK
+            for group in mamba_groups:
+                if index < len(group.layer_names):
+                    mamba_view = views[group.layer_names[index]]
+                    assert mamba_view.data_ptr() == main_view.data_ptr()
+                    assert (
+                        mamba_view.stride(0) * mamba_view.element_size()
+                        == BYTES_PER_BLOCK
+                    )
+            assert views[_compressed_name(index)].data_ptr() == (
+                views[_compressor_state_name(index)].data_ptr()
+            )
+
+    def test_prefix_hits_are_aligned_and_ignore_private_compressor_state(self):
+        config = _shared_layout_config()
+        config.cache_config.enable_prefix_caching = True
+        config.cache_config.prefix_match_unit = 16
+        groups = get_kv_cache_groups(
+            config,
+            _make_csa_linear_specs(num_tuples=1),
+        )
+        kv_cache_config = get_kv_cache_config_from_groups(
+            config,
+            groups,
+            available_memory=2 * MAIN_KV_PAGE_BYTES,
+        )
+
+        assert resolve_kv_cache_block_sizes(kv_cache_config, config) == (16, 16)
+
+        config.cache_config.prefix_match_unit = 2
+        with pytest.raises(ValueError, match="compression ratio"):
+            get_kv_cache_groups(
+                config,
+                _make_csa_linear_specs(num_tuples=1),
+            )
 
 
 class TestDensePacking:
