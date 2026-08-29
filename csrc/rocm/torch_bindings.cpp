@@ -47,6 +47,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("gemv_f16_rdna2(Tensor x, Tensor w, Tensor? bias) -> Tensor");
   rocm_ops.impl("gemv_f16_rdna2", torch::kCUDA, &gemv_f16_rdna2);
 
+  // T44: push-based one-shot all-reduce for small TP messages on gfx1030
+  rocm_ops.def(
+      "rdna_ar_init(int rank, int world, Tensor device_ids, int max_bytes, "
+      "str shm_name) -> Tensor");
+  rocm_ops.impl("rdna_ar_init", torch::kCPU, &rdna_ar_init);
+  rocm_ops.def("rdna_ar_connect(int handle, Tensor handles) -> ()");
+  rocm_ops.impl("rdna_ar_connect", torch::kCPU, &rdna_ar_connect);
+  rocm_ops.def("rdna_ar_can(int handle, Tensor t) -> bool");
+  rocm_ops.impl("rdna_ar_can", torch::kCUDA, &rdna_ar_can);
+  rocm_ops.def("rdna_ar_all_reduce(int handle, Tensor t) -> Tensor");
+  rocm_ops.impl("rdna_ar_all_reduce", torch::kCUDA, &rdna_ar_all_reduce);
+  // no tensor arguments -> no dispatch key; register as catch-all
+  rocm_ops.def("rdna_ar_timed_out(int handle) -> bool", &rdna_ar_timed_out);
+  rocm_ops.def("rdna_ar_fast_calls(int handle) -> int", &rdna_ar_fast_calls);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitKrc(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "

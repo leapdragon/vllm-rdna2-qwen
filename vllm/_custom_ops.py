@@ -2210,6 +2210,28 @@ def wvSplitK(
     return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
 
 
+def rdna_ar_init(
+    rank: int, world: int, device_ids: torch.Tensor, max_bytes: int, shm_name: str
+) -> torch.Tensor:
+    return torch.ops._rocm_C.rdna_ar_init(rank, world, device_ids, max_bytes, shm_name)
+
+
+def rdna_ar_connect(handle: int, handles: torch.Tensor) -> None:
+    torch.ops._rocm_C.rdna_ar_connect(handle, handles)
+
+
+def rdna_ar_can(handle: int, t: torch.Tensor) -> bool:
+    return torch.ops._rocm_C.rdna_ar_can(handle, t)
+
+
+def rdna_ar_all_reduce(handle: int, t: torch.Tensor) -> torch.Tensor:
+    return torch.ops._rocm_C.rdna_ar_all_reduce(handle, t)
+
+
+def rdna_ar_timed_out(handle: int) -> bool:
+    return torch.ops._rocm_C.rdna_ar_timed_out(handle)
+
+
 def gemv_f16_rdna2(
     x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor:
