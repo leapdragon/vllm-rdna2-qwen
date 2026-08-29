@@ -7,6 +7,7 @@ The scripts that built, served, measured and validated the configuration in
 |---|---|
 | `build-torch-rocm714.sh` | build PyTorch (ROCm/pytorch release/2.12) + Triton wheels for gfx1030 against TheRock ROCm 7.14 |
 | `serve-qwen38-flash-next.sh` | the serving configuration (host, no container); every knob explained in `docs/rdna2/CHANGES.md` §4 |
+| `validate.py [base_url]` | four greedy sanity checks against the running server; exit 0 only if all pass |
 
 | file | what | how to run |
 |---|---|---|

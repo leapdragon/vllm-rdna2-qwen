@@ -115,8 +115,9 @@ python tools/rdna2/bench.py 1 1024        # long-generation control
 python tools/rdna2/bench_ctx.py 13000 256 # decode at ~13k context, unique prompt
 ```
 
-Greedy sanity (chat completions, `enable_thinking: false`, temperature 0): `17 * 23` → `391`,
-capital of Australia → `Canberra`, first five primes → `2, 3, 5, 7, 11`.
+Greedy sanity: `python tools/rdna2/validate.py` (chat completions, `enable_thinking: false`,
+temperature 0): `17 * 23` → `391`, capital of Australia → `Canberra`, first five primes →
+`2, 3, 5, 7, 11`, and a "why is the sky blue" that must mention scattering.
 
 What you should see (our numbers, `RESULTS.md` T46):
 
