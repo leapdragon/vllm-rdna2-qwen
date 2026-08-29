@@ -255,7 +255,6 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             and hidden_states.dtype == torch.float16
             and hidden_states.shape[0] <= 8
             and activation == MoEActivation.SILU
-            and expert_map is None
             and not apply_router_weight_on_input
             and self.quant_config.w1_zp is None
             and self.block_shape is not None
@@ -270,6 +269,11 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 # invoke+moe_sum tail below.
                 M = hidden_states.shape[0]
                 topk = topk_ids.shape[1]
+                if expert_map is not None:
+                    # Expert parallelism: global -> local expert ids, -1 for
+                    # experts held by other ranks (the kernel skips those; the
+                    # layer's all-reduce sums the per-rank partials).
+                    topk_ids = expert_map[topk_ids]
                 inter = w1.size(1) // 2
                 act_buf = torch.empty(
                     (M, topk, inter),
@@ -689,7 +693,6 @@ class TritonWNA16Experts(TritonExperts):
             and hidden_states.dtype == torch.float16
             and hidden_states.shape[0] <= 8
             and activation == MoEActivation.SILU
-            and expert_map is None
             and not apply_router_weight_on_input
             and self.quant_config.w1_zp is None
             and self.block_shape is not None
@@ -704,6 +707,11 @@ class TritonWNA16Experts(TritonExperts):
                 # invoke+moe_sum tail below.
                 M = hidden_states.shape[0]
                 topk = topk_ids.shape[1]
+                if expert_map is not None:
+                    # Expert parallelism: global -> local expert ids, -1 for
+                    # experts held by other ranks (the kernel skips those; the
+                    # layer's all-reduce sums the per-rank partials).
+                    topk_ids = expert_map[topk_ids]
                 inter = w1.size(1) // 2
                 act_buf = torch.empty(
                     (M, topk, inter),

@@ -2210,6 +2210,14 @@ def wvSplitK(
     return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
 
 
+def gemv_f16_rdna2(
+    x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    """gfx1030 fp16 skinny GEMM, M <= 8 tokens: x[M,K] . w[N,K]^T (+bias).
+    See skinny_gemms_int4.cu (T43)."""
+    return torch.ops._rocm_C.gemv_f16_rdna2(x, w, bias)
+
+
 def moe_skinny_int4_decode(
     input: torch.Tensor,
     w13: torch.Tensor,

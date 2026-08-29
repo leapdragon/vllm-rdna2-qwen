@@ -53,6 +53,9 @@ void paged_attention(
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
 
+at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
+                          const std::optional<at::Tensor>& bias);
+
 void moe_skinny_int4_decode(const at::Tensor& input, const at::Tensor& w13,
                             const at::Tensor& w13_scale, const at::Tensor& w2,
                             const at::Tensor& w2_scale,

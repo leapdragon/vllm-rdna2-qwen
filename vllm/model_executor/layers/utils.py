@@ -260,11 +260,34 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import (
+        on_gfx1x,
+        on_gfx9,
+        on_gfx10x,
+        on_gfx950,
+        on_gfx1250,
+    )
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
+
+    # gfx10x decode path (T43): vLLM's wvSplitK/LLMM1 are gfx9/gfx11+ only and
+    # their RDNA build gives wrong results on gfx1030, so without this every
+    # dense fp16 projection ran on rocBLAS Tensile tiles at ~35% of bandwidth.
+    if (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and on_gfx10x()
+        and x.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and 0 < n <= 8
+        and k % 8 == 0
+        and weight.is_contiguous()
+        and (bias is None or bias.is_contiguous())
+    ):
+        x_view = x.reshape(-1, k).contiguous()
+        out = ops.gemv_f16_rdna2(x_view, weight, bias)
+        return out.reshape(*x.shape[:-1], m)
 
     cu_count = num_compute_units()
 
