@@ -228,11 +228,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
         if hasattr(layer, "weight_i8"):
-            from vllm.model_executor.layers import rdna_dense_int8
+            # T45/T46: int8 shadow for decode, fp16 rocBLAS for prefill -- the
+            # choice is made at runtime inside the op (torch.compile would
+            # otherwise freeze it at trace time).
+            from vllm.model_executor.layers import rdna_ops  # noqa: F401
 
-            out = rdna_dense_int8.apply(layer, x, bias)
-            if out is not None:
-                return out
+            return torch.ops.vllm.rdna_dense_gemm(
+                x, layer.weight, layer.weight_i8, layer.weight_i8_scale, bias
+            )
         return self._gemm_impl(layer, x, layer.weight, bias)
 
 

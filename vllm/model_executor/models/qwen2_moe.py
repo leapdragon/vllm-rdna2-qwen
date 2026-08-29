@@ -29,6 +29,8 @@ from collections.abc import Iterable
 from itertools import islice
 from typing import Any
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -36,7 +38,11 @@ from transformers import Qwen2MoeConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -110,6 +116,26 @@ class Qwen2MoeMLP(nn.Module):
         self.expert_gate = expert_gate
 
     def forward(self, x):
+        if self.expert_gate is not None and _rdna_shared_expert_ok(self, x):
+            # T46 (gfx1030): opaque op; decode (M <= 8) = gate_up+silu*mul kernel
+            # then down GEMV with sigmoid(w_gate.x) fused (6 launches -> 2);
+            # prefill = torch inside the op. Row-parallel reduce as before.
+            from vllm.model_executor.layers import rdna_ops  # noqa: F401
+
+            g, d, e = self.gate_up_proj, self.down_proj, self.expert_gate
+            out = torch.ops.vllm.rdna_shared_expert(
+                x,
+                g.weight,
+                getattr(g, "weight_i8", None),
+                getattr(g, "weight_i8_scale", None),
+                d.weight,
+                getattr(d, "weight_i8", None),
+                getattr(d, "weight_i8_scale", None),
+                e.weight.reshape(-1),
+            )
+            if d.reduce_results and d.tp_size > 1:
+                out = tensor_model_parallel_all_reduce(out)
+            return out
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)

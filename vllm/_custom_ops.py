@@ -2232,6 +2232,22 @@ def rdna_ar_timed_out(handle: int) -> bool:
     return torch.ops._rocm_C.rdna_ar_timed_out(handle)
 
 
+def rdna_gemv_act(x, w, scale, act_cols: int, act_scale: float) -> torch.Tensor:
+    return torch.ops._rocm_C.rdna_gemv_act(x, w, scale, act_cols, act_scale)
+
+
+def rdna_hc_up_gate_mix(lora, w, scale, xn, hc_count: int) -> torch.Tensor:
+    return torch.ops._rocm_C.rdna_hc_up_gate_mix(lora, w, scale, xn, hc_count)
+
+
+def rdna_se_gate_up_silu(x, w, scale) -> torch.Tensor:
+    return torch.ops._rocm_C.rdna_se_gate_up_silu(x, w, scale)
+
+
+def rdna_se_down_gated(act, w, scale, x, w_gate) -> torch.Tensor:
+    return torch.ops._rocm_C.rdna_se_down_gated(act, w, scale, x, w_gate)
+
+
 def gemv_i8_rdna2(
     x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor:

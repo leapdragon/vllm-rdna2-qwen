@@ -1498,6 +1498,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
     "csrc/rocm/rdna_allreduce.cu"
+    "csrc/rocm/rdna_fused_glue.cu"
     "csrc/rocm/attention.cu")
   set(VLLM_ROCM_EXT_FLAGS ${VLLM_GPU_FLAGS})
 

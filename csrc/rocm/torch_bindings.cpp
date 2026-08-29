@@ -49,6 +49,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def("gemv_i8_rdna2(Tensor x, Tensor w, Tensor scale, Tensor? bias) -> Tensor");
   rocm_ops.impl("gemv_i8_rdna2", torch::kCUDA, &gemv_i8_rdna2);
 
+  // T46: fused decode glue (hyper-connection mix, shared expert)
+  rocm_ops.def("rdna_gemv_act(Tensor x, Tensor w, Tensor? scale, int act_cols, float act_scale) -> Tensor");
+  rocm_ops.impl("rdna_gemv_act", torch::kCUDA, &rdna_gemv_act);
+  rocm_ops.def("rdna_hc_up_gate_mix(Tensor lora, Tensor w, Tensor? scale, Tensor xn, int hc_count) -> Tensor");
+  rocm_ops.impl("rdna_hc_up_gate_mix", torch::kCUDA, &rdna_hc_up_gate_mix);
+  rocm_ops.def("rdna_se_gate_up_silu(Tensor x, Tensor w, Tensor? scale) -> Tensor");
+  rocm_ops.impl("rdna_se_gate_up_silu", torch::kCUDA, &rdna_se_gate_up_silu);
+  rocm_ops.def("rdna_se_down_gated(Tensor act, Tensor w, Tensor? scale, Tensor x, Tensor w_gate) -> Tensor");
+  rocm_ops.impl("rdna_se_down_gated", torch::kCUDA, &rdna_se_down_gated);
+
   // T44: push-based one-shot all-reduce for small TP messages on gfx1030
   rocm_ops.def(
       "rdna_ar_init(int rank, int world, Tensor device_ids, int max_bytes, "

@@ -63,6 +63,18 @@ at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in);
 bool rdna_ar_timed_out(int64_t handle);
 int64_t rdna_ar_fast_calls(int64_t handle);
 
+at::Tensor rdna_gemv_act(const at::Tensor& x, const at::Tensor& w,
+                         const std::optional<at::Tensor>& scale, int64_t act_cols,
+                         double act_scale);
+at::Tensor rdna_hc_up_gate_mix(const at::Tensor& lora, const at::Tensor& w,
+                               const std::optional<at::Tensor>& scale, const at::Tensor& xn,
+                               int64_t hc_count);
+at::Tensor rdna_se_gate_up_silu(const at::Tensor& x, const at::Tensor& w,
+                                const std::optional<at::Tensor>& scale);
+at::Tensor rdna_se_down_gated(const at::Tensor& act, const at::Tensor& w,
+                              const std::optional<at::Tensor>& scale, const at::Tensor& x,
+                              const at::Tensor& w_gate);
+
 at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scale,
                          const std::optional<at::Tensor>& bias);
 
