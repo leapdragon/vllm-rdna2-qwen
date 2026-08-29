@@ -61,11 +61,17 @@ list is not an error message, it is a wrong build.
 
 ```bash
 source ~/venvs/vllm-rdna2-qwen/bin/activate
-pip install -r requirements/rocm-build.txt          # build deps (no torch — you built it)
+# build deps WITHOUT torch/triton (requirements/build/rocm.txt would pull torch 2.11+rocm7.1
+# with its own bundled ROCm 7.1 runtime — exactly the mixed-ROCm trap; you built torch above)
+pip install "cmake>=3.26.1,<4" "packaging>=24.2" "setuptools>=77.0.3,<80" "setuptools-scm>=8" \
+            "setuptools-rust>=1.9.0" wheel "jinja2>=3.1.6" ninja -r requirements/common.txt
 export VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1030 ROCM_PATH=/opt/rocm MAX_JOBS=24
-pip install -e . --no-build-isolation                # ~15 min: _C, _rocm_C (our kernels), _moe_C
-pip install -r requirements/rocm.txt                 # runtime deps
+pip install -e . --no-build-isolation --no-deps      # ~15 min: _C, _rocm_C (our kernels), _moe_C
+pip install -r requirements/rocm.txt --no-deps       # runtime deps (then `pip check` and add what it names)
 ```
+
+The Rust frontend (`vllm-rs`, the Rust tool parser) is optional and is skipped when `cargo` is
+absent; nothing on this path needs it.
 
 Rebuilding only the ROCm extension after a kernel edit: see `tools/rdna2/README.md`.
 
