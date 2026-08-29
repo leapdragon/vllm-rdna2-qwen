@@ -434,7 +434,17 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             # exists to keep the embedding opaque to graph capture, which the
             # offload process does not do -- and we are already inside the
             # owning module, so do the lookup directly.
-            output.copy_(self.ngram_embedding(ngram_ids).flatten(-2))
+            quant = getattr(self.ngram_embedding, "_ple_quant", None)
+            if quant is not None:
+                # Quantized sidecar: the checkpoint table was stubbed to an empty
+                # tensor, and gathers are dequantized straight out of the mmapped
+                # shards. ngram_ids is (tokens, heads) and output is
+                # (tokens, heads * head_dim), so both flatten to per-head rows.
+                quant.gather_into(
+                    ngram_ids.reshape(-1), output.reshape(-1, self.head_dim)
+                )
+            else:
+                output.copy_(self.ngram_embedding(ngram_ids).flatten(-2))
         else:
             torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
                 ngram_ids,

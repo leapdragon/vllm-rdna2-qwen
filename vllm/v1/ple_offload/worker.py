@@ -360,6 +360,141 @@ def _disk_backed_tensor(path: str, shape: tuple[int, ...], dtype: torch.dtype,
     return torch.from_numpy(arr).view(dtype)
 
 
+# ---------------------------------------------------------------------------
+# Quantized PLE sidecar (primitive-ai/Qwen3.8-Flash-Next-PLE-quant).
+#
+# The bf16 n-gram table is 95-102 GB, which does not fit this host's RAM, so the
+# disk path below pages it and every decoded token pays random read latency. The
+# sidecar ships the same table at int4 g16 (32 GB) / fp8 per-row (49 GB), small
+# enough to sit in page cache. Lifted from that repo's worker overlay: pure torch
+# plus safetensors mmap, no CUDA, so it runs unchanged on ROCm.
+# ---------------------------------------------------------------------------
+
+class _PleQuantTable:
+    """Shard-mmapped quantized n-gram table; gathers dequantize to BF16."""
+
+    ROWS_PER_SHARD = 2_500_012
+
+    def __init__(self, quant_dir: str, total_rows: int, width: int) -> None:
+        import json
+        import os
+
+        from safetensors import safe_open
+
+        meta = json.load(open(os.path.join(quant_dir, "META.json")))
+        self.layout = meta["layout"]
+        assert meta["rows"] == total_rows and meta["width"] == width, (
+            f"sidecar built for {meta['rows']}x{meta['width']}, "
+            f"table is {total_rows}x{width}"
+        )
+        n_shards = meta["shards"]
+        assert n_shards * self.ROWS_PER_SHARD == total_rows, "non-uniform shards"
+        # Order matters: the e2m1 layout string contains "e4m3" (its scale dtype).
+        if "e2m1" in self.layout:
+            key = "weight_e2m1"
+        elif "e4m3" in self.layout:
+            key = "weight_fp8"
+        else:
+            key = "weight_i4"
+        self._q, self._s, self._s2 = [], [], []
+        for n in range(n_shards):
+            f = safe_open(os.path.join(quant_dir, f"shard_{n}.safetensors"),
+                          framework="pt")
+            self._q.append(f.get_tensor(key))
+            self._s.append(f.get_tensor("weight_scale"))
+            self._s2.append(
+                f.get_tensor("weight_scale_2").item()
+                if "weight_scale_2" in f.keys() else 1.0
+            )
+        self.width = width
+        self._lut = None
+        logger.info("PLE quant table: %s, %d shards mmapped from %s",
+                    self.layout, n_shards, quant_dir)
+
+    def gather_into(self, ids: torch.Tensor, out: torch.Tensor) -> None:
+        ids = ids.long()
+        shard = ids // self.ROWS_PER_SHARD
+        local = ids - shard * self.ROWS_PER_SHARD
+        order = torch.argsort(shard)
+        s_sorted, l_sorted = shard[order], local[order]
+        uniq, counts = torch.unique_consecutive(s_sorted, return_counts=True)
+        pos = 0
+        for s, c in zip(uniq.tolist(), counts.tolist()):
+            sel = l_sorted[pos:pos + c]
+            rows = self._dequant(s, sel)
+            out[order[pos:pos + c]] = rows.to(out.dtype)
+            pos += c
+
+    def _dequant(self, s: int, sel: torch.Tensor) -> torch.Tensor:
+        if "e2m1" in self.layout:
+            if self._lut is None:
+                mags = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+                self._lut = torch.tensor(mags + [-m for m in mags],
+                                         dtype=torch.float32)
+            packed = self._q[s].index_select(0, sel)
+            lo = (packed & 0xF).long()
+            hi = (packed >> 4).long()
+            nib = torch.stack((lo, hi), dim=-1).view(packed.shape[0], self.width)
+            scale = self._s[s].index_select(0, sel).to(torch.float32)
+            g = self.width // scale.shape[1]
+            return (self._lut[nib]
+                    * scale.repeat_interleave(g, dim=1)
+                    * self._s2[s])
+        if "e4m3" in self.layout:
+            q = self._q[s].index_select(0, sel).to(torch.float32)
+            return q * self._s[s].index_select(0, sel)[:, None]
+        packed = self._q[s].index_select(0, sel)
+        lo = (packed & 0xF).to(torch.int16)
+        hi = (packed >> 4).to(torch.int16)
+        nib = torch.stack((lo, hi), dim=-1).view(packed.shape[0], self.width)
+        scale = self._s[s].index_select(0, sel).to(torch.float32)
+        g = self.width // scale.shape[1]
+        return (nib.to(torch.float32) - 8) * scale.repeat_interleave(g, dim=1)
+
+
+def _ple_quant_dir() -> str | None:
+    import os
+
+    return os.environ.get("VLLM_PLE_QUANT_DIR") or None
+
+
+def _ple_quant_attach(layer_name: str, layer: torch.nn.Module,
+                      quant_dir: str) -> str | None:
+    """Swap the layer's table for a sidecar-backed quant store.
+
+    Returns the stubbed parameter's name, or None when the layer has no
+    parameter large enough to be a table (>= 1 GiB).
+    """
+    named = sorted(layer.named_parameters(), key=lambda kv: kv[1].numel(), reverse=True)
+    if not named or named[0][1].numel() * named[0][1].element_size() < (1 << 30):
+        return None
+    pname, param = named[0]
+    rows, width = param.shape
+    owner = layer
+    parts = pname.split(".")
+    for p in parts[:-1]:
+        owner = getattr(owner, p)
+    owner._ple_quant = _PleQuantTable(quant_dir, rows, width)
+    # Stub before anything writes the parameter: the original 95 GB allocation
+    # is lazy virtual memory and stays unmaterialized.
+    stub = torch.empty(0, width, dtype=param.dtype)
+    target = getattr(owner, parts[-1])
+    if target.is_meta:
+        # Same constraint as _ple_disk_attach: this runs before weights are
+        # materialized, so the parameter is still on meta and `.data = stub`
+        # trips set_data's type check (meta is not cpu). Swap the Parameter and
+        # carry over vLLM's weight-loading metadata.
+        new_param = torch.nn.Parameter(stub, requires_grad=False)
+        for attr, value in vars(target).items():
+            setattr(new_param, attr, value)
+        setattr(owner, parts[-1], new_param)
+    else:
+        target.data = stub
+    logger.info("PLE quant: %s.%s stubbed, gathers served from sidecar.",
+                layer_name, pname)
+    return pname
+
+
 def _ple_disk_attach(layer_name: str, layer: torch.nn.Module,
                      disk_dir: str) -> tuple[str, bool] | None:
     """Swap the layer's largest parameter (the n-gram table) for a disk-backed map.
@@ -508,7 +643,13 @@ class PleOffloadRunner:
         )
         offload_prefixes = tuple(f"{name}." for name in offload_layers)
 
-        disk_dir = _ple_disk_dir()
+        quant_dir = _ple_quant_dir()
+        # A quantized sidecar replaces the checkpoint table outright, so the
+        # bf16 disk-paging path is not used when one is configured.
+        disk_dir = _ple_disk_dir() if quant_dir is None else None
+        if quant_dir is not None:
+            for layer_name, layer in offload_layers.items():
+                _ple_quant_attach(layer_name, layer, quant_dir)
         disk_attached: dict[str, str] = {}
         disk_complete_params: set[str] = set()
         disk_complete_tables: tuple[str, ...] = ()
