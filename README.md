@@ -1,3 +1,10 @@
+> **This fork: Qwen3.8-Flash-Next on 4× AMD Radeon PRO V620 (gfx1030) at ~100 tokens/s, built
+> against TheRock ROCm 7.14.** Start at [`docs/rdna2/README.md`](docs/rdna2/README.md) — what
+> to download, how to build, how to serve, what to expect. What changed and why:
+> [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md). Measurements: [`docs/rdna2/RESULTS.md`](docs/rdna2/RESULTS.md).
+> The silicon profile behind every kernel: [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md).
+> Tools: [`tools/rdna2/`](tools/rdna2/). Branch: `rdna2/qwen38-flash-next`; `main` tracks upstream.
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
