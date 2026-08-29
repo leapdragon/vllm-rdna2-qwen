@@ -50,7 +50,9 @@ PyTorch is built from source. Use the same pins as this fork's `docker/Dockerfil
 uv venv --python 3.12 ~/venvs/vllm-rdna2-qwen
 source ~/venvs/vllm-rdna2-qwen/bin/activate
 tools/rdna2/build-torch-rocm714.sh          # ~2–3 h on 32 cores; writes wheels to ~/wheels/rdna2/
-pip install ~/wheels/rdna2/torch-*.whl ~/wheels/rdna2/triton-*.whl
+uv pip install ~/wheels/rdna2/torch-*.whl ~/wheels/rdna2/triton-*.whl   # BEFORE any other dep:
+                                             # several vLLM deps require torch and pip would
+                                             # otherwise fetch the CUDA torch from PyPI
 python -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.get_arch_list())"
 ```
 
@@ -63,11 +65,11 @@ list is not an error message, it is a wrong build.
 source ~/venvs/vllm-rdna2-qwen/bin/activate
 # build deps WITHOUT torch/triton (requirements/build/rocm.txt would pull torch 2.11+rocm7.1
 # with its own bundled ROCm 7.1 runtime — exactly the mixed-ROCm trap; you built torch above)
-pip install "cmake>=3.26.1,<4" "packaging>=24.2" "setuptools>=77.0.3,<80" "setuptools-scm>=8" \
+uv pip install "cmake>=3.26.1,<4" "packaging>=24.2" "setuptools>=77.0.3,<80" "setuptools-scm>=8" \
             "setuptools-rust>=1.9.0" wheel "jinja2>=3.1.6" ninja -r requirements/common.txt
 export VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1030 ROCM_PATH=/opt/rocm MAX_JOBS=24
-pip install -e . --no-build-isolation --no-deps      # ~15 min: _C, _rocm_C (our kernels), _moe_C
-pip install -r requirements/rocm.txt --no-deps       # runtime deps (then `pip check` and add what it names)
+uv pip install -e . --no-build-isolation --no-deps   # ~15 min: _C, _rocm_C (our kernels), _moe_C
+uv pip install -r requirements/rocm.txt --no-deps       # runtime deps (then `pip check` and add what it names)
 ```
 
 The Rust frontend (`vllm-rs`, the Rust tool parser) is optional and is skipped when `cargo` is
