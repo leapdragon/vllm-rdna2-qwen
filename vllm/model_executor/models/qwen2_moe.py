@@ -76,6 +76,23 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+
+def _rdna_shared_expert_ok(mlp, x: torch.Tensor) -> bool:
+    """Static gate for the T46 fused shared-expert op (decode/prefill is runtime)."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm() or x.dtype != torch.float16 or x.dim() != 2:
+        return False
+    if os.getenv("VLLM_RDNA_FUSED_SE", "1") != "1":
+        return False
+    for lin in (mlp.gate_up_proj, mlp.down_proj, mlp.expert_gate):
+        if getattr(lin, "bias", None) is not None:
+            return False
+        if lin.weight.dtype != torch.float16:
+            return False
+    return True
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
