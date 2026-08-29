@@ -647,12 +647,25 @@ class PleOffloadRunner:
         # A quantized sidecar replaces the checkpoint table outright, so the
         # bf16 disk-paging path is not used when one is configured.
         disk_dir = _ple_disk_dir() if quant_dir is None else None
-        if quant_dir is not None:
-            for layer_name, layer in offload_layers.items():
-                _ple_quant_attach(layer_name, layer, quant_dir)
         disk_attached: dict[str, str] = {}
         disk_complete_params: set[str] = set()
         disk_complete_tables: tuple[str, ...] = ()
+        if quant_dir is not None:
+            # The sidecar supplies the table, so its parameter must be marked
+            # already-complete: the checkpoint no longer carries it (we do not
+            # even download that shard) and the post-load completeness check
+            # would otherwise fail on
+            # '...ple_embedding.ngram_embedding.weight'. Same bookkeeping the
+            # disk path does for a finished file.
+            table_prefixes = []
+            for layer_name, layer in offload_layers.items():
+                pname = _ple_quant_attach(layer_name, layer, quant_dir)
+                if pname is None:
+                    continue
+                full = f"{layer_name}.{pname}"
+                disk_complete_params.add(full)
+                table_prefixes.append(full.rsplit(".", 1)[0])
+            disk_complete_tables = tuple(table_prefixes)
         if disk_dir is not None:
             table_prefixes = []
             for layer_name, layer in offload_layers.items():
