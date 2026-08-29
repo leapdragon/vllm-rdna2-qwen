@@ -254,3 +254,8 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# this fork (rdna2): out-of-tree extension builds, traces, local model dirs
+build_rocm/
+logs/
+models/
