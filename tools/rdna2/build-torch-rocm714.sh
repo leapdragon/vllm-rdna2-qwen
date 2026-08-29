@@ -20,7 +20,9 @@ mkdir -p "$SRC" "$OUT"
 
 [ -x "$ROCM_PATH/bin/hipcc" ] || { echo "no hipcc under $ROCM_PATH"; exit 1; }
 python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version' || { echo "use a Python 3.12 venv"; exit 1; }
-python3 -m pip install -q --upgrade pip setuptools wheel ninja cmake pyyaml numpy typing_extensions requests packaging
+# uv venvs ship without pip; use whichever installer exists
+if python3 -m pip --version >/dev/null 2>&1; then PIP="python3 -m pip"; else PIP="uv pip"; fi
+$PIP install -q --upgrade setuptools wheel ninja cmake pyyaml numpy typing_extensions requests packaging
 
 export ROCM_PATH ROCM_HOME="$ROCM_PATH" HIP_PATH="$ROCM_PATH" MAX_JOBS
 export PATH="$ROCM_PATH/bin:$PATH"
@@ -39,7 +41,7 @@ cd "$SRC/pytorch"
 git fetch -q origin
 git checkout -q "$PYTORCH_REF"
 git submodule sync -q && git submodule update -q --init --recursive
-python3 -m pip install -q -r requirements.txt
+$PIP install -q -r requirements.txt
 # hipify the CUDA sources in-tree (idempotent)
 python3 tools/amd_build/build_amd.py
 python3 setup.py bdist_wheel --dist-dir "$OUT" 2>&1 | tee "$OUT/torch-build.log" | grep -E "error|Error|^-- |Building wheel|Finished" | tail -20
@@ -54,8 +56,8 @@ if [ -z "${SKIP_TRITON:-}" ]; then
   git fetch -q origin
   git checkout -q "$TRITON_REF"
   export TRITON_BUILD_WITH_CCACHE=false TRITON_BUILD_WITH_CLANG_LLD=false
-  python3 -m pip install -q -r python/requirements.txt 2>/dev/null || true
-  python3 -m pip wheel --no-build-isolation --no-deps -w "$OUT" . 2>&1 | tee "$OUT/triton-build.log" | tail -5
+  $PIP install -q -r python/requirements.txt 2>/dev/null || true
+  ( python3 -m pip --version >/dev/null 2>&1 && python3 -m pip wheel --no-build-isolation --no-deps -w "$OUT" . || python3 setup.py bdist_wheel --dist-dir "$OUT" ) 2>&1 | tee "$OUT/triton-build.log" | tail -5
   ls -la "$OUT"/triton-*.whl
 fi
 
