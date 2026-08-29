@@ -7,6 +7,9 @@ from __future__ import annotations
 from typing import cast
 
 import torch
+
+from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
 from torch import nn
 
 from vllm.config import VllmConfig
@@ -54,6 +57,21 @@ def apply_qsa_rope(
         )
         return tensor.reshape(shape)
 
+    if current_platform.is_rocm() and tensor.is_contiguous() and positions.ndim == 1:
+        # T46: vLLM's rotary_embedding kernel rotates the first rotary_dim of
+        # every head in place -- one launch instead of the ~7 of the native
+        # path (mul/sub/add/cat) that ran inside this opaque op on gfx1030.
+        out = tensor.clone()
+        flat = out.view(num_tokens, -1)
+        ops.rotary_embedding(
+            positions,
+            flat,
+            None,
+            head_dim,
+            cache,
+            rotary_emb.is_neox_style,
+        )
+        return out
     rotated = rotary_emb.apply_rotary_emb(
         tensor[..., :rotary_dim],
         cos,
@@ -67,7 +85,16 @@ def apply_qsa_rmsnorm(
     tensor: torch.Tensor,
 ) -> torch.Tensor:
     """Use vLLM's portable RMSNorm implementation on ROCm."""
-
+    if current_platform.is_rocm() and tensor.is_contiguous() and tensor.dim() == 2:
+        # T46: one _C.rms_norm launch; Gemma's (1 + w) folded into a cached
+        # weight. Replaces ~7 native kernels per call inside the QSA op.
+        w1 = getattr(norm, "_rdna_w1", None)
+        if w1 is None:
+            w1 = (norm.weight.float() + 1.0).to(tensor.dtype).contiguous()
+            norm._rdna_w1 = w1
+        out = torch.empty_like(tensor)
+        ops.rms_norm(out, tensor, w1, norm.variance_epsilon)
+        return out
     return cast(torch.Tensor, norm(tensor))
 
 

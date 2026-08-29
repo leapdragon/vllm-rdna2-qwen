@@ -2232,6 +2232,13 @@ def rdna_ar_timed_out(handle: int) -> bool:
     return torch.ops._rocm_C.rdna_ar_timed_out(handle)
 
 
+def gemv_i8_rdna2(
+    x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    """gfx1030 int8 weight-only skinny GEMM, M <= 8: x[M,K] . (w[N,K] * scale[N])^T."""
+    return torch.ops._rocm_C.gemv_i8_rdna2(x, w, scale, bias)
+
+
 def gemv_f16_rdna2(
     x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor:
@@ -2251,14 +2258,17 @@ def moe_skinny_int4_decode(
     act_buf: torch.Tensor,
     output: torch.Tensor,
     group_size: int,
+    expert_map: torch.Tensor | None = None,
 ) -> None:
     """Small-batch W4A16 MoE decode: gate_up+silu*mul then weighted down.
 
     gfx1030 skinny GEMV pair; symmetric int4 only. See skinny_gemms_int4.cu.
+    topk_ids int32/int64, topk_weights fp32/fp16; expert_map (int32, EP)
+    is applied in-kernel (T46).
     """
     torch.ops._rocm_C.moe_skinny_int4_decode(
         input, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids,
-        act_buf, output, group_size,
+        act_buf, output, group_size, expert_map,
     )
 
 

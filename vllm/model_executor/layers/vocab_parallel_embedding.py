@@ -63,6 +63,11 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+        elif current_platform.is_rocm() and isinstance(layer, ParallelLMHead):
+            # T45: int8 shadow of lm_head for the decode logits GEMV
+            from vllm.model_executor.layers import rdna_dense_int8
+
+            rdna_dense_int8.make_shadow(layer)
 
     def apply(
         self,
@@ -72,6 +77,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if hasattr(layer, "weight_i8"):
+            from vllm.model_executor.layers import rdna_dense_int8
+
+            out = rdna_dense_int8.apply(layer, x, bias)
+            if out is not None:
+                return out
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

@@ -269,11 +269,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 # invoke+moe_sum tail below.
                 M = hidden_states.shape[0]
                 topk = topk_ids.shape[1]
-                if expert_map is not None:
-                    # Expert parallelism: global -> local expert ids, -1 for
-                    # experts held by other ranks (the kernel skips those; the
-                    # layer's all-reduce sums the per-rank partials).
-                    topk_ids = expert_map[topk_ids]
+                # T46: ids/weights go to the kernel as produced (int64/fp32 or
+                # fp16) and the EP expert_map is applied in-kernel: no index,
+                # convert or copy launches on the decode path.
                 inter = w1.size(1) // 2
                 act_buf = torch.empty(
                     (M, topk, inter),
@@ -286,11 +284,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                     self.quant_config.w1_scale,
                     w2,
                     self.quant_config.w2_scale,
-                    topk_weights.to(torch.float32).contiguous(),
-                    topk_ids.to(torch.int32).contiguous(),
+                    topk_weights.contiguous(),
+                    topk_ids.contiguous(),
                     act_buf,
                     output,
                     self.block_shape[1],
+                    expert_map,
                 )
                 return
 
@@ -707,11 +706,9 @@ class TritonWNA16Experts(TritonExperts):
                 # invoke+moe_sum tail below.
                 M = hidden_states.shape[0]
                 topk = topk_ids.shape[1]
-                if expert_map is not None:
-                    # Expert parallelism: global -> local expert ids, -1 for
-                    # experts held by other ranks (the kernel skips those; the
-                    # layer's all-reduce sums the per-rank partials).
-                    topk_ids = expert_map[topk_ids]
+                # T46: ids/weights go to the kernel as produced (int64/fp32 or
+                # fp16) and the EP expert_map is applied in-kernel: no index,
+                # convert or copy launches on the decode path.
                 inter = w1.size(1) // 2
                 act_buf = torch.empty(
                     (M, topk, inter),
@@ -724,11 +721,12 @@ class TritonWNA16Experts(TritonExperts):
                     self.quant_config.w1_scale,
                     w2,
                     self.quant_config.w2_scale,
-                    topk_weights.to(torch.float32).contiguous(),
-                    topk_ids.to(torch.int32).contiguous(),
+                    topk_weights.contiguous(),
+                    topk_ids.contiguous(),
                     act_buf,
                     output,
                     self.block_shape[1],
+                    expert_map,
                 )
                 return
 

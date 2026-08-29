@@ -271,10 +271,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
         mm_config = model_config.multimodal_config
         text_only = mm_config is None or mm_config.language_model_only
+        # T46: the fused Triton qk-norm+rope+gate kernel has no CUDA-only
+        # pieces; on gfx1030 it replaces ~20 eager kernels per QSA layer.
         self.use_fused_qk_norm_rope_gate = (
             self.attn_output_gate
             and getattr(self.rotary_emb, "is_neox_style", False)
-            and current_platform.is_cuda()
+            and (current_platform.is_cuda() or current_platform.is_rocm())
             and text_only
         )
 

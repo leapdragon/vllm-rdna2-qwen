@@ -40,12 +40,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "moe_skinny_int4_decode(Tensor input, Tensor w13, Tensor w13_scale, "
       "Tensor w2, Tensor w2_scale, Tensor topk_weights, Tensor topk_ids, "
-      "Tensor! act_buf, Tensor! output, int group_size) -> ()");
+      "Tensor! act_buf, Tensor! output, int group_size, Tensor? expert_map) -> ()");
   rocm_ops.impl("moe_skinny_int4_decode", torch::kCUDA, &moe_skinny_int4_decode);
 
   // gfx1030 fp16 skinny GEMM for decode-sized M (T43)
   rocm_ops.def("gemv_f16_rdna2(Tensor x, Tensor w, Tensor? bias) -> Tensor");
   rocm_ops.impl("gemv_f16_rdna2", torch::kCUDA, &gemv_f16_rdna2);
+  rocm_ops.def("gemv_i8_rdna2(Tensor x, Tensor w, Tensor scale, Tensor? bias) -> Tensor");
+  rocm_ops.impl("gemv_i8_rdna2", torch::kCUDA, &gemv_i8_rdna2);
 
   // T44: push-based one-shot all-reduce for small TP messages on gfx1030
   rocm_ops.def(

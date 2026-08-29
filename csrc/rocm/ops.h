@@ -63,6 +63,9 @@ at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in);
 bool rdna_ar_timed_out(int64_t handle);
 int64_t rdna_ar_fast_calls(int64_t handle);
 
+at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scale,
+                         const std::optional<at::Tensor>& bias);
+
 at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
                           const std::optional<at::Tensor>& bias);
 
@@ -71,4 +74,5 @@ void moe_skinny_int4_decode(const at::Tensor& input, const at::Tensor& w13,
                             const at::Tensor& w2_scale,
                             const at::Tensor& topk_weights,
                             const at::Tensor& topk_ids, at::Tensor& act_buf,
-                            at::Tensor& output, const int64_t group_size);
+                            at::Tensor& output, const int64_t group_size,
+                            const std::optional<at::Tensor>& expert_map);

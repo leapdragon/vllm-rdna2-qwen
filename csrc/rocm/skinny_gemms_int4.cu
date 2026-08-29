@@ -823,10 +823,26 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
 // value = (nibble - 8) * scale (symmetric uint4b8), scales [E, rows, K/G].
 // ---------------------------------------------------------------------------
 
+// T46: topk ids arrive as the router produced them (int64 or int32) and are
+// remapped through the EP expert_map in-kernel, so the Python hook launches no
+// index/convert/copy kernels (they were 3 launches per MoE layer).
+__device__ __forceinline__ int moe_local_expert(const void* ids, bool ids_i64,
+                                                const int32_t* expert_map, int idx) {
+  int e = ids_i64 ? (int)reinterpret_cast<const int64_t*>(ids)[idx]
+                  : reinterpret_cast<const int32_t*>(ids)[idx];
+  if (expert_map != nullptr && e >= 0) e = expert_map[e];
+  return e;
+}
+__device__ __forceinline__ float moe_topk_w(const void* w, bool w_is_half, int idx) {
+  return w_is_half ? __half2float(reinterpret_cast<const half*>(w)[idx])
+                   : reinterpret_cast<const float*>(w)[idx];
+}
+
 template <int WAVES>
 __global__ void moe_w13_silu_gemv_(
     const half* __restrict__ input, const uint32_t* __restrict__ w13,
-    const half* __restrict__ s13, const int32_t* __restrict__ topk_ids,
+    const half* __restrict__ s13, const void* __restrict__ topk_ids,
+    const bool ids_i64, const int32_t* __restrict__ expert_map,
     half* __restrict__ act, const int K, const int N, const int topk,
     const int group_size) {
   const int m = blockIdx.z, s = blockIdx.y;
@@ -836,7 +852,7 @@ __global__ void moe_w13_silu_gemv_(
   for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = input[m * K + i];
   __syncthreads();
   if (n >= N) return;
-  const int expert = topk_ids[m * topk + s];
+  const int expert = moe_local_expert(topk_ids, ids_i64, expert_map, m * topk + s);
   // Expert parallelism: ids already remapped to local indices; < 0 means the
   // expert lives on another rank — emit zero so the down kernel adds nothing.
   if (expert < 0) {
@@ -878,8 +894,10 @@ __global__ void moe_w13_silu_gemv_(
 template <int WAVES>
 __global__ void moe_w2_gemv_(
     const half* __restrict__ act, const uint32_t* __restrict__ w2,
-    const half* __restrict__ s2, const int32_t* __restrict__ topk_ids,
-    const float* __restrict__ topk_w, half* __restrict__ out, const int N,
+    const half* __restrict__ s2, const void* __restrict__ topk_ids,
+    const bool ids_i64, const int32_t* __restrict__ expert_map,
+    const void* __restrict__ topk_w, const bool w_is_half,
+    half* __restrict__ out, const int N,
     const int H, const int topk, const int group_size) {
   const int m = blockIdx.z;
   const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -892,7 +910,7 @@ __global__ void moe_w2_gemv_(
   const int N8 = N / 8, NG = N / group_size;
   float acc = 0.f;
   for (int s = 0; s < topk; s++) {
-    const int expert = topk_ids[m * topk + s];
+    const int expert = moe_local_expert(topk_ids, ids_i64, expert_map, m * topk + s);
     if (expert < 0) continue;  // non-local expert under EP
     const uint32_t* wrow = w2 + ((uint64_t)expert * H + h) * N8;
     const half* srow = s2 + ((uint64_t)expert * H + h) * NG;
@@ -907,7 +925,7 @@ __global__ void moe_w2_gemv_(
         p += (float)((int)((q >> (4 * j)) & 0xF) - 8) * __half2float(xrow[k0 + j]);
       sacc += p * __half2float(srow[k0 / group_size]);
     }
-    acc += sacc * topk_w[m * topk + s];
+    acc += sacc * moe_topk_w(topk_w, w_is_half, m * topk + s);
   }
 #pragma unroll
   for (int off = 16; off >= 1; off >>= 1) acc += __shfl_xor(acc, off);
@@ -920,7 +938,7 @@ void moe_skinny_int4_decode(
     const at::Tensor& w13_scale, const at::Tensor& w2,
     const at::Tensor& w2_scale, const at::Tensor& topk_weights,
     const at::Tensor& topk_ids, at::Tensor& act_buf, at::Tensor& output,
-    const int64_t group_size) {
+    const int64_t group_size, const std::optional<at::Tensor>& expert_map) {
   const int M = input.size(0);
   const int K = input.size(1);
   const int topk = topk_ids.size(1);
@@ -936,9 +954,21 @@ void moe_skinny_int4_decode(
                   act_buf.scalar_type() == at::kHalf &&
                   output.scalar_type() == at::kHalf,
               "fp16 activations/scales only");
-  TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "topk_ids must be int32");
-  TORCH_CHECK(topk_weights.scalar_type() == at::kFloat,
-              "topk_weights must be float32");
+  TORCH_CHECK(topk_ids.scalar_type() == at::kInt || topk_ids.scalar_type() == at::kLong,
+              "topk_ids must be int32 or int64");
+  TORCH_CHECK(topk_weights.scalar_type() == at::kFloat ||
+                  topk_weights.scalar_type() == at::kHalf,
+              "topk_weights must be float32 or fp16");
+  TORCH_CHECK(topk_ids.is_contiguous() && topk_weights.is_contiguous(),
+              "topk_ids/topk_weights must be contiguous");
+  const int32_t* emap = nullptr;
+  if (expert_map.has_value()) {
+    TORCH_CHECK(expert_map->scalar_type() == at::kInt && expert_map->is_contiguous(),
+                "expert_map must be contiguous int32");
+    emap = reinterpret_cast<const int32_t*>(expert_map->const_data_ptr());
+  }
+  const bool ids_i64 = topk_ids.scalar_type() == at::kLong;
+  const bool w_half = topk_weights.scalar_type() == at::kHalf;
   TORCH_CHECK(input.is_contiguous() && act_buf.is_contiguous() &&
                   output.is_contiguous(),
               "activations must be contiguous");
@@ -959,15 +989,15 @@ void moe_skinny_int4_decode(
       reinterpret_cast<const half*>(input.const_data_ptr()),
       reinterpret_cast<const uint32_t*>(w13.const_data_ptr()),
       reinterpret_cast<const half*>(w13_scale.const_data_ptr()),
-      reinterpret_cast<const int32_t*>(topk_ids.const_data_ptr()),
+      topk_ids.const_data_ptr(), ids_i64, emap,
       reinterpret_cast<half*>(act_buf.mutable_data_ptr()), K, N, topk,
       (int)group_size);
   moe_w2_gemv_<WAVES><<<grid2, block, topk * N * 2, stream>>>(
       reinterpret_cast<const half*>(act_buf.const_data_ptr()),
       reinterpret_cast<const uint32_t*>(w2.const_data_ptr()),
       reinterpret_cast<const half*>(w2_scale.const_data_ptr()),
-      reinterpret_cast<const int32_t*>(topk_ids.const_data_ptr()),
-      reinterpret_cast<const float*>(topk_weights.const_data_ptr()),
+      topk_ids.const_data_ptr(), ids_i64, emap,
+      topk_weights.const_data_ptr(), w_half,
       reinterpret_cast<half*>(output.mutable_data_ptr()), N, K, topk,
       (int)group_size);
 }
@@ -1083,6 +1113,135 @@ at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
     case 6: gemv_f16_rdna2_launch<6>(xp, wp, bp, yp, N, K, s); break;
     case 7: gemv_f16_rdna2_launch<7>(xp, wp, bp, yp, N, K, s); break;
     default: gemv_f16_rdna2_launch<8>(xp, wp, bp, yp, N, K, s); break;
+  }
+  return y;
+}
+
+
+// ---------------------------------------------------------------------------
+// int8 weight-only skinny GEMM for gfx1030 decode (M <= 8): y = x . (w_i8 * s)^T (+bias).
+// Same wave-per-row design as gemv_f16_rdna2; a 16-byte load carries 16 weights, halving
+// the streamed bytes of the fp16 dense projections (T45). Per-output-channel symmetric
+// fp16 scale. lm_head/rank [62080x2560]: 640 us vs 1270 us fp16 in the harness.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ half2 rdna_i8x2_to_h2(int lo, int hi) {
+  return __floats2half2_rn((float)lo, (float)hi);
+}
+
+template <int WAVES, int MT>
+__global__ void __launch_bounds__(WAVES * 32)
+gemv_i8_rdna2_(const half* __restrict__ x, const int8_t* __restrict__ w,
+               const half* __restrict__ scale, const half* __restrict__ bias,
+               half* __restrict__ y, const int N, const int K) {
+  const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int n = blockIdx.x * WAVES + wave;
+  if (n >= N) return;
+  const int K16 = K / 16;
+  const uint4* __restrict__ wrow = reinterpret_cast<const uint4*>(w + (size_t)n * K);
+  const uint4* __restrict__ xr = reinterpret_cast<const uint4*>(x);
+  float acc[MT];
+#pragma unroll
+  for (int m = 0; m < MT; m++) acc[m] = 0.f;
+  for (int i = lane; i < K16; i += 32 * 4) {
+    uint4 wq[4];
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int idx = i + 32 * u;
+      wq[u] = (idx < K16) ? wrow[idx] : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int idx = i + 32 * u;
+      if (idx < K16) {
+        const int32_t* q = reinterpret_cast<const int32_t*>(&wq[u]);
+        half2 wh[8];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const int32_t v = q[j];
+          wh[2 * j] = rdna_i8x2_to_h2((int8_t)(v & 0xff), (int8_t)((v >> 8) & 0xff));
+          wh[2 * j + 1] =
+              rdna_i8x2_to_h2((int8_t)((v >> 16) & 0xff), (int8_t)((v >> 24) & 0xff));
+        }
+#pragma unroll
+        for (int m = 0; m < MT; m++) {
+          const uint4 xa = xr[((size_t)m * K16 + idx) * 2];
+          const uint4 xb = xr[((size_t)m * K16 + idx) * 2 + 1];
+          const half2* xh0 = reinterpret_cast<const half2*>(&xa);
+          const half2* xh1 = reinterpret_cast<const half2*>(&xb);
+          float a = acc[m];
+          a = __builtin_amdgcn_fdot2(wh[0], xh0[0], a, false);
+          a = __builtin_amdgcn_fdot2(wh[1], xh0[1], a, false);
+          a = __builtin_amdgcn_fdot2(wh[2], xh0[2], a, false);
+          a = __builtin_amdgcn_fdot2(wh[3], xh0[3], a, false);
+          a = __builtin_amdgcn_fdot2(wh[4], xh1[0], a, false);
+          a = __builtin_amdgcn_fdot2(wh[5], xh1[1], a, false);
+          a = __builtin_amdgcn_fdot2(wh[6], xh1[2], a, false);
+          a = __builtin_amdgcn_fdot2(wh[7], xh1[3], a, false);
+          acc[m] = a;
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < MT; m++) {
+#pragma unroll
+    for (int off = 16; off >= 1; off >>= 1) acc[m] += __shfl_xor(acc[m], off);
+  }
+  if (lane == 0) {
+    const float sc = __half2float(scale[n]);
+    const float b = bias ? __half2float(bias[n]) : 0.f;
+#pragma unroll
+    for (int m = 0; m < MT; m++)
+      y[(size_t)m * N + n] = __float2half(acc[m] * sc + b);
+  }
+}
+
+template <int MT>
+static void gemv_i8_rdna2_launch(const half* x, const int8_t* w, const half* s,
+                                 const half* bias, half* y, int N, int K,
+                                 cudaStream_t st) {
+  if (N >= 1152)
+    gemv_i8_rdna2_<8, MT><<<(N + 7) / 8, 256, 0, st>>>(x, w, s, bias, y, N, K);
+  else if (N >= 576)
+    gemv_i8_rdna2_<4, MT><<<(N + 3) / 4, 128, 0, st>>>(x, w, s, bias, y, N, K);
+  else if (N >= 288)
+    gemv_i8_rdna2_<2, MT><<<(N + 1) / 2, 64, 0, st>>>(x, w, s, bias, y, N, K);
+  else
+    gemv_i8_rdna2_<1, MT><<<N, 32, 0, st>>>(x, w, s, bias, y, N, K);
+}
+
+at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scale,
+                         const std::optional<at::Tensor>& bias) {
+  const int M = x.size(0), K = x.size(1), N = w.size(0);
+  TORCH_CHECK(M >= 1 && M <= 8, "gemv_i8_rdna2: M must be 1..8");
+  TORCH_CHECK(w.size(1) == K && K % 16 == 0, "gemv_i8_rdna2: K mismatch / K % 16");
+  TORCH_CHECK(x.scalar_type() == at::kHalf && w.scalar_type() == at::kChar &&
+                  scale.scalar_type() == at::kHalf && scale.numel() == N,
+              "gemv_i8_rdna2: x fp16, w int8, scale fp16[N]");
+  TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && scale.is_contiguous(),
+              "gemv_i8_rdna2: contiguous operands");
+  const half* bp = nullptr;
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->scalar_type() == at::kHalf && bias->is_contiguous() &&
+                    bias->numel() == N, "gemv_i8_rdna2: bias fp16[N]");
+    bp = reinterpret_cast<const half*>(bias->const_data_ptr());
+  }
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  auto y = at::empty({M, N}, x.options());
+  const cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  const half* xp = reinterpret_cast<const half*>(x.const_data_ptr());
+  const int8_t* wp = reinterpret_cast<const int8_t*>(w.const_data_ptr());
+  const half* sp = reinterpret_cast<const half*>(scale.const_data_ptr());
+  half* yp = reinterpret_cast<half*>(y.mutable_data_ptr());
+  switch (M) {
+    case 1: gemv_i8_rdna2_launch<1>(xp, wp, sp, bp, yp, N, K, st); break;
+    case 2: gemv_i8_rdna2_launch<2>(xp, wp, sp, bp, yp, N, K, st); break;
+    case 3: gemv_i8_rdna2_launch<3>(xp, wp, sp, bp, yp, N, K, st); break;
+    case 4: gemv_i8_rdna2_launch<4>(xp, wp, sp, bp, yp, N, K, st); break;
+    case 5: gemv_i8_rdna2_launch<5>(xp, wp, sp, bp, yp, N, K, st); break;
+    case 6: gemv_i8_rdna2_launch<6>(xp, wp, sp, bp, yp, N, K, st); break;
+    case 7: gemv_i8_rdna2_launch<7>(xp, wp, sp, bp, yp, N, K, st); break;
+    default: gemv_i8_rdna2_launch<8>(xp, wp, sp, bp, yp, N, K, st); break;
   }
   return y;
 }

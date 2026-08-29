@@ -44,7 +44,7 @@ class RdnaOneShotAllReduce:
         self._ops = ops
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        max_kb = int(os.getenv("VLLM_RDNA_AR_MAX_KB", "512"))
+        max_kb = int(os.getenv("VLLM_RDNA_AR_MAX_KB", "64"))  # decode messages; prefill chunks are faster on RCCL
         self.max_bytes = max_kb * 1024
         if not (2 <= self.world_size <= 8):
             return
