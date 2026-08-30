@@ -76,7 +76,11 @@ uv pip install -r requirements/rocm.txt --no-deps       # runtime deps (then `pi
 ```
 
 The Rust frontend (`vllm-rs`, the Rust tool parser) is optional and is skipped when `cargo` is
-absent; nothing on this path needs it.
+absent; nothing on this path needs it. After the deps, `pip check` will still name `torchvision`
+(timm), `torch-c-dlpack-ext` (tilelang) and amd-quark's ONNX chain — quantization/vision extras
+this path never imports; leave them. numpy must satisfy numba (<2.5) and mistral-common (<2.4):
+`uv pip install "numpy>=1.25,<2.4"`. For a proper version string, fetch upstream's tags once
+(`git fetch --tags https://github.com/vllm-project/vllm.git`) before building.
 
 Rebuilding only the ROCm extension after a kernel edit: see `tools/rdna2/README.md`.
 
