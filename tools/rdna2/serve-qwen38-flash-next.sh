@@ -24,7 +24,10 @@
 #   default '{"image": 4, "video": 0}'), MM_PROCESSOR_KWARGS (JSON for --mm-processor-kwargs,
 #   default '{"max_pixels": 1638400}' = images resized to <= 1280x1280 before the encoder: the
 #   processor's own ceiling is 16 megapixels, and on gfx1030 the ViT's attention is SDPA's math
-#   path, which materialises N^2 -- the memory profiler's 16 MP dummy image asked for 64 GiB).
+#   path, which materialises N^2 -- the memory profiler's 16 MP dummy image asked for 64 GiB),
+#   MM_ELIDE (1: when a conversation has accumulated more than the image limit, the OLDEST
+#   images are replaced with a text marker and the newest MM_LIMIT are kept -- agent platforms
+#   cannot rewrite past turns, so the strict HTTP 400 wedges them; 0: stock vLLM 400).
 set -euo pipefail
 
 : "${MODEL:?set MODEL to the AWQ-W4A16 backbone directory (shards 2-5 + model_mtp.safetensors)}"
@@ -83,6 +86,7 @@ if [ "${VISION:-0}" = "1" ]; then
   _MM_PROC_DEFAULT='{"max_pixels": 1638400}'
   VISIONARGS=(--limit-mm-per-prompt "${MM_LIMIT:-$_MM_LIMIT_DEFAULT}"
               --mm-processor-kwargs "${MM_PROCESSOR_KWARGS:-$_MM_PROC_DEFAULT}")
+  export MM_ELIDE_OVER_LIMIT="${MM_ELIDE:-1}"
 fi
 PROF=()
 if [ -n "${PROFILE:-}" ]; then

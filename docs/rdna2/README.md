@@ -135,7 +135,11 @@ Do not raise that cap casually: the checkpoint's own ceiling is 16 megapixels an
 the ViT runs Torch SDPA's math path, which materialises the full attention matrix — the memory
 profiler's 16 MP dummy image asks for 64 GiB and kills the boot. Costs ~137k tokens of KV pool
 at 196k context. Verified with `tools/rdna2/vision_test.py`: shapes, colours, OCR, counting,
-multi-image, a 1800×1400 image, over-limit rejection, text unaffected),
+multi-image, a 1800×1400 image, over-limit handling, text unaffected. When a conversation has
+accumulated more than the image limit, the server keeps the NEWEST `MM_LIMIT` images and
+replaces older ones with a text marker instead of rejecting with HTTP 400 — agent platforms
+cannot rewrite past turns, so a hard 400 wedges the chat permanently; `MM_ELIDE=0` restores
+the stock rejection),
 `CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}'` (server-side defaults
 merged into every request's `chat_template_kwargs`, request values win; this template understands
 `enable_thinking`, `preserve_thinking` — keep earlier turns' `reasoning_content` in the prompt — and

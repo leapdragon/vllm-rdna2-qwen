@@ -270,6 +270,16 @@ had been skipping. `VISION=1` in the serve script enables it. Facts that matter 
   two-images-which-has-the-triangle, an 1800×1400 star, a 5th image rejected with HTTP 400,
   and text-only decode afterwards. TTFT 1.3–5 s per image prompt (encoder is eager);
   text decode and the PLE consistency test are unaffected.
+- **Over-limit conversations are elided, not rejected** (`MM_ELIDE=1`, the default with
+  vision on). Stock vLLM 400s a prompt whose accumulated images exceed
+  `--limit-mm-per-prompt`; in an agent loop the history only grows, so after the Nth
+  screenshot every subsequent request fails and platforms that cannot rewrite past turns
+  (litellm-fronted chat UIs, Kilocode-style agents) are wedged. The renderer
+  (`_elide_over_limit_images`, `vllm/renderers/online_renderer.py`) now keeps the newest
+  `limit` images and replaces older image parts with a short text marker before templating,
+  preserving turn structure. Verified: 6 images at limit 4 → HTTP 200, log line
+  "Elided 2 over-limit image(s)", and the model demonstrably no longer sees the elided
+  (oldest) image while a 4-image control still does. `MM_ELIDE=0` restores the strict 400.
 
 ## 9. What was measured but not adopted
 

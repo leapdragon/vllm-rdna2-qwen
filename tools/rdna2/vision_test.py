@@ -20,6 +20,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--base", default="http://localhost:8000")
 ap.add_argument("--limit", type=int, default=4, help="configured images per prompt")
 ap.add_argument("--save-dir", default=None, help="also write the generated PNGs here")
+ap.add_argument("--strict-limit", action="store_true",
+                help="expect over-limit prompts to be rejected with 400 (MM_ELIDE=0 servers)")
 args = ap.parse_args()
 
 
@@ -147,18 +149,31 @@ check("5 two images", a[0], ["second", "2nd", "image 2"], *a[1:])
 a = chat([imgs["star"]], "What is the large shape in this image and what colour is it? A few words.")
 check("6 large image", a[0], [("yellow", "star"), ("gold", "star")], *a[1:])
 
-# 7: one over the configured limit must be a clean 400, not a dead engine
-body_imgs = [imgs["circle"]] * (args.limit + 1)
-try:
-    chat(body_imgs, "Describe these images.", max_tokens=20)
-    print(f"FAIL 7 over-limit ({args.limit + 1} images) was accepted")
-    ok = False
-except urllib.error.HTTPError as e:
-    msg = e.read().decode()[:120]
-    print(f"PASS 7 over-limit ({args.limit + 1} images) rejected: HTTP {e.code} {msg!r}")
-except Exception as e:  # noqa: BLE001
-    print(f"FAIL 7 over-limit raised {type(e).__name__}: {e}")
-    ok = False
+# 7: over the configured limit. Default server behaviour (MM_ELIDE=1): the request succeeds
+# and the OLDEST images are elided -- prove it by putting the only text-bearing image first:
+# with 6 images and limit 4, the "SUNRISE 42" image must no longer be visible. --strict-limit
+# instead expects the stock HTTP 400.
+if args.strict_limit:
+    try:
+        chat([imgs["circle"]] * (args.limit + 1), "Describe these images.", max_tokens=20)
+        print(f"FAIL 7 over-limit ({args.limit + 1} images) was accepted")
+        ok = False
+    except urllib.error.HTTPError as e:
+        print(f"PASS 7 over-limit rejected: HTTP {e.code} {e.read().decode()[:100]!r}")
+    except Exception as e:  # noqa: BLE001
+        print(f"FAIL 7 over-limit raised {type(e).__name__}: {e}")
+        ok = False
+else:
+    six = [imgs["text"], imgs["circle"], imgs["triangle"], imgs["quad"], imgs["count"], imgs["star"]]
+    q = "Is there any readable text (words or numbers) in any of these images? Answer yes or no."
+    try:
+        a = chat(six, q, max_tokens=20)
+        check("7 over-limit elides the oldest (no text image left)", a[0], ["no"], *a[1:])
+        b = chat([imgs["text"], imgs["circle"], imgs["triangle"], imgs["quad"]], q, max_tokens=20)
+        check("7b control at the limit still sees the text image", b[0], ["yes"], *b[1:])
+    except urllib.error.HTTPError as e:
+        print(f"FAIL 7 over-limit got HTTP {e.code} (elision off?): {e.read().decode()[:100]!r}")
+        ok = False
 
 # 8: text still fine
 body = {"model": "qwen38-flash-next", "messages": [{"role": "user", "content": "What is 17 * 23? Answer with just the number."}],

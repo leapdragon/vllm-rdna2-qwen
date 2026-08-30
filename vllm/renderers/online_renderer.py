@@ -60,6 +60,64 @@ def _reused_prompt_token_ids(request: Any) -> list[int] | None:
     return kv.pop("prompt_token_ids", None) or None
 
 
+def _is_image_part(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    return (
+        part.get("type") in ("image_url", "image")
+        or "image_url" in part
+        or "image" in part
+    )
+
+
+def _elide_over_limit_images(request: ChatCompletionRequest, model_config) -> None:
+    """Agent-friendly handling of the per-prompt image limit (2026-08-30).
+
+    Long tool-use conversations accumulate screenshots until the whole history
+    crosses ``--limit-mm-per-prompt`` and every request is rejected with a 400 --
+    which most chat platforms cannot recover from, because they cannot rewrite
+    turns that already happened. Instead of rejecting, keep the NEWEST ``limit``
+    images and replace older image parts with a short text marker, preserving
+    message structure and positions. MM_ELIDE_OVER_LIMIT=0 restores the strict
+    400 behaviour.
+    """
+    import os
+
+    if os.getenv("MM_ELIDE_OVER_LIMIT", "1") != "1":
+        return
+    mm_config = getattr(model_config, "multimodal_config", None)
+    if mm_config is None:
+        return
+    try:
+        limit = mm_config.get_limit_per_prompt("image")
+    except Exception:  # noqa: BLE001 - any config oddity: keep strict behaviour
+        return
+    messages = getattr(request, "messages", None)
+    if limit <= 0 or not isinstance(messages, list):
+        return
+    slots: list[tuple[list, int]] = []          # (content list, index) per image part
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for i, part in enumerate(content):
+            if _is_image_part(part):
+                slots.append((content, i))
+    excess = len(slots) - limit
+    if excess <= 0:
+        return
+    for content, i in slots[:excess]:           # oldest first
+        content[i] = {
+            "type": "text",
+            "text": "[an earlier image was removed: this server keeps only the "
+                    f"most recent {limit} images of a conversation]",
+        }
+    logger.info(
+        "Elided %d over-limit image(s) from a chat request (%d total, limit %d).",
+        excess, len(slots), limit,
+    )
+
+
 class OnlineRenderer:
     def __init__(
         self,
@@ -131,6 +189,8 @@ class OnlineRenderer:
         validation and ``adjust_request`` still run and the output is
         detokenized (text-out).
         """
+        _elide_over_limit_images(request, self.model_config)
+
         tokenizer = self.renderer.tokenizer
 
         tool_parser = self.parser.tool_parser_cls if self.parser is not None else None

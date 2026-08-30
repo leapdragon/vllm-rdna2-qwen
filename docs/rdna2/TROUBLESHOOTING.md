@@ -224,6 +224,11 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   barrier flags in host memory over PCIe; since 2026-08-30 it polls local VRAM. If it recurs,
   `tools/rdna2/soak_fabric_watch.sh` correlates generation with the kernel log; check power
   caps and link widths (`amd-smi metric --pcie`) before blaming software.
+- **Agent chats wedge with `At most N image(s) may be provided in one prompt` once enough
+  screenshots have accumulated** — the history exceeds `--limit-mm-per-prompt` and every
+  request 400s; most platforms cannot delete past turns. This fork's default (`MM_ELIDE=1`)
+  keeps the newest N images and elides older ones with a text marker instead. If you see the
+  400 anyway, the server predates the fix or runs `MM_ELIDE=0`.
 - **Boot with vision enabled dies in memory profiling: "Tried to allocate 64.00 GiB" from
   `apply_sdpa`.** The image processor's default ceiling is 16 megapixels and the ViT falls
   back to Torch SDPA on gfx1030 (quadratic memory); the profiler's max-size dummy image is the
