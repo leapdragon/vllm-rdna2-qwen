@@ -1846,7 +1846,12 @@ def _parse_chat_message_content(
 ) -> list[ConversationMessage]:
     role = message["role"]
     content = message.get("content")
+    # Accept both the OpenAI-style "reasoning" field and "reasoning_content" -- the field
+    # vLLM's own reasoning parsers emit -- so a client that echoes a previous response back
+    # verbatim keeps its thinking in the prompt (templates with preserve_thinking).
     reasoning = message.get("reasoning")
+    if reasoning is None:
+        reasoning = message.get("reasoning_content")
 
     if content is None:
         content = []
