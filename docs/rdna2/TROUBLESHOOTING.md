@@ -203,9 +203,16 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   dynamic token range; a Python `if 0 < n <= 8:` inside the traced region is decided on the
   tracing example and baked into the graph. Count kernel *launches* in a profile after every
   change; put decode/prefill choices inside an opaque custom op with a fake impl.
-- **Same symptom, second cause: the torch.compile cache.** Its key does not cover edits to
-  vLLM's own Python, so a changed hook can be served from a stale compiled graph. Boot with
-  `VLLM_DISABLE_COMPILE_CACHE=1` while iterating.
+- **Same symptom, second cause: the torch.compile cache.** Its key covers the traced forward
+  files, but not the opaque custom ops' bodies/schemas, `rdna_dense_int8.py`'s eligibility rule
+  or the `.so`, and a hit is reused with Dynamo guards off — so a change there can be served
+  from a stale graph. Boot with `VLLM_DISABLE_COMPILE_CACHE=1` while iterating, or clear
+  `~/.cache/vllm/torch_compile_cache/`. Note the flag also disables *writing*: the first boot
+  after turning the cache on is still a full ~13-minute compile.
+- **Warm boot dies with `'_OpNamespace' 'vllm' object has no attribute 'rdna_hc_mix'`.** The
+  cached graph runs before any forward pass executed the lazy `import rdna_ops` at the call
+  sites. Custom ops referenced by compiled graphs must be registered at module import time
+  (done in `rdna_dense_int8.py` and the model's `amd/hyperconnection.py`, 2026-08-30).
 - **One card loads weights, three sit at 1 % VRAM.** A collective's init raised on one rank
   inside an ordered barrier loop and that rank moved on; the others wait forever. vLLM builds
   several `GroupCoordinator`s over the same ranks — never keep singleton state in a

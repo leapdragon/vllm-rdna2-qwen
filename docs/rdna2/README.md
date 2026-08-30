@@ -108,13 +108,22 @@ MODEL=models/qwen38-flash-next PLE_INT4=models/qwen38-flash-next-ple/ples_int4 \
 
 That script is the whole configuration; read it. The knobs that are not optional are explained
 in `CHANGES.md` §4 (expert parallelism, fp16, language-model-only, the stability env). Boot
-takes ~15 minutes (weights, torch.compile, CUDA-graph capture, the MTP head). `curl
+takes ~13–15 minutes (weights, torch.compile, CUDA-graph capture, the MTP head). `curl
 localhost:8000/health` returns 200 at "Application startup complete". The first request at a
-new context length is slow while sidecar pages are cold.
+new context length is slow while sidecar pages are cold. `COMPILE_CACHE_OFF=0` turns vLLM's
+torch.compile cache on: the *next* boot with an unchanged configuration skips the ~700 s of
+Inductor work (the flag disables writing as well as reading, so the first boot after enabling it
+is still cold; see `CHANGES.md` §8 for what the cache key does not cover).
 
 Optional knobs: `GPUUTIL=` (default 0.90), `MAXLEN=` (default 131072; the model allows 262144 — the
-KV pool held ~197k tokens at 0.86), `MTP=4` (+2 % on long generations), `DENSE_INT8=0` (fp16 dense projections;
-−15 %), `GPUS=1,2,3,4` (ROCR device ids), `PORT=`, `PROFILE=1` (enables `/start_profile`),
+KV pool held ~197k tokens at 0.86), `MTP=4` (+2 % on long generations) or `MTP=0` (no draft head:
+the `mtp.*` weights are never loaded and no draft graphs are captured, ~2.5 GiB/card back to the KV
+pool — worth it when your workload's acceptance rate is low, e.g. below ~20 %), `DENSE_INT8=0` (fp16
+dense projections; −15 %), `GPUS=1,2,3,4` (ROCR device ids), `PORT=`, `PROFILE=1` (enables `/start_profile`),
+`CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}'` (server-side defaults
+merged into every request's `chat_template_kwargs`, request values win; this template understands
+`enable_thinking`, `preserve_thinking` — keep earlier turns' `reasoning_content` in the prompt — and
+`reasoning_effort` = `xhigh` (template default) | `medium` | `low`),
 `TOOLS=0` (off: tool calling — on by default, `--enable-auto-tool-choice --tool-call-parser
 qwen3_coder --reasoning-parser qwen3`, which is what agentic clients such as Kilocode, Cline or
 Roo need for `tool_choice: "auto"`; the model's template emits Qwen3-Coder-style

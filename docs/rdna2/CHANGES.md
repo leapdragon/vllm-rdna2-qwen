@@ -183,8 +183,22 @@ vLLM compiles the model once for a dynamic token range. Any Python `if 0 < n <= 
 traced region is decided on the tracing example and baked into the graph — the int8 path never
 ran inside the compiled graph for a whole boot. Every decode/prefill choice therefore lives inside
 an **opaque custom op** with a fake impl (`vllm/model_executor/layers/rdna_ops.py`:
-`rdna_dense_gemm`, `rdna_hc_mix`, `rdna_shared_expert`). vLLM's torch.compile cache is disabled
-by the launcher because its key does not cover these Python changes.
+`rdna_dense_gemm`, `rdna_hc_mix`, `rdna_shared_expert`).
+
+**The torch.compile cache and these ops.** The cache key (`vllm/compilation/backends.py`) hashes
+every declared `VLLM_*` env var, the vLLM config, and the *contents of the Python files Dynamo
+traced*; a hit is then reused with Dynamo guards disabled. It does **not** see the bodies,
+schemas or fake impls of opaque ops (Dynamo never enters them), `rdna_dense_int8.py`'s
+per-layer eligibility, or the `.so` — change any of those and clear
+`~/.cache/vllm/torch_compile_cache/` or boot once with `COMPILE_CACHE_OFF=1`. Two facts learned
+the hard way (2026-08-30): `VLLM_DISABLE_COMPILE_CACHE=1` disables *writing* as well as reading
+(so a boot with it set saves nothing for the next one; the per-boot hash directory is still
+created, holding only `computation_graph.py` dumps), and a cached graph is executed before any
+forward pass has run the lazy `import rdna_ops` at the call sites — so the ops are now
+registered eagerly at import time of `rdna_dense_int8.py` and the model's `hyperconnection.py`
+(a warm boot otherwise dies with `'_OpNamespace' 'vllm' object has no attribute 'rdna_hc_mix'`).
+The serve script keeps the cache off by default (`COMPILE_CACHE_OFF=1`) as the safe setting for
+anyone editing the fork; with it on, a boot whose key matches skips the ~700 s of Inductor work.
 
 ## 9. What was measured but not adopted
 

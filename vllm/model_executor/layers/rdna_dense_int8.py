@@ -18,6 +18,12 @@ import torch
 
 from vllm.logger import init_logger
 
+# Register torch.ops.vllm.rdna_* eagerly. With the torch.compile cache enabled a cached
+# graph that calls these ops is loaded and run before any forward pass has executed the
+# lazy imports at the call sites -> "'_OpNamespace' 'vllm' object has no attribute
+# 'rdna_hc_mix'" (2026-08-30). Importing the module is what registers the ops.
+from vllm.model_executor.layers import rdna_ops  # noqa: F401
+
 logger = init_logger(__name__)
 
 _ENABLED: bool | None = None

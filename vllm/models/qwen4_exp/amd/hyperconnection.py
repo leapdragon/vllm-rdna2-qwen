@@ -33,6 +33,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.models.utils import maybe_prefix
 
+# Eager registration of torch.ops.vllm.rdna_* (see rdna_dense_int8.py): a compile-cache
+# hit runs the cached graph before the lazy imports below would have executed.
+from vllm.model_executor.layers import rdna_ops  # noqa: F401
+
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
