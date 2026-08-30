@@ -17,7 +17,11 @@
 #   reasoning parser), TOOL_PARSER (qwen3_coder), REASONING_PARSER (qwen3),
 #   CHAT_KWARGS (JSON merged into every request's chat_template_kwargs, request values win;
 #   this template understands enable_thinking, preserve_thinking and reasoning_effort =
-#   xhigh|medium|low, e.g. CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}').
+#   xhigh|medium|low, e.g. CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}'),
+#   VISION (0: text only -- the 0.9 GB Qwen3-VL-style vision tower is not loaded, --language-model-only;
+#   1: images accepted on the chat API, tower replicated on every rank, ~0.9 GB/card less KV;
+#   the ViT runs Torch SDPA attention on gfx1030), MM_LIMIT (JSON for --limit-mm-per-prompt,
+#   default '{"image": 4, "video": 0}').
 set -euo pipefail
 
 : "${MODEL:?set MODEL to the AWQ-W4A16 backbone directory (shards 2-5 + model_mtp.safetensors)}"
@@ -68,6 +72,13 @@ if [ "${TOOLS:-1}" = "1" ]; then
   TOOLARGS=(--enable-auto-tool-choice --tool-call-parser "${TOOL_PARSER:-qwen3_coder}"
             --reasoning-parser "${REASONING_PARSER:-qwen3}")
 fi
+VISIONARGS=(--language-model-only --skip-mm-profiling)
+if [ "${VISION:-0}" = "1" ]; then
+  # Profiling stays on so the encoder's activations are accounted for before the KV pool
+  # is sized; the limit keeps a prompt from carrying more than MM_LIMIT images.
+  _MM_LIMIT_DEFAULT='{"image": 4, "video": 0}'   # never inline JSON in ${VAR:-...}: bash closes at the first '}'
+  VISIONARGS=(--limit-mm-per-prompt "${MM_LIMIT:-$_MM_LIMIT_DEFAULT}")
+fi
 PROF=()
 if [ -n "${PROFILE:-}" ]; then
   PROF=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir="$TRACES")
@@ -80,7 +91,7 @@ exec python3 -m vllm.entrypoints.openai.api_server \
   --max-model-len "$MAXLEN" --gpu-memory-utilization "$GPUUTIL" \
   --max-num-seqs 4 --max-num-batched-tokens 2048 \
   ${EAGER:+--enforce-eager} \
-  --language-model-only --skip-mm-profiling \
+  "${VISIONARGS[@]}" \
   --enable-prefix-caching \
   "${SPEC[@]}" "${TOOLARGS[@]}" "${CHATARGS[@]}" "${PROF[@]}" ${EXTRA_ARGS:-} \
   --host 0.0.0.0 --port "$PORT"
