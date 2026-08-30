@@ -145,7 +145,7 @@ If you run vLLM your own way, use the flags directly:
 | what | serve-script knob | stock vLLM argument |
 |---|---|---|
 | MTP draft head on (98–106 t/s decode at ~60 % acceptance) | `MTP=3` (default) | `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` |
-| MTP off (~55 t/s, head never loaded, ~2.5 GiB/card more KV cache; better when your acceptance is < ~25 %) | `MTP=0` | omit `--speculative-config` |
+| MTP off (~62–65 t/s, head never loaded, ~2.5 GiB/card more KV cache; better when your acceptance is < ~25 %) | `MTP=0` | omit `--speculative-config` |
 | thinking defaults for every request | `CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}'` | `--default-chat-template-kwargs '{…}'` |
 
 Restart to switch (the speculative config is fixed at engine init). With the torch.compile

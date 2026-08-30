@@ -220,9 +220,20 @@ order, DMAs the result to every TP worker's buffer, then bumps a shared-memory c
 worker; each model thread blocks in `prepare_forward` until its counter reaches the launch
 number and only then enqueues the forward. The chain is inherently serial (step N+1's lookup
 needs step N's token), so nothing is lost by waiting on the host — but the wait is now real:
-decode went from 70–72 t/s (which was the *no-wait* speed) to ~55 t/s, of which ~3.3 ms per
-step is the CPU lookup (2.5 ms, dozens of small torch ops + mmap faults) plus copy/sync
-(0.8 ms). Optimising that path is the next workstream. Tests: `tools/rdna2/ple_consistency_test.py`
+decode first went from 70–72 t/s (which was the *no-wait* speed) to ~55 t/s, with ~3.3 ms per
+step in the worker. Three follow-ups the same day brought it back to **61–65 t/s over 256
+tokens, 62 over 1024**: (1) a fused numpy decode path (`_fused_decode_lookup`) — for plain
+decode batches the n-gram hashing and the int4 row gather run in numpy straight into the
+result buffer (0.05 ms for 16 rows vs 1.6 ms of torch dispatch; bit-identical, and
+`PLE_OFFLOAD_FUSED_CHECK=1` verifies every step against `forward_impl`); (2) the sidecar is
+prefaulted into the page cache at worker start (32 GB in 30 s, overlapped with weight loading;
+`PLE_OFFLOAD_PREFAULT=0` disables) so random rows are minor faults, not 0.4 ms disk reads;
+(3) the result no longer crosses processes on the GPU: each TP worker registers a shared
+pinned result buffer, the offload worker writes rows + a plain-store sequence number, and each
+model thread DMAs the rows to its own device buffer on its model stream. Worker time per
+request: 3.33 → 0.88 ms. What remains on the critical path (~2.3 ms of a ~15.4 ms step) is the
+D2H of the sampled token, the zmq hop and the lookup itself; the forward is ~13 ms.
+Tests: `tools/rdna2/ple_consistency_test.py`
 (two identical greedy runs must match, garble scan, no skips, idle GPUs; `--trace` with
 `PLE_OFFLOAD_DEBUG_TRACE` on the worker compares the lookups themselves),
 `tools/rdna2/ple_coherence_test.py` (cross-process DMA visibility, standalone).
