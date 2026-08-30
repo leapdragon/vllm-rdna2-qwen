@@ -213,6 +213,11 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   cached graph runs before any forward pass executed the lazy `import rdna_ops` at the call
   sites. Custom ops referenced by compiled graphs must be registered at module import time
   (done in `rdna_dense_int8.py` and the model's `amd/hyperconnection.py`, 2026-08-30).
+- **Warm boot dies with `queue.Full` in `PleOffloadConnector._launch` during kernel warmup.**
+  The model thread only enqueues GPU work, so a fast host loop runs ahead of the PLE request
+  thread and the bounded request queue (`max_num_seqs + 1`) overflowed; cold boots were slow
+  enough never to hit it. Fixed with a blocking put (2026-08-30). If you see it, your tree
+  predates that commit.
 - **One card loads weights, three sit at 1 % VRAM.** A collective's init raised on one rank
   inside an ordered barrier loop and that rank moved on; the others wait forever. vLLM builds
   several `GroupCoordinator`s over the same ranks — never keep singleton state in a
