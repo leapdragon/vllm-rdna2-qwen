@@ -7,7 +7,7 @@
 #   tools/rdna2/build-torch-rocm714.sh                 # ~2-3 h on 32 cores
 #
 # Env: ROCM_PATH (/opt/rocm), SRC (~/src/rdna2), OUT (~/wheels/rdna2), MAX_JOBS (nproc),
-#      PYTORCH_REF (6bbd260), TRITON_REF (f0b55c0), SKIP_TRITON (unset)
+#      PYTORCH_REF (6bbd260), TRITON_REF (f0b55c0), SKIP_TRITON / SKIP_TORCH (unset)
 set -euo pipefail
 
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
@@ -34,7 +34,8 @@ export BUILD_TEST=0 USE_DISTRIBUTED=1 USE_RCCL=1 USE_MPI=0 USE_KINETO=1 USE_ROCM
 export CMAKE_PREFIX_PATH="$(python3 -c 'import sys; print(sys.prefix)'):$ROCM_PATH"
 
 # ---- PyTorch ------------------------------------------------------------------------------
-if [ ! -d "$SRC/pytorch" ]; then
+if [ -z "${SKIP_TORCH:-}" ]; then
+if [ ! -e "$SRC/pytorch" ]; then
   git clone https://github.com/ROCm/pytorch.git "$SRC/pytorch"
 fi
 cd "$SRC/pytorch"
@@ -46,10 +47,11 @@ $PIP install -q -r requirements.txt
 python3 tools/amd_build/build_amd.py
 python3 setup.py bdist_wheel --dist-dir "$OUT" 2>&1 | tee "$OUT/torch-build.log" | grep -E "error|Error|^-- |Building wheel|Finished" | tail -20
 ls -la "$OUT"/torch-*.whl
+fi
 
 # ---- Triton -------------------------------------------------------------------------------
 if [ -z "${SKIP_TRITON:-}" ]; then
-  if [ ! -d "$SRC/triton" ]; then
+  if [ ! -e "$SRC/triton" ]; then
     git clone https://github.com/ROCm/triton.git "$SRC/triton"
   fi
   cd "$SRC/triton"
