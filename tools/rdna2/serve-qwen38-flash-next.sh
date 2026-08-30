@@ -9,7 +9,11 @@
 #
 # Knobs (env): GPUS (ROCR device ids, default 1,2,3,4), PORT (8000), MTP (3), GPUUTIL (0.86),
 #   DENSE_INT8 (1), EAGER (unset), PROFILE (unset), TRACES (dir for torch-profiler traces),
-#   COMPILE_CACHE_OFF (1), P2P (PXB), MAXLEN (65536), EXTRA_ARGS.
+#   COMPILE_CACHE_OFF (1), P2P (PXB), MAXLEN (65536), EXTRA_ARGS,
+#   TOOLS (1: OpenAI tool calling with tool_choice "auto" for agentic clients such as Kilocode /
+#   Cline / Roo; the model's chat template emits Qwen3-Coder-style <function=…><parameter=…> XML,
+#   parsed by vLLM's "qwen3_coder" parser; <think> blocks go to reasoning_content via the "qwen3"
+#   reasoning parser), TOOL_PARSER (qwen3_coder), REASONING_PARSER (qwen3).
 set -euo pipefail
 
 : "${MODEL:?set MODEL to the AWQ-W4A16 backbone directory (shards 2-5 + model_mtp.safetensors)}"
@@ -51,6 +55,11 @@ SPEC=()
 if [ -n "$MTP" ] && [ "$MTP" != "0" ]; then
   SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP}")
 fi
+TOOLARGS=()
+if [ "${TOOLS:-1}" = "1" ]; then
+  TOOLARGS=(--enable-auto-tool-choice --tool-call-parser "${TOOL_PARSER:-qwen3_coder}"
+            --reasoning-parser "${REASONING_PARSER:-qwen3}")
+fi
 PROF=()
 if [ -n "${PROFILE:-}" ]; then
   PROF=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir="$TRACES")
@@ -65,5 +74,5 @@ exec python3 -m vllm.entrypoints.openai.api_server \
   ${EAGER:+--enforce-eager} \
   --language-model-only --skip-mm-profiling \
   --enable-prefix-caching \
-  "${SPEC[@]}" "${PROF[@]}" ${EXTRA_ARGS:-} \
+  "${SPEC[@]}" "${TOOLARGS[@]}" "${PROF[@]}" ${EXTRA_ARGS:-} \
   --host 0.0.0.0 --port "$PORT"
