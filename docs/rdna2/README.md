@@ -128,6 +128,14 @@ KV pool held ~197k tokens at 0.86), `MTP=4` (+2 % on long generations) or `MTP=0
 the `mtp.*` weights are never loaded and no draft graphs are captured, ~2.5 GiB/card back to the KV
 pool — worth it when your workload's acceptance rate is low, e.g. below ~20 %), `DENSE_INT8=0` (fp16
 dense projections; −15 %), `GPUS=1,2,3,4` (ROCR device ids), `PORT=`, `PROFILE=1` (enables `/start_profile`),
+`VISION=1` (loads the model's 0.9 GB Qwen3-VL-style vision tower on every rank and accepts
+images on the chat API — up to `MM_LIMIT` per prompt, default `'{"image": 4, "video": 0}'`;
+images are resized to `MM_PROCESSOR_KWARGS`, default `'{"max_pixels": 1638400}'` ≈ 1280×1280.
+Do not raise that cap casually: the checkpoint's own ceiling is 16 megapixels and on gfx1030
+the ViT runs Torch SDPA's math path, which materialises the full attention matrix — the memory
+profiler's 16 MP dummy image asks for 64 GiB and kills the boot. Costs ~137k tokens of KV pool
+at 196k context. Verified with `tools/rdna2/vision_test.py`: shapes, colours, OCR, counting,
+multi-image, a 1800×1400 image, over-limit rejection, text unaffected),
 `CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}'` (server-side defaults
 merged into every request's `chat_template_kwargs`, request values win; this template understands
 `enable_thinking`, `preserve_thinking` — keep earlier turns' `reasoning_content` in the prompt — and

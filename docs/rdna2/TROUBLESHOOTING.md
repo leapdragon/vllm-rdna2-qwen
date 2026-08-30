@@ -224,6 +224,11 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   barrier flags in host memory over PCIe; since 2026-08-30 it polls local VRAM. If it recurs,
   `tools/rdna2/soak_fabric_watch.sh` correlates generation with the kernel log; check power
   caps and link widths (`amd-smi metric --pcie`) before blaming software.
+- **Boot with vision enabled dies in memory profiling: "Tried to allocate 64.00 GiB" from
+  `apply_sdpa`.** The image processor's default ceiling is 16 megapixels and the ViT falls
+  back to Torch SDPA on gfx1030 (quadratic memory); the profiler's max-size dummy image is the
+  16 MP worst case. Cap it: `--mm-processor-kwargs '{"max_pixels": 1638400}'` (the serve
+  script's default when `VISION=1`).
 - **Warm boot dies with `queue.Full` in `PleOffloadConnector._launch` during kernel warmup.**
   The model thread only enqueues GPU work, so a fast host loop runs ahead of the PLE request
   thread and the bounded request queue (`max_num_seqs + 1`) overflowed; cold boots were slow

@@ -250,6 +250,27 @@ byte-identical, waiting generates no PCIe traffic, and a 5-minute soak (`soak_fa
 logged no `mpt2sas`/amdgpu events — this box audibly resets its tape drive under fabric
 stress, and twice that day cards dropped off the bus during generation.
 
+## 8b. Vision (2026-08-30)
+
+The checkpoint ships a full Qwen3-VL-style vision tower (27 blocks, hidden 1152, patch 16,
+2×2 merge; 333 `model.visual.*` tensors, 0.90 GB bf16 in shard 2) which `--language-model-only`
+had been skipping. `VISION=1` in the serve script enables it. Facts that matter on gfx1030:
+
+- The ViT attention backend resolves to **Torch SDPA** (no `flash_attn` package, AITER is
+  CDNA-only, the Triton-AMD FA subpackage is absent). SDPA's math path materialises the
+  N² attention matrix, and the image processor's default ceiling is `longest_edge: 16777216`
+  — the startup memory profiler builds a 16 MP dummy image and dies asking for **64 GiB**.
+  The serve script therefore caps images at `--mm-processor-kwargs '{"max_pixels": 1638400}'`
+  (≈1280×1280 → 6,400 patches → a ~1.3 GB attention matrix). Raise it only with a
+  linear-memory ViT backend.
+- The tower is **replicated on every TP rank** (not sharded): ~0.9 GB/card plus encoder
+  activations; at 196k context the KV pool drops from 541k to 405k tokens (2.06×).
+- Verified with `tools/rdna2/vision_test.py` (synthetic images, deterministic answers):
+  colour+shape, OCR ("SUNRISE 42" read exactly), counting (5 squares), quadrant colours,
+  two-images-which-has-the-triangle, an 1800×1400 star, a 5th image rejected with HTTP 400,
+  and text-only decode afterwards. TTFT 1.3–5 s per image prompt (encoder is eager);
+  text decode and the PLE consistency test are unaffected.
+
 ## 9. What was measured but not adopted
 
 - YTILE=2 (two rows per wave) and LDS-staged activations for `gemv_f16_rdna2`: no gain.

@@ -21,7 +21,10 @@
 #   VISION (0: text only -- the 0.9 GB Qwen3-VL-style vision tower is not loaded, --language-model-only;
 #   1: images accepted on the chat API, tower replicated on every rank, ~0.9 GB/card less KV;
 #   the ViT runs Torch SDPA attention on gfx1030), MM_LIMIT (JSON for --limit-mm-per-prompt,
-#   default '{"image": 4, "video": 0}').
+#   default '{"image": 4, "video": 0}'), MM_PROCESSOR_KWARGS (JSON for --mm-processor-kwargs,
+#   default '{"max_pixels": 1638400}' = images resized to <= 1280x1280 before the encoder: the
+#   processor's own ceiling is 16 megapixels, and on gfx1030 the ViT's attention is SDPA's math
+#   path, which materialises N^2 -- the memory profiler's 16 MP dummy image asked for 64 GiB).
 set -euo pipefail
 
 : "${MODEL:?set MODEL to the AWQ-W4A16 backbone directory (shards 2-5 + model_mtp.safetensors)}"
@@ -77,7 +80,9 @@ if [ "${VISION:-0}" = "1" ]; then
   # Profiling stays on so the encoder's activations are accounted for before the KV pool
   # is sized; the limit keeps a prompt from carrying more than MM_LIMIT images.
   _MM_LIMIT_DEFAULT='{"image": 4, "video": 0}'   # never inline JSON in ${VAR:-...}: bash closes at the first '}'
-  VISIONARGS=(--limit-mm-per-prompt "${MM_LIMIT:-$_MM_LIMIT_DEFAULT}")
+  _MM_PROC_DEFAULT='{"max_pixels": 1638400}'
+  VISIONARGS=(--limit-mm-per-prompt "${MM_LIMIT:-$_MM_LIMIT_DEFAULT}"
+              --mm-processor-kwargs "${MM_PROCESSOR_KWARGS:-$_MM_PROC_DEFAULT}")
 fi
 PROF=()
 if [ -n "${PROFILE:-}" ]; then
