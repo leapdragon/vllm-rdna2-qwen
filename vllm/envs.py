@@ -299,6 +299,13 @@ if TYPE_CHECKING:
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_PLE_DISK_OFFLOAD_DIR: str = ""
+    VLLM_PLE_QUANT_DIR: str = ""
+    VLLM_RDNA_DENSE_INT8: bool = False
+    VLLM_RDNA_AR: bool = True
+    VLLM_RDNA_AR_MAX_KB: int = 64
+    VLLM_RDNA_FUSED_HC: bool = True
+    VLLM_RDNA_FUSED_SE: bool = True
+    VLLM_ROCM_MOE_SKINNY: bool = True
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2056,6 +2063,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_DISK_OFFLOAD_DIR": lambda: os.getenv(
         "VLLM_PLE_DISK_OFFLOAD_DIR", ""
     ),
+    # --- gfx1030 / RDNA2 fork (docs/rdna2/CHANGES.md) ---
+    # int4/fp8 quantized n-gram table sidecar served by the PLE offload worker
+    "VLLM_PLE_QUANT_DIR": lambda: os.getenv("VLLM_PLE_QUANT_DIR", ""),
+    # int8 weight-only shadows of the dense fp16 projections for decode (T45)
+    "VLLM_RDNA_DENSE_INT8": lambda: os.getenv("VLLM_RDNA_DENSE_INT8", "0") == "1",
+    # push-based one-shot P2P all-reduce for small TP messages (T44)
+    "VLLM_RDNA_AR": lambda: os.getenv("VLLM_RDNA_AR", "1") == "1",
+    "VLLM_RDNA_AR_MAX_KB": lambda: int(os.getenv("VLLM_RDNA_AR_MAX_KB", "64")),
+    # fused hyper-connection mix / shared-expert decode kernels (T46)
+    "VLLM_RDNA_FUSED_HC": lambda: os.getenv("VLLM_RDNA_FUSED_HC", "1") == "1",
+    "VLLM_RDNA_FUSED_SE": lambda: os.getenv("VLLM_RDNA_FUSED_SE", "1") == "1",
+    # wave-per-row int4 MoE GEMV for decode on gfx1030 (T38/T43)
+    "VLLM_ROCM_MOE_SKINNY": lambda: os.getenv("VLLM_ROCM_MOE_SKINNY", "1") == "1",
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
