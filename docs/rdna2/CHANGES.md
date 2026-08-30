@@ -200,6 +200,45 @@ registered eagerly at import time of `rdna_dense_int8.py` and the model's `hyper
 The serve script keeps the cache off by default (`COMPILE_CACHE_OFF=1`) as the safe setting for
 anyone editing the fork; with it on, a boot whose key matches skips the ~700 s of Inductor work.
 
+## 8a. The n-gram (PLE) offload handshake and the all-reduce barrier — 2026-08-30
+
+Two ROCm-specific bugs, found while chasing garbled characters (`">>"`, `charsetset`) in
+long tool-call generations after MTP was switched off:
+
+**HIP graphs drop `hipStreamWaitValue32`.** vLLM's PLE offload makes the GPU wait for the
+CPU n-gram lookup with a stream-memory wait (`ple_offload_wait`, inside the compiled graph).
+On ROCm the call is accepted during stream capture but not recorded, so every CUDA-graph
+decode step read whatever was in the output buffer — usually the previous step's lookup. The
+"Duplicate PLE request … skipping" warnings were the fingerprint (forwards finished without
+waiting, the host ran ahead, the CPU worker drained two requests and dropped one). MTP=3 had
+masked it by keeping the worker ahead of the GPU through timing luck. Moving the wait outside
+the graph is *not* the fix: a pending WAIT_REG_MEM cannot be preempted when KFD evicts queues
+(`svm_range_restore`, frequent here), the eviction times out, the driver resets the GPU and
+on this machine the reset loses the card from the PCIe bus. The protocol now has **no
+GPU-side waits at all** (`vllm/v1/ple_offload/`): the worker processes requests strictly in
+order, DMAs the result to every TP worker's buffer, then bumps a shared-memory counter per
+worker; each model thread blocks in `prepare_forward` until its counter reaches the launch
+number and only then enqueues the forward. The chain is inherently serial (step N+1's lookup
+needs step N's token), so nothing is lost by waiting on the host — but the wait is now real:
+decode went from 70–72 t/s (which was the *no-wait* speed) to ~55 t/s, of which ~3.3 ms per
+step is the CPU lookup (2.5 ms, dozens of small torch ops + mmap faults) plus copy/sync
+(0.8 ms). Optimising that path is the next workstream. Tests: `tools/rdna2/ple_consistency_test.py`
+(two identical greedy runs must match, garble scan, no skips, idle GPUs; `--trace` with
+`PLE_OFFLOAD_DEBUG_TRACE` on the worker compares the lookups themselves),
+`tools/rdna2/ple_coherence_test.py` (cross-process DMA visibility, standalone).
+
+**The one-shot all-reduce's barrier flags were in a host-coherent page.** Every rank polled
+system memory over PCIe for the whole barrier (~10 k barriers/s at MTP=0), and — the subtle
+part — its payload went to a peer's VRAM while its flag went to host memory: posted PCIe
+writes are only ordered per destination, so a rank could see the flag before the last payload
+bytes landed and reduce a few stale elements. That was the run-to-run logprob noise
+(1e-5…1e-2) that made two greedy runs diverge. Flags now live in a 4 KB page appended to each
+rank's *uncached* staging buffer (same IPC handle): a rank announces with one posted P2P
+store per peer and polls its own memory with `s_sleep(8)` between polls. Two greedy runs are
+byte-identical, waiting generates no PCIe traffic, and a 5-minute soak (`soak_fabric_watch.sh`)
+logged no `mpt2sas`/amdgpu events — this box audibly resets its tape drive under fabric
+stress, and twice that day cards dropped off the bus during generation.
+
 ## 9. What was measured but not adopted
 
 - YTILE=2 (two rows per wave) and LDS-staged activations for `gemv_f16_rdna2`: no gain.

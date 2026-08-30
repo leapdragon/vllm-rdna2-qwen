@@ -119,6 +119,8 @@ class PleOffloadConnector:
         # the forward. Allocated before registration so it can be shared.
         self._done_seq_buf = torch.zeros(1, dtype=torch.int64).share_memory_()
         self._launch_seq = 0
+        self._t_launch = 0.0
+        self._t_wait = 0.0
         self._request_thread_ready = threading.Event()
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
@@ -439,7 +441,9 @@ class PleOffloadConnector:
             self.signal_dummy_outputs(num_tokens)
             return
         self._launch_seq += 1
+        t0 = time.perf_counter()
         self._launch(num_reqs, num_tokens)
+        t1 = time.perf_counter()
         # Host-side wait for the CPU lookup (2026-08-30). Why not the GPU-side
         # stream wait the layer's ``ple_offload_wait`` op enqueues: on ROCm,
         # hipStreamWaitValue32 is accepted during stream capture but not recorded
@@ -451,6 +455,15 @@ class PleOffloadConnector:
         # step N+1's lookup needs step N's sampled token, so the chain is serial
         # anyway, and async scheduling still overlaps this wait with forward N.
         self._wait_lookup_done(self._launch_seq)
+        t2 = time.perf_counter()
+        self._t_launch += t1 - t0
+        self._t_wait += t2 - t1
+        if self._launch_seq % 500 == 0 and self.tp_rank == 0:
+            n = self._launch_seq
+            logger.info(
+                "PLE offload host wait over %d launches: launch %.2f ms + wait %.2f ms per step",
+                n, self._t_launch / n * 1e3, self._t_wait / n * 1e3,
+            )
 
     def _wait_lookup_done(self, seq: int) -> None:
         """Block until the offload worker reports launch ``seq`` complete."""

@@ -145,7 +145,7 @@ If you run vLLM your own way, use the flags directly:
 | what | serve-script knob | stock vLLM argument |
 |---|---|---|
 | MTP draft head on (98–106 t/s decode at ~60 % acceptance) | `MTP=3` (default) | `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` |
-| MTP off (72 t/s, head never loaded, ~2.5 GiB/card more KV cache; better when your acceptance is < ~25 %) | `MTP=0` | omit `--speculative-config` |
+| MTP off (~55 t/s, head never loaded, ~2.5 GiB/card more KV cache; better when your acceptance is < ~25 %) | `MTP=0` | omit `--speculative-config` |
 | thinking defaults for every request | `CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}'` | `--default-chat-template-kwargs '{…}'` |
 
 Restart to switch (the speculative config is fixed at engine init). With the torch.compile
@@ -181,6 +181,11 @@ What you should see (our numbers, `RESULTS.md`):
 After every run: `journalctl -k | grep amdgpu` should show nothing new, and `rocm-smi --showtemp`
 should be under 60 °C. Container logs are UTC and the host journal is local time — convert
 before attributing a fault to a run.
+
+Correctness checks worth running after any change to the n-gram offload or the all-reduce:
+`tools/rdna2/ple_consistency_test.py` (two identical greedy 1200-token runs must be
+byte-identical, no "Duplicate PLE request" lines, GPUs idle afterwards) and, for sustained
+load with a kernel-log watch, `tools/rdna2/soak_fabric_watch.sh 300`. See CHANGES.md §8a.
 
 ## 8. Profiling — how the optimisations were found
 

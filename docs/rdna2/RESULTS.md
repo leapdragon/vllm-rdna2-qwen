@@ -215,6 +215,13 @@ Same host build, `MTP=0` (no `--speculative-config`), `COMPILE_CACHE_OFF=0`,
 
 Warm boots needed three fixes in this fork (eager custom-op registration, back-pressure on the
 PLE request queue, one input-ready event per PLE request — see CHANGES.md §8 and
-TROUBLESHOOTING.md §5a). Open item: the PLE offload worker still logs "Duplicate PLE request …
-skipping duplicate" for roughly one decode step in five without MTP (never with MTP=3); outputs
-validate correctly, cause not yet isolated (suspected interaction with async scheduling).
+TROUBLESHOOTING.md §5a).
+
+**Correction, later the same day (CHANGES.md §8a):** the "Duplicate PLE request" skips were a
+real bug — HIP graphs drop the stream wait the n-gram offload relied on, so decode steps used
+stale lookups (garbled long generations). With the host-side completion protocol the numbers
+above change: **MTP=0 decode is ~55 t/s over 1024 tokens (37–47 over 256)** because the CPU
+lookup (~3.3 ms/step) is now genuinely waited for; two greedy runs are byte-identical (they
+were not before — the old all-reduce could read a few stale payload elements); a 5-minute soak
+logs no PCIe-fabric events. The 98–106 t/s MTP=3 and 70–72 t/s MTP=0 figures were measured
+with the broken wait and should be read as upper bounds until the lookup path is optimised.

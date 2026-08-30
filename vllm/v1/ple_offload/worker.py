@@ -915,6 +915,9 @@ class PleOffloadRunner:
             self._debug_trace = open(trace_path, "a", buffering=1)
             logger.warning("PLE_OFFLOAD_DEBUG_TRACE=%s: tracing every request (test hook).", trace_path)
         self._done_seq: dict[int, int] = {}
+        self._t_lookup = 0.0
+        self._t_total = 0.0
+        self._n_timed = 0
         if self._debug_delay_s:
             logger.warning("PLE_OFFLOAD_DEBUG_DELAY_MS=%.0f: every lookup is delayed (test hook).", self._debug_delay_s * 1e3)
         logger.info("Busy-loop started.")
@@ -975,6 +978,7 @@ class PleOffloadRunner:
             self._handle_one(request)
 
     def _handle_one(self, request: PleOffloadRequest) -> None:
+        t_recv = time.perf_counter()
         requests_by_dp = {request.dp_rank: request}
 
         # Speculative placeholders are not vocabulary IDs. Normalize each DP
@@ -1002,6 +1006,7 @@ class PleOffloadRunner:
                     if input_bufs.ngram_context_buf is not None
                     else None
                 )
+                t_lk0 = time.perf_counter()
                 result = layer.forward_impl(
                     input_bufs.input_ids_buf[: request.num_tokens],
                     input_bufs.input_ids_buf[: request.num_tokens],
@@ -1009,6 +1014,7 @@ class PleOffloadRunner:
                     ngram_context,
                     output_buffer=self._pinned_bufs[dp_rank][layer_name],
                 )
+                self._t_lookup += time.perf_counter() - t_lk0
                 if self._debug_trace is not None:
                     import hashlib
                     ids = input_bufs.input_ids_buf[: request.num_tokens]
@@ -1043,3 +1049,14 @@ class PleOffloadRunner:
                     if buf is not None and id(buf) not in written:
                         buf[0] = seq
                         written.add(id(buf))
+        # timing stats (test/diagnostic): every 500 requests log the average split
+        self._t_total += time.perf_counter() - t_recv
+        self._n_timed += 1
+        if self._n_timed % 500 == 0:
+            n = self._n_timed
+            logger.info(
+                "PLE offload timing over %d requests: lookup %.2f ms, copy+sync %.2f ms, "
+                "total in worker %.2f ms per request",
+                n, self._t_lookup / n * 1e3, (self._t_total - self._t_lookup) / n * 1e3,
+                self._t_total / n * 1e3,
+            )

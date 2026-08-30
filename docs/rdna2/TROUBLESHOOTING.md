@@ -213,6 +213,17 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   cached graph runs before any forward pass executed the lazy `import rdna_ops` at the call
   sites. Custom ops referenced by compiled graphs must be registered at module import time
   (done in `rdna_dense_int8.py` and the model's `amd/hyperconnection.py`, 2026-08-30).
+- **Garbled characters in long generations (`">>"`, `charsetset`), "Duplicate PLE request …
+  skipping" in the log, 99 % GPU busy at idle with 0 % memory activity.** HIP graphs drop
+  `hipStreamWaitValue32`, so CUDA-graph decode steps did not wait for the CPU n-gram lookup.
+  Fixed by the host-side completion protocol (CHANGES.md §8a); `tools/rdna2/ple_consistency_test.py`
+  is the regression test. Do not reintroduce a GPU-side wait: a pending WAIT_REG_MEM blocks
+  KFD queue eviction and the resulting reset lost a GPU from the bus here.
+- **Cards drop off the PCIe bus during generation; the SAS HBA's tape drive re-initialises
+  (`mpt2sas_cm0: detecting: handle(...)`).** Fabric stress. The all-reduce used to poll its
+  barrier flags in host memory over PCIe; since 2026-08-30 it polls local VRAM. If it recurs,
+  `tools/rdna2/soak_fabric_watch.sh` correlates generation with the kernel log; check power
+  caps and link widths (`amd-smi metric --pcie`) before blaming software.
 - **Warm boot dies with `queue.Full` in `PleOffloadConnector._launch` during kernel warmup.**
   The model thread only enqueues GPU work, so a fast host loop runs ahead of the PLE request
   thread and the bounded request queue (`max_num_seqs + 1`) overflowed; cold boots were slow
