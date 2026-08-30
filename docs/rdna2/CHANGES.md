@@ -11,6 +11,37 @@ subjects carry the original patch numbers (`port: 000N …`, `T43 …`) so they 
 the experiment log in `RESULTS.md`. Nothing here is a config-only tweak: the numbers came
 from profiling inside the serving process and writing kernels for what the profile showed.
 
+## How to see exactly what this fork changed (on GitHub)
+
+The branch has three layers, and GitHub's compare view can show each:
+
+1. **Everything vs upstream vLLM** — [`main...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/main...rdna2/qwen38-flash-next):
+   the Flash-Next model branch (vLLM PR #53896, not ours) *plus* this fork's work. Large.
+2. **Only this fork's work** — [`2a46f85b43...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...rdna2/qwen38-flash-next):
+   `2a46f85b43` is the merge commit that brought the Flash-Next branch in; every commit after it
+   is ours (the 22 ported patches, the env declarations, `docs/rdna2/`, `tools/rdna2/`).
+   The **Commits** tab of that compare lists them with their original subjects
+   (`port: 000N …`, `rdna2: …`, `PLE offload: …`, `T43 …`, `T44 …`, `T45/T46 …`); the
+   **Files changed** tab is the whole diff.
+3. **One change at a time** — the commit list
+   [`commits/rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/commits/rdna2/qwen38-flash-next);
+   click a commit to see its diff. The sections above are in that order.
+
+Locally: `git log --first-parent 2a46f85b43..rdna2/qwen38-flash-next` and
+`git diff --stat 2a46f85b43 rdna2/qwen38-flash-next`.
+
+Where our code lives (new or modified files, by area):
+
+| area | files |
+|---|---|
+| `csrc/rocm/` | `rdna_allreduce.cuh/.cu` (one-shot all-reduce), `rdna_fused_glue.cu` (fused hc / shared-expert kernels), `skinny_gemms_int4.cu` (int4 MoE GEMV, `gemv_f16_rdna2`, `gemv_i8_rdna2`), `ops.h`, `torch_bindings.cpp` |
+| `vllm/model_executor/layers/` | `rdna_ops.py` (runtime-dispatch custom ops), `rdna_dense_int8.py` (int8 shadows), `utils.py` (the GEMM route), `linear.py` / `vocab_parallel_embedding.py` (hooks), `fused_qk_norm_rope.py`, `fused_moe/experts/triton_moe.py` (MoE hook), `ple_offload_layer.py` |
+| `vllm/distributed/device_communicators/` | `rdna_all_reduce.py`, `cuda_communicator.py` (hook) |
+| `vllm/v1/ple_offload/` | the PLE offload worker/connector, `hip_driver.py` (HIP shim) |
+| `vllm/models/qwen4_exp/amd/` | `ple_layer.py` (offload + sidecar), `hyperconnection.py`, `qsa.py`, `indexer_qsa.py`, fp16 enablement |
+| `vllm/platforms/rocm.py`, `vllm/envs.py` | `on_gfx10x()`, amdsmi device filtering, the fork's environment variables |
+| `docs/rdna2/`, `tools/rdna2/` | this documentation and the build/serve/measure tools |
+
 ## 0. The base
 
 Validated twice: in the container environment the numbers in `RESULTS.md` were measured in

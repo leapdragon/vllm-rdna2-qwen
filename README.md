@@ -81,6 +81,12 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
 first (this platform's failure modes point away from their causes), then
 [`docs/rdna2/README.md`](docs/rdna2/README.md) §9.
 
+**To see what was changed**: the GitHub compare view
+[`2a46f85b43...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...rdna2/qwen38-flash-next)
+shows only this fork's commits and diff (everything after the merge of the Flash-Next model
+branch); [`main...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/main...rdna2/qwen38-flash-next)
+shows everything vs upstream vLLM. `docs/rdna2/CHANGES.md` opens with a map of where the code lives.
+
 **To understand or reuse the work**: [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) — every
 change and the reason for it; [`docs/rdna2/RESULTS.md`](docs/rdna2/RESULTS.md) — the measured
 numbers; [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md) — the silicon profile the
