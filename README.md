@@ -1,9 +1,93 @@
-> **This fork: Qwen3.8-Flash-Next on 4× AMD Radeon PRO V620 (gfx1030) at ~100 tokens/s, built
-> against TheRock ROCm 7.14.** Start at [`docs/rdna2/README.md`](docs/rdna2/README.md) — what
-> to download, how to build, how to serve, what to expect. What changed and why:
-> [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md). Measurements: [`docs/rdna2/RESULTS.md`](docs/rdna2/RESULTS.md).
-> The silicon profile behind every kernel: [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md).
-> Tools: [`tools/rdna2/`](tools/rdna2/). Branch: `rdna2/qwen38-flash-next`; `main` tracks upstream.
+# GETTING STARTED WITH THIS FORK
+
+This is a fork of [vLLM](https://github.com/vllm-project/vllm) that serves the
+**Qwen3.8-Flash-Next** model (176 B parameters) on **four AMD Radeon PRO V620** cards
+(Navi 21 / gfx1030) at about **100 tokens per second**, built against a stock
+**TheRock ROCm 7.14** install. Stock vLLM cannot do this: it does not support gfx1030, the
+model is not merged upstream yet, and the model's 51-billion-row n-gram table does not fit on
+the cards. Everything that makes it work is in this repository. You do not need Docker.
+
+**What you get**: the patched vLLM source (kernels written for this chip, a P2P all-reduce,
+int8 shadows, fused decode kernels, the CPU offload for the n-gram table), the build and serve
+scripts, the benchmark/validation tools, and the research write-ups explaining every change.
+
+**What you need** (details in [`docs/rdna2/README.md`](docs/rdna2/README.md) §1):
+
+- A Linux box (ours: Ubuntu, kernel 7.0) with **4× gfx103x cards with 32 GB each**, ≥96 GB of
+  RAM, ~250 GB of free disk, and **no other GPU generation in the machine**.
+- The kernel command line `amdgpu.pcie_gen_cap=0x00070007 amdgpu.aspm=0 amdgpu.runpm=0
+  amdgpu.gpu_recovery=1 amdgpu.noretry=1 amd_iommu=on iommu=pt` (without it, four of these
+  cards under tensor parallelism fall off the PCIe bus).
+- **TheRock ROCm 7.14** installed with the runfile so that `/opt/rocm` points at it and
+  `/opt/rocm/bin/rocminfo` lists your cards as `gfx1030`. No apt ROCm packages mixed in.
+- `git`, `cmake`, `ninja`, `gcc`, [`uv`](https://docs.astral.sh/uv/) (for a Python 3.12
+  environment), and the Hugging Face CLI (`pip install -U huggingface_hub` gives you `hf`).
+- About 3 hours of unattended build time and ~105 GB of downloads.
+
+**The steps** (each one is spelled out in [`docs/rdna2/README.md`](docs/rdna2/README.md)):
+
+1. **Get the code.** Clone this repository — the default branch is the working one:
+
+   ```bash
+   git clone https://github.com/leapdragon/vllm-rdna2-qwen.git
+   cd vllm-rdna2-qwen        # you are on branch rdna2/qwen38-flash-next
+   ```
+
+2. **Build PyTorch, Triton and torchvision for gfx1030** (TheRock does not publish PyTorch
+   wheels for this GPU family, so they are built from source — this is the long step):
+
+   ```bash
+   uv venv --python 3.12 ~/venvs/vllm-rdna2-qwen
+   source ~/venvs/vllm-rdna2-qwen/bin/activate
+   tools/rdna2/build-torch-rocm714.sh                      # ~2-3 hours; wheels land in ~/wheels/rdna2/
+   uv pip install ~/wheels/rdna2/torch-*.whl ~/wheels/rdna2/triton-*.whl ~/wheels/rdna2/torchvision-*.whl
+   ```
+
+3. **Build this vLLM** (`docs/rdna2/README.md` §4 has the exact commands, including the two
+   small traps: install the wheels above *before* any other dependency, and copy
+   `/opt/rocm/share/amd_smi` somewhere writable before installing it):
+
+   ```bash
+   uv pip install -e . --no-build-isolation --no-deps       # ~25 minutes
+   ```
+
+4. **Download the model** — two parts, no conversion (§5):
+
+   ```bash
+   hf download wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --local-dir models/qwen38-flash-next \
+      --exclude "model-00001-of-00005.safetensors"           # 73 GB; shard 1 is not needed
+   hf download primitive-ai/Qwen3.8-Flash-Next-PLE-quant --include "ples_int4/*" \
+      --local-dir models/qwen38-flash-next-ple                # 30 GB n-gram table, int4
+   ```
+
+5. **Serve it** (§6). The script *is* the whole configuration:
+
+   ```bash
+   MODEL=models/qwen38-flash-next PLE_INT4=models/qwen38-flash-next-ple/ples_int4 \
+     tools/rdna2/serve-qwen38-flash-next.sh
+   ```
+
+   Boot takes ~15 minutes; `curl localhost:8000/health` returns 200 when it is up. It speaks
+   the OpenAI API on port 8000 (model name `qwen38-flash-next`).
+
+6. **Check it** (§7):
+
+   ```bash
+   python tools/rdna2/validate.py        # must print PASS
+   python tools/rdna2/bench.py 3 256     # expect ~95-105 tokens/s decode
+   ```
+
+**If something goes wrong**: [`docs/rdna2/TROUBLESHOOTING.md`](docs/rdna2/TROUBLESHOOTING.md)
+first (this platform's failure modes point away from their causes), then
+[`docs/rdna2/README.md`](docs/rdna2/README.md) §9.
+
+**To understand or reuse the work**: [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) — every
+change and the reason for it; [`docs/rdna2/RESULTS.md`](docs/rdna2/RESULTS.md) — the measured
+numbers; [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md) — the silicon profile the
+kernels were designed against; [`tools/rdna2/`](tools/rdna2/) — build, serve, benchmark, profile
+and test tools. `main` tracks upstream vLLM; this fork's work is on `rdna2/qwen38-flash-next`.
+
+---
 
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
