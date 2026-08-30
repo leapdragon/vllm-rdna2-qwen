@@ -7,7 +7,8 @@
 #   tools/rdna2/build-torch-rocm714.sh                 # ~2-3 h on 32 cores
 #
 # Env: ROCM_PATH (/opt/rocm), SRC (~/src/rdna2), OUT (~/wheels/rdna2), MAX_JOBS (nproc),
-#      PYTORCH_REF (6bbd260), TRITON_REF (f0b55c0), SKIP_TRITON / SKIP_TORCH (unset)
+#      PYTORCH_REF (6bbd260), TRITON_REF (f0b55c0), VISION_REF (v0.27.1),
+#      SKIP_TORCH / SKIP_TRITON / SKIP_VISION (unset)
 set -euo pipefail
 
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
@@ -16,6 +17,7 @@ OUT="${OUT:-$HOME/wheels/rdna2}"
 MAX_JOBS="${MAX_JOBS:-$(nproc)}"
 PYTORCH_REF="${PYTORCH_REF:-6bbd260}"   # ROCm/pytorch release/2.12 as of 2026-08-02
 TRITON_REF="${TRITON_REF:-f0b55c0}"     # ROCm/triton release/internal/3.7.x as of 2026-08-18
+VISION_REF="${VISION_REF:-v0.27.1}"      # pytorch/vision matching torch 2.12 (Dockerfile.rocm_base pin)
 mkdir -p "$SRC" "$OUT"
 
 [ -x "$ROCM_PATH/bin/hipcc" ] || { echo "no hipcc under $ROCM_PATH"; exit 1; }
@@ -69,5 +71,20 @@ if [ -z "${SKIP_TRITON:-}" ]; then
   ls -la "$OUT"/triton-*.whl
 fi
 
+# ---- torchvision (CPU ops only; transformers' Qwen2-VL image processor imports it) ---------
+if [ -z "${SKIP_VISION:-}" ]; then
+  if [ ! -e "$SRC/vision" ]; then
+    git clone https://github.com/pytorch/vision.git "$SRC/vision"
+  fi
+  cd "$SRC/vision"
+  git fetch -q origin --tags
+  git checkout -q "$VISION_REF"
+  # needs the torch wheel built above installed in this venv
+  python3 -c "import torch" || { echo "install $OUT/torch-*.whl first"; exit 1; }
+  FORCE_CUDA=0 TORCHVISION_USE_NVJPEG=0 TORCHVISION_USE_VIDEO_CODEC=0 \
+    python3 setup.py bdist_wheel --dist-dir "$OUT" 2>&1 | tee "$OUT/vision-build.log" | grep -E "error|Building wheel|Finished" | tail -5
+  ls -la "$OUT"/torchvision-*.whl
+fi
+
 echo "wheels in $OUT:"; ls "$OUT"/*.whl
-echo "install:  pip install $OUT/torch-*.whl $OUT/triton-*.whl"
+echo "install:  pip install $OUT/torch-*.whl $OUT/triton-*.whl $OUT/torchvision-*.whl"
