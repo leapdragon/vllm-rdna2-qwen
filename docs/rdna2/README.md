@@ -99,6 +99,14 @@ hf download primitive-ai/Qwen3.8-Flash-Next-PLE-quant --include "ples_int4/*" --
 `models/qwen38-flash-next-ple/ples_int4/META.json` must read
 `"layout": "group16_int4_fp16scale_lownibblefirst", "rows": 320001536, "width": 160`.
 
+The same download serves both with and without the MTP draft head. `model_mtp.safetensors`
+(5.2 GB, the head's 31 `mtp.*` tensors) is part of it and **must stay on disk in both cases**:
+`model.safetensors.index.json` references it and vLLM refuses to start if an indexed file is
+missing (`FileNotFoundError: Weight files referenced in index but missing`). With `MTP=0` the
+loader maps `mtp.*` to nothing, so the file costs disk only — nothing of it reaches VRAM; with
+`MTP=3` the draft model is built from it. Do not `--exclude` it. There is no separate model
+assembly step for either mode; the switch is the serve argument (§6).
+
 ## 6. Serve
 
 ```bash
