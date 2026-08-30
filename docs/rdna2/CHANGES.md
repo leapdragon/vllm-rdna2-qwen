@@ -13,6 +13,10 @@ from profiling inside the serving process and writing kernels for what the profi
 
 ## 0. The base
 
+Validated twice: in the container environment the numbers in `RESULTS.md` were measured in
+(ROCm 7.2.3), and on the host against TheRock ROCm 7.14 (same source, PyTorch built from
+source; `RESULTS.md` last section) — 98 / 105 / 96 t/s.
+
 `main` of this fork = upstream `vllm-project/vllm` main (post-0.28.0, `6cddad414`) merged with
 `peakcrosser7/vllm` `release/qwen38next` (the Flash-Next PR branch, head `91a6b555d`). The
 merge was clean. Our commits sit on top. The Flash-Next AMD code path (`vllm/models/qwen4_exp/amd/`)

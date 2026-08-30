@@ -128,12 +128,12 @@ Greedy sanity: `python tools/rdna2/validate.py` (chat completions, `enable_think
 temperature 0): `17 * 23` → `391`, capital of Australia → `Canberra`, first five primes →
 `2, 3, 5, 7, 11`, and a "why is the sky blue" that must mention scattering.
 
-What you should see (our numbers, `RESULTS.md` T46):
+What you should see (our numbers, `RESULTS.md`):
 
 | | decode t/s |
 |---|---|
-| 256 tokens, ×3 | 98 / 101 / 97 |
-| 1024 tokens | 95 |
+| 256 tokens, ×3 | 98 / 105 / 96 on the host build (98 / 101 / 97 in the validated container) |
+| 1024 tokens | 106 (95 container) |
 | 2.9k / 10.6k / 27k context | 78 / 108 / 88 (acceptance-driven; no context slope) |
 | per MTP step | ~29 ms, ~1,800 kernels |
 

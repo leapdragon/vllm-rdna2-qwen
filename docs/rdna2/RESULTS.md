@@ -177,3 +177,24 @@ Remaining per step: all-reduce 4.9 ms (95 × 52 µs, mostly rank skew), MoE int4
 GEMV 3.5, glue 2.5 (754 kernels), fused hc 2.4, attention 0.9, all-gather 0.8; idle ~9 ms
 (1,788 bubbles). A 4-deep unroll of the MoE GEMV did not help (not MLP-bound; its per-block
 LDS staging of x is the next suspect).
+
+
+## Host build against TheRock ROCm 7.14 (this fork, 2026-08-30 UTC)
+
+The same source (branch `rdna2/qwen38-flash-next`) built on the host, no container: PyTorch
+2.12.0+git6bbd260 from source for gfx1030, ROCm/triton 3.7.1 (f0b55c07), pytorch/vision 0.27.1,
+this fork's `_C`/`_rocm_C`/`_moe_C` against `/opt/rocm` = TheRock 7.14.60850. Served with
+`tools/rdna2/serve-qwen38-flash-next.sh` (MTP=3, int8 shadows, one-shot all-reduce).
+
+| | container (ROCm 7.2.3, T46 boot 9b) | **host (TheRock 7.14)** |
+|---|---|---|
+| decode, 256 tokens ×3 | 98.4 / 101.1 / 97.3 t/s | **98.4 / 105.4 / 95.8 t/s** |
+| decode, 1024 tokens | 95.2 t/s | **106.1 t/s** |
+| decode @ ~10.6k context (unique prompt) | 108 t/s (3.12 tok/step) | 92 t/s (2.56 tok/step) — acceptance, not context |
+| GPU KV cache | ~2.6 GiB/card | 128,526 tokens at `--max-model-len 65536` (1.96× concurrency) |
+| `tools/rdna2/validate.py` | pass | **pass** |
+| cards after the runs | 41–47 °C | 48–53 °C, journal clean |
+
+Kernel-level: the 12 dense decode shapes at M=4 take 1.0 ms on our kernels vs 3.2 ms on
+ROCm 7.14's rocBLAS (container: 1.4 vs 5.1 ms); the fused glue kernels and the
+runtime-dispatch ops pass their references on the host build with the same relerr.
