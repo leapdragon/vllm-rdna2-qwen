@@ -129,6 +129,25 @@ qwen3_coder --reasoning-parser qwen3`, which is what agentic clients such as Kil
 Roo need for `tool_choice: "auto"`; the model's template emits Qwen3-Coder-style
 `<function=…><parameter=…>` XML and `<think>` blocks land in `reasoning_content`).
 
+### Switching MTP and thinking defaults — plain vLLM arguments, no code changes
+
+Nothing here is fork-specific; the serve script only turns two standard vLLM flags on and off.
+If you run vLLM your own way, use the flags directly:
+
+| what | serve-script knob | stock vLLM argument |
+|---|---|---|
+| MTP draft head on (98–106 t/s decode at ~60 % acceptance) | `MTP=3` (default) | `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` |
+| MTP off (72 t/s, head never loaded, ~2.5 GiB/card more KV cache; better when your acceptance is < ~25 %) | `MTP=0` | omit `--speculative-config` |
+| thinking defaults for every request | `CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}'` | `--default-chat-template-kwargs '{…}'` |
+
+Restart to switch (the speculative config is fixed at engine init). With the torch.compile
+cache on, each configuration has its own cache key, so once both have booted once, switching is
+a warm boot in either direction. `tools/rdna2/watch.py` shows the live acceptance rate
+(`mtp NN% accepted`), which is the number to decide by. One fork-specific fix matters for
+`preserve_thinking`: stock vLLM drops `reasoning_content` on incoming assistant messages (it
+only reads the OpenAI-style `reasoning`), so clients that echo vLLM's own responses back got an
+empty `<think>` block — this fork accepts both fields (`vllm/entrypoints/chat_utils.py`).
+
 ## 7. Validate and measure
 
 ```bash
