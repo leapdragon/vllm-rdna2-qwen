@@ -26,6 +26,9 @@ class PleOffloadRegistration:
     input_ids_buf: torch.Tensor
     query_start_loc_buf: torch.Tensor
     ngram_context_buf: torch.Tensor | None
+    # Host-side completion counter (shared CPU int64[1]) written by the offload
+    # worker after this worker's output buffers hold request N's result.
+    done_seq_buf: torch.Tensor | None = None
 
 
 @dataclass

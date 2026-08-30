@@ -23,6 +23,7 @@ import contextlib
 import json
 import mmap as _mmap
 import multiprocessing.process
+import os
 import pickle
 import signal
 import tempfile
@@ -32,6 +33,7 @@ from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from typing import Any, cast
 
+import time
 import msgspec
 import torch
 import torch.distributed as dist
@@ -76,6 +78,7 @@ class PleOffloadOutputTarget:
     gpu_output_buffer: torch.Tensor  # IPC-mapped GPU buffer for this TP worker
     sem: CpuGpuSemaphore  # semaphore paired with gpu_output_buffer
     copy_stream: torch.cuda.Stream
+    done_seq_buf: torch.Tensor | None = None  # shared CPU counter of completed requests
 
 
 @dataclass
@@ -851,6 +854,7 @@ class PleOffloadRunner:
                         registration.sem_flag_tensors[layer_name]
                     ),
                     copy_stream=torch.cuda.Stream(device=gpu_buffer.device),
+                    done_seq_buf=registration.done_seq_buf,
                 )
                 targets_for_dp.setdefault(layer_name, []).append(target)
             # All TP ranks in one DP group receive the same input, so buffers
@@ -902,6 +906,10 @@ class PleOffloadRunner:
         shutdown_event: threading.Event,
     ) -> None:
         """Decode and batch available requests by DP rank until shutdown."""
+        self._debug_delay_s = float(os.getenv("PLE_OFFLOAD_DEBUG_DELAY_MS", "0")) / 1e3
+        self._done_seq: dict[int, int] = {}
+        if self._debug_delay_s:
+            logger.warning("PLE_OFFLOAD_DEBUG_DELAY_MS=%.0f: every lookup is delayed (test hook).", self._debug_delay_s * 1e3)
         logger.info("Busy-loop started.")
         poller = zmq.Poller()
         poller.register(pull_socket, zmq.POLLIN)
@@ -926,8 +934,25 @@ class PleOffloadRunner:
             self._handle_requests(requests)
 
     def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
-        """Run requests layer-first so each DP rank can resume promptly."""
-        requests_by_dp: dict[int, PleOffloadRequest] = {}
+        """Run every drained request, strictly in arrival order.
+
+        Protocol (2026-08-30, replaces the GPU stream-wait handshake): the GPU
+        worker's model thread blocks in ``prepare_forward`` until this process
+        has written request N's result into its output buffer and bumped the
+        shared ``done_seq_buf`` counter, and only then enqueues the forward. No
+        stream-wait packet is ever left pending on a GPU queue (on ROCm,
+        hipStreamWaitValue32 is dropped from HIP graphs, and a pending
+        WAIT_REG_MEM made KFD queue eviction fail and reset the GPU). Because the
+        GPU worker cannot launch request N+1 before N completed, at most one
+        request per DP rank is ever outstanding; several in one drain would be a
+        protocol violation, so they are processed in order and logged.
+        """
+        if len(requests) > 1:
+            logger.warning(
+                "%d PLE requests drained at once (expected at most one per DP rank); "
+                "processing in order.",
+                len(requests),
+            )
         for request in requests:
             if request.dp_rank not in self._worker_targets:
                 logger.warning(
@@ -935,13 +960,15 @@ class PleOffloadRunner:
                     request.dp_rank,
                 )
                 continue
-            if request.dp_rank in requests_by_dp:
-                logger.warning(
-                    "Duplicate PLE request for dp_rank=%d; skipping duplicate.",
-                    request.dp_rank,
-                )
-                continue
-            requests_by_dp[request.dp_rank] = request
+            if self._debug_delay_s:
+                # Test hook: PLE_OFFLOAD_DEBUG_DELAY_MS slows every lookup so a test
+                # can prove the forward waits for the result (output unchanged,
+                # decode slower) instead of reading a stale buffer.
+                time.sleep(self._debug_delay_s)
+            self._handle_one(request)
+
+    def _handle_one(self, request: PleOffloadRequest) -> None:
+        requests_by_dp = {request.dp_rank: request}
 
         # Speculative placeholders are not vocabulary IDs. Normalize each DP
         # input once before all PLE layers consume the shared buffer.
@@ -955,12 +982,12 @@ class PleOffloadRunner:
             for dp_rank, request in requests_by_dp.items():
                 targets = self._worker_targets[dp_rank][layer_name]
 
-                # The CPU must not overwrite a GPU output buffer until its
-                # previous result has been consumed. The GPU runner resets the
-                # flag after the complete model forward.
+                # The previous DMA out of the pinned result buffer must be done
+                # before forward_impl overwrites it. (The GPU side is ordered by
+                # the host protocol: request N+1 is only launched after forward N
+                # finished consuming buffer N, so no GPU-side wait is needed.)
                 for target in targets:
                     target.copy_stream.synchronize()
-                    target.sem.wait_reset(target.copy_stream)
 
                 input_bufs = self._input_bufs[dp_rank]
                 ngram_context = (
@@ -985,3 +1012,19 @@ class PleOffloadRunner:
                             result[slices], non_blocking=True
                         )
                         target.sem.signal(target.copy_stream)
+
+        # Publish completion: every TP worker's output buffers now hold this
+        # request's result (DMA finished), so its model thread may enqueue the
+        # forward. One counter per TP worker; the same tensor is shared by all
+        # of that worker's layer targets, so write it once per worker.
+        for dp_rank in requests_by_dp:
+            seq = self._done_seq.get(dp_rank, 0) + 1
+            self._done_seq[dp_rank] = seq
+            written: set[int] = set()
+            for layer_name in self._layers:
+                for target in self._worker_targets[dp_rank][layer_name]:
+                    target.copy_stream.synchronize()
+                    buf = target.done_seq_buf
+                    if buf is not None and id(buf) not in written:
+                        buf[0] = seq
+                        written.add(id(buf))

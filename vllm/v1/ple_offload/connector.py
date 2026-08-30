@@ -5,6 +5,7 @@
 import os
 import queue
 import threading
+import time
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
@@ -112,6 +113,12 @@ class PleOffloadConnector:
             tuple[PleOffloadRequest, torch.cuda.Event | None] | None
         ] = queue.Queue(maxsize=1)
         self._request_thread: threading.Thread | None = None
+        # Host-side completion protocol (see prepare_forward): the offload worker
+        # bumps this shared counter once this worker's output buffers hold the
+        # result of launch N; the model thread waits for it before enqueueing
+        # the forward. Allocated before registration so it can be shared.
+        self._done_seq_buf = torch.zeros(1, dtype=torch.int64).share_memory_()
+        self._launch_seq = 0
         self._request_thread_ready = threading.Event()
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
@@ -228,6 +235,7 @@ class PleOffloadConnector:
             input_ids_buf=self._input_ids_buf,
             query_start_loc_buf=self._query_start_loc_buf,
             ngram_context_buf=self._ngram_context_buf,
+            done_seq_buf=self._done_seq_buf,
         )
 
         # ForkingPickler transmits tensors through shared-memory and CUDA IPC.
@@ -430,7 +438,43 @@ class PleOffloadConnector:
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
+        self._launch_seq += 1
         self._launch(num_reqs, num_tokens)
+        # Host-side wait for the CPU lookup (2026-08-30). Why not the GPU-side
+        # stream wait the layer's ``ple_offload_wait`` op enqueues: on ROCm,
+        # hipStreamWaitValue32 is accepted during stream capture but not recorded
+        # into the HIP graph, so on every CUDA-graph decode replay it was a no-op
+        # and the model read a stale buffer (garbled long generations, "Duplicate
+        # PLE request" skips); and a *pending* WAIT_REG_MEM packet cannot be
+        # preempted when KFD evicts queues (svm_range_restore), which reset and
+        # lost a GPU on this machine. Waiting here on the host costs nothing:
+        # step N+1's lookup needs step N's sampled token, so the chain is serial
+        # anyway, and async scheduling still overlaps this wait with forward N.
+        self._wait_lookup_done(self._launch_seq)
+
+    def _wait_lookup_done(self, seq: int) -> None:
+        """Block until the offload worker reports launch ``seq`` complete."""
+        buf = self._done_seq_buf
+        deadline = time.monotonic() + 600.0
+        warned = False
+        spins = 0
+        while int(buf[0]) < seq:
+            spins += 1
+            if spins < 2000:
+                continue                      # ~sub-millisecond: spin
+            time.sleep(20e-6)
+            now = time.monotonic()
+            if not warned and now > deadline - 595.0:
+                logger.warning(
+                    "PLE lookup for launch %d has taken >5 s (worker slow or stuck?)",
+                    seq,
+                )
+                warned = True
+            if now > deadline:
+                raise RuntimeError(
+                    f"PLE offload worker did not complete launch {seq} within 600 s "
+                    f"(done={int(buf[0])})"
+                )
 
     def signal_dummy_outputs(self, num_tokens: int) -> None:
         """Locally satisfy PLE waits for dummy and capture forwards."""
