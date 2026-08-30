@@ -117,10 +117,13 @@ class PleOffloadConnector:
         # bumps this shared counter once this worker's output buffers hold the
         # result of launch N; the model thread waits for it before enqueueing
         # the forward. Allocated before registration so it can be shared.
-        self._done_seq_buf = torch.zeros(1, dtype=torch.int64).share_memory_()
+        # int32 page: the offload worker's copy streams WriteValue32 the launch number
+        # into it (host-mapped there); we poll it. One full page keeps registration simple.
+        self._done_seq_buf = torch.zeros(1024, dtype=torch.int32).share_memory_()
         self._launch_seq = 0
         self._t_launch = 0.0
         self._t_wait = 0.0
+        self._t_stage = 0.0
         self._request_thread_ready = threading.Event()
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
@@ -166,19 +169,22 @@ class PleOffloadConnector:
 
         config = vllm_config.model_config.hf_text_config
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        for layer in layers.values():
-            # The CPU worker writes results here through CUDA IPC. The GPU
-            # placeholder waits on the paired cross-process semaphore.
+        self._out_bufs: dict[str, torch.Tensor] = {}
+        for name, layer in layers.items():
+            out_dtype = layer.get_offload_output_dtype(vllm_config.model_config.dtype)
+            # Device buffer the model reads; filled by *this* process's H2D copy from the
+            # shared pinned result buffer once the worker has published the lookup
+            # (2026-08-30; the worker used to DMA into it through CUDA IPC).
             output_buffer = torch.empty(
-                max_num_tokens,
-                int(config.ple_embed_dim),
-                dtype=layer.get_offload_output_dtype(vllm_config.model_config.dtype),
-                device=self.device,
+                max_num_tokens, int(config.ple_embed_dim), dtype=out_dtype, device=self.device
             )
             layer.setup_cross_process_offload(
                 output_buffer,
                 CpuGpuSemaphore(self.device),
             )
+            self._out_bufs[name] = torch.empty(
+                max_num_tokens, int(config.ple_embed_dim), dtype=out_dtype
+            ).share_memory_()
         return layers
 
     def _pin_input_buffers(self) -> None:
@@ -186,6 +192,7 @@ class PleOffloadConnector:
         buffers = [self._input_ids_buf, self._query_start_loc_buf]
         if self._ngram_context_buf is not None:
             buffers.append(self._ngram_context_buf)
+        buffers.extend(self._out_bufs.values())   # pinned here -> real async H2D source
         for buffer in buffers:
             if buffer.device.type != "cpu" or not buffer.is_shared():
                 raise RuntimeError("PLE input buffers must be shared CPU tensors")
@@ -238,6 +245,7 @@ class PleOffloadConnector:
             query_start_loc_buf=self._query_start_loc_buf,
             ngram_context_buf=self._ngram_context_buf,
             done_seq_buf=self._done_seq_buf,
+            out_bufs=self._out_bufs,
         )
 
         # ForkingPickler transmits tensors through shared-memory and CUDA IPC.
@@ -304,6 +312,7 @@ class PleOffloadConnector:
         socket: zmq.Socket,
     ) -> None:
         """Stage one batch from fixed sources and publish its request."""
+        t0 = time.perf_counter()
         if self._uses_cuda_inputs:
             assert input_ready is not None
             self._copy_cuda_inputs(request, input_ready)
@@ -312,6 +321,7 @@ class PleOffloadConnector:
 
         with torch.cuda.nvtx.range("ple_offload.send_request"):
             socket.send(msgspec.msgpack.encode(request))
+        self._t_stage += time.perf_counter() - t0
 
     def _copy_cpu_inputs(self, request: PleOffloadRequest) -> None:
         """Stage MRV1's existing CPU mirrors in the notifier thread."""
@@ -392,7 +402,11 @@ class PleOffloadConnector:
                         )
                 self._d2h_done_event.record(self._d2h_stream)
             with torch.cuda.nvtx.range("ple_offload.wait_d2h"):
-                self._d2h_done_event.synchronize()
+                # busy-poll: hipEventSynchronize wakes coarsely; this thread has nothing
+                # else to do and the wait is on the critical path of every decode step
+                ev = self._d2h_done_event
+                while not ev.query():
+                    pass
 
     def _launch(
         self,
@@ -455,14 +469,24 @@ class PleOffloadConnector:
         # step N+1's lookup needs step N's sampled token, so the chain is serial
         # anyway, and async scheduling still overlaps this wait with forward N.
         self._wait_lookup_done(self._launch_seq)
+        # The result is in the shared pinned buffer: copy it to our device buffer on the
+        # model stream (stream-ordered before the forward) and raise the flag the eager
+        # path's in-layer wait looks at. Each rank does its own copy, in parallel.
+        stream = torch.cuda.current_stream(self.device)
+        for name, layer in self._layers.items():
+            layer._gpu_output_buffer[:num_tokens].copy_(
+                self._out_bufs[name][:num_tokens], non_blocking=True
+            )
+            layer._sem.signal(stream)
         t2 = time.perf_counter()
         self._t_launch += t1 - t0
         self._t_wait += t2 - t1
         if self._launch_seq % 500 == 0 and self.tp_rank == 0:
             n = self._launch_seq
             logger.info(
-                "PLE offload host wait over %d launches: launch %.2f ms + wait %.2f ms per step",
-                n, self._t_launch / n * 1e3, self._t_wait / n * 1e3,
+                "PLE offload host wait over %d launches: launch %.2f ms + wait %.2f ms per "
+                "step (request thread: input stage+send %.2f ms)",
+                n, self._t_launch / n * 1e3, self._t_wait / n * 1e3, self._t_stage / n * 1e3,
             )
 
     def _wait_lookup_done(self, seq: int) -> None:

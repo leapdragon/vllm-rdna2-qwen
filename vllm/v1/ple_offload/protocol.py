@@ -29,6 +29,9 @@ class PleOffloadRegistration:
     # Host-side completion counter (shared CPU int64[1]) written by the offload
     # worker after this worker's output buffers hold request N's result.
     done_seq_buf: torch.Tensor | None = None
+    # Shared pinned CPU result buffers, one per PLE layer: the worker writes the lookup
+    # here and this GPU worker copies it to its own device buffer on its model stream.
+    out_bufs: dict[str, torch.Tensor] | None = None
 
 
 @dataclass
