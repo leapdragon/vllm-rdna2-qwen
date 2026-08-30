@@ -61,6 +61,11 @@ CPU-offload design for it (PRs #53899 / #54070) that was CUDA-only. This fork:
   memory-mapped in the CPU worker and dequantised on gather. Measured: throughput identical to
   the bf16 table (<4 %); the value is 30 GB of page cache instead of 103 GB of RAM or disk paging.
 
+The driver selection is platform-aware, not import-aware: a full venv has `cuda-bindings`
+installed as a transitive dependency, and "try cuda-python, fall back to the HIP shim" then
+picks cuda-python on ROCm and dies on `dlopen libcuda.so.1` at the first host registration
+(found on the first host build). On ROCm (`torch.version.hip`) the shim is always used.
+
 Only the AMD PLE layer subclasses `PleOffloadLayer`; the NVIDIA layer stays as upstream
 (their later refactor and piecewise-graph n-gram-id fix are in this tree; the offload hooks
 were not re-ported to it).

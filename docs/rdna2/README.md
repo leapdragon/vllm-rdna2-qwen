@@ -152,7 +152,9 @@ launch to a model source line. That pair found every lever in `CHANGES.md` §5�
 ## 9. If it does not work
 
 `TROUBLESHOOTING.md` first. Then, in the order they bit us: cards missing from `rocminfo`
-(another GPU in the machine), one card loading weights and three idle (a collective deadlocked
+(another GPU in the machine), `Failed to dlopen libcuda.so.1` from the PLE offload connector
+(a `cuda-bindings` package in the venv is being preferred over the HIP shim — fixed in this
+fork, but it is what an unpatched merge does), one card loading weights and three idle (a collective deadlocked
 during init — check the log for `rdna_ar`), `hipErrorOutOfMemory` with gigabytes free (not a
 memory problem), a lever that "did nothing" (profile the kernel *counts* — torch.compile may have
 frozen your branch at trace time, `CHANGES.md` §8), and 10× flattering prefill numbers (prefix
