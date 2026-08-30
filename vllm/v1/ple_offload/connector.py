@@ -396,7 +396,18 @@ class PleOffloadConnector:
             num_tokens=num_tokens,
             num_reqs=num_reqs,
         )
-        self._request_queue.put_nowait(request)
+        # Block instead of put_nowait: the model thread only *enqueues* GPU work, so during
+        # a fast host loop (kernel warmup after a compile-cache hit, async scheduling) it can
+        # run several steps ahead of the request thread, which drains one request per
+        # completed GPU input stage. The bounded queue (max_num_seqs + 1) then raised
+        # queue.Full and killed the worker. Back-pressure is safe: the GPU keeps executing
+        # already-enqueued steps while we wait, so the request thread always makes progress.
+        try:
+            self._request_queue.put(request, timeout=300)
+        except queue.Full as exc:
+            raise RuntimeError(
+                "PLE offload request queue stayed full for 300 s; the request thread is stuck"
+            ) from exc
 
     def prepare_forward(
         self,
