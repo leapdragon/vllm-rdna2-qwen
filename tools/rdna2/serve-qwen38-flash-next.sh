@@ -9,7 +9,8 @@
 #
 # Knobs (env): GPUS (ROCR device ids, default 1,2,3,4), PORT (8000), MTP (3), GPUUTIL (0.86),
 #   DENSE_INT8 (1), EAGER (unset), PROFILE (unset), TRACES (dir for torch-profiler traces),
-#   COMPILE_CACHE_OFF (1), P2P (PXB), MAXLEN (65536), EXTRA_ARGS,
+#   COMPILE_CACHE_OFF (1), P2P (PXB), MAXLEN (131072; the model allows 262144 and the KV pool
+#   at GPUUTIL 0.86 holds ~177k tokens, i.e. 1.35 concurrent 128k requests), EXTRA_ARGS,
 #   TOOLS (1: OpenAI tool calling with tool_choice "auto" for agentic clients such as Kilocode /
 #   Cline / Roo; the model's chat template emits Qwen3-Coder-style <function=…><parameter=…> XML,
 #   parsed by vLLM's "qwen3_coder" parser; <think> blocks go to reasoning_content via the "qwen3"
@@ -22,7 +23,7 @@ GPUS="${GPUS:-1,2,3,4}"
 PORT="${PORT:-8000}"
 MTP="${MTP:-3}"
 GPUUTIL="${GPUUTIL:-0.86}"
-MAXLEN="${MAXLEN:-65536}"
+MAXLEN="${MAXLEN:-131072}"
 TRACES="${TRACES:-$PWD/logs/traces}"
 mkdir -p "$TRACES"
 

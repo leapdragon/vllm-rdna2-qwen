@@ -112,7 +112,8 @@ takes ~15 minutes (weights, torch.compile, CUDA-graph capture, the MTP head). `c
 localhost:8000/health` returns 200 at "Application startup complete". The first request at a
 new context length is slow while sidecar pages are cold.
 
-Optional knobs: `MTP=4` (+2 % on long generations), `DENSE_INT8=0` (fp16 dense projections;
+Optional knobs: `MAXLEN=` (default 131072; the model allows 262144, the KV pool at `GPUUTIL=0.86`
+holds ~177k tokens), `MTP=4` (+2 % on long generations), `DENSE_INT8=0` (fp16 dense projections;
 −15 %), `GPUS=1,2,3,4` (ROCR device ids), `PORT=`, `PROFILE=1` (enables `/start_profile`),
 `TOOLS=0` (off: tool calling — on by default, `--enable-auto-tool-choice --tool-call-parser
 qwen3_coder --reasoning-parser qwen3`, which is what agentic clients such as Kilocode, Cline or
