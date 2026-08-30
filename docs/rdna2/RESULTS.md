@@ -198,3 +198,23 @@ this fork's `_C`/`_rocm_C`/`_moe_C` against `/opt/rocm` = TheRock 7.14.60850. Se
 Kernel-level: the 12 dense decode shapes at M=4 take 1.0 ms on our kernels vs 3.2 ms on
 ROCm 7.14's rocBLAS (container: 1.4 vs 5.1 ms); the fused glue kernels and the
 runtime-dispatch ops pass their references on the host build with the same relerr.
+
+## MTP off, compile cache on, warm boots (2026-08-30)
+
+Same host build, `MTP=0` (no `--speculative-config`), `COMPILE_CACHE_OFF=0`,
+`CHAT_KWARGS='{"preserve_thinking": true, "reasoning_effort": "medium"}'`, 128k context, 0.90.
+
+| | MTP=3 | **MTP=0** |
+|---|---|---|
+| decode, 256 tokens (greedy) | 98–106 t/s at ~60 % acceptance | **70–72 t/s** (no draft cost; the better choice below ~25 % acceptance) |
+| GPU KV cache at `--max-model-len 131072` | 229,553–247,974 tokens (1.75–1.89×) | **495,407–518,363 tokens (3.78–3.95×)** |
+| CUDA-graph memory per card | 1.31 + 1.10 GiB (backbone + draft head) | 0.63 + 0.45 GiB |
+| boot, cold compile | ~13–15 min | ~14.5 min |
+| **boot, warm compile cache** | — | **~3 min** (weights 93 s, engine init 16.5 s, compile 1 s) |
+| `validate.py` / `toolcall_test.py` | pass / pass | pass / pass |
+
+Warm boots needed three fixes in this fork (eager custom-op registration, back-pressure on the
+PLE request queue, one input-ready event per PLE request — see CHANGES.md §8 and
+TROUBLESHOOTING.md §5a). Open item: the PLE offload worker still logs "Duplicate PLE request …
+skipping duplicate" for roughly one decode step in five without MTP (never with MTP=3); outputs
+validate correctly, cause not yet isolated (suspected interaction with async scheduling).
