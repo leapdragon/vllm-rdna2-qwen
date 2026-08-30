@@ -104,9 +104,13 @@ class PleOffloadConnector:
         self._pinned_input_buffers: list[torch.Tensor] = []
         # PLE rejects DBO, and each forward consumes its output before the
         # next launch, so one pending request is sufficient.
-        self._request_queue: queue.Queue[PleOffloadRequest | None] = queue.Queue(
-            maxsize=1
-        )
+        # Each item carries its own input-ready event: a single re-recorded event let
+        # a request thread that fell one step behind wait on the *next* step's recording,
+        # which depends on this step's forward, which waits for this very request
+        # (deadlock on warm boots, 2026-08-30).
+        self._request_queue: queue.Queue[
+            tuple[PleOffloadRequest, torch.cuda.Event | None] | None
+        ] = queue.Queue(maxsize=1)
         self._request_thread: threading.Thread | None = None
         self._request_thread_ready = threading.Event()
         self._zmq_ctx: zmq.Context | None = None
@@ -270,10 +274,11 @@ class PleOffloadConnector:
             socket.connect(ipc_addr)
             self._request_thread_ready.set()
             while True:
-                request = self._request_queue.get()
-                if request is None:
+                item = self._request_queue.get()
+                if item is None:
                     return
-                self._process_request(request, socket)
+                request, input_ready = item
+                self._process_request(request, input_ready, socket)
         except Exception:
             logger.exception("PLE request thread failed")
             os._exit(1)
@@ -282,10 +287,16 @@ class PleOffloadConnector:
             if socket is not None:
                 socket.close(linger=0)
 
-    def _process_request(self, request: PleOffloadRequest, socket: zmq.Socket) -> None:
+    def _process_request(
+        self,
+        request: PleOffloadRequest,
+        input_ready: torch.cuda.Event | None,
+        socket: zmq.Socket,
+    ) -> None:
         """Stage one batch from fixed sources and publish its request."""
         if self._uses_cuda_inputs:
-            self._copy_cuda_inputs(request)
+            assert input_ready is not None
+            self._copy_cuda_inputs(request, input_ready)
         else:
             self._copy_cpu_inputs(request)
 
@@ -342,18 +353,16 @@ class PleOffloadConnector:
             ):
                 raise ValueError(f"PLE {name} source is incompatible")
 
-    def _copy_cuda_inputs(self, request: PleOffloadRequest) -> None:
+    def _copy_cuda_inputs(
+        self, request: PleOffloadRequest, input_ready: torch.cuda.Event
+    ) -> None:
         """Stage MRV2 inputs on the background D2H stream."""
-        if (
-            self._d2h_stream is None
-            or self._input_ready_event is None
-            or self._d2h_done_event is None
-        ):
+        if self._d2h_stream is None or self._d2h_done_event is None:
             raise RuntimeError("PLE D2H resources are not initialized")
 
         with torch.accelerator.device_index(self.device.index):
             with torch.cuda.stream(self._d2h_stream):
-                self._d2h_stream.wait_event(self._input_ready_event)
+                self._d2h_stream.wait_event(input_ready)
                 with torch.cuda.nvtx.range("ple_offload.copy_input_ids"):
                     self._input_ids_buf[: request.num_tokens].copy_(
                         self._input_ids_source[: request.num_tokens],
@@ -386,11 +395,13 @@ class PleOffloadConnector:
         if self.tp_rank != 0:
             return
 
+        input_ready: torch.cuda.Event | None = None
         if self._uses_cuda_inputs:
-            assert self._input_ready_event is not None
             # The background copy stream waits for runner input production
-            # without making the model stream wait for D2H completion.
-            self._input_ready_event.record(torch.cuda.current_stream(self.device))
+            # without making the model stream wait for D2H completion. One event
+            # per request (see the queue comment in __init__).
+            input_ready = torch.cuda.Event()
+            input_ready.record(torch.cuda.current_stream(self.device))
         request = PleOffloadRequest(
             dp_rank=self.dp_rank,
             num_tokens=num_tokens,
@@ -403,7 +414,7 @@ class PleOffloadConnector:
         # queue.Full and killed the worker. Back-pressure is safe: the GPU keeps executing
         # already-enqueued steps while we wait, so the request thread always makes progress.
         try:
-            self._request_queue.put(request, timeout=300)
+            self._request_queue.put((request, input_ready), timeout=300)
         except queue.Full as exc:
             raise RuntimeError(
                 "PLE offload request queue stayed full for 300 s; the request thread is stuck"
