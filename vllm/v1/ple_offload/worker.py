@@ -907,6 +907,13 @@ class PleOffloadRunner:
     ) -> None:
         """Decode and batch available requests by DP rank until shutdown."""
         self._debug_delay_s = float(os.getenv("PLE_OFFLOAD_DEBUG_DELAY_MS", "0")) / 1e3
+        # Test hook: PLE_OFFLOAD_DEBUG_TRACE=<file> appends one line per request
+        # "seq num_tokens num_reqs ids_hash result_hash" so two runs can be compared.
+        self._debug_trace = None
+        trace_path = os.getenv("PLE_OFFLOAD_DEBUG_TRACE", "")
+        if trace_path:
+            self._debug_trace = open(trace_path, "a", buffering=1)
+            logger.warning("PLE_OFFLOAD_DEBUG_TRACE=%s: tracing every request (test hook).", trace_path)
         self._done_seq: dict[int, int] = {}
         if self._debug_delay_s:
             logger.warning("PLE_OFFLOAD_DEBUG_DELAY_MS=%.0f: every lookup is delayed (test hook).", self._debug_delay_s * 1e3)
@@ -1002,6 +1009,14 @@ class PleOffloadRunner:
                     ngram_context,
                     output_buffer=self._pinned_bufs[dp_rank][layer_name],
                 )
+                if self._debug_trace is not None:
+                    import hashlib
+                    ids = input_bufs.input_ids_buf[: request.num_tokens]
+                    h_ids = hashlib.md5(ids.contiguous().numpy().tobytes()).hexdigest()[:12]
+                    h_res = hashlib.md5(result.contiguous().view(torch.uint8).numpy().tobytes() if result.dtype != torch.bfloat16 else result.float().contiguous().numpy().tobytes()).hexdigest()[:12]
+                    self._debug_trace.write(
+                        f"{self._done_seq.get(dp_rank, 0) + 1} {request.num_tokens} {request.num_reqs} {h_ids} {h_res}\n"
+                    )
 
                 # The result is identical on every TP rank in this DP group.
                 # Each copy stream signals only after its DMA completes.

@@ -27,6 +27,9 @@ ap.add_argument("--log", default=None, help="serve log to scan (default: newest 
 ap.add_argument("--save", default=None)
 ap.add_argument("--expect", default=None, help="text file from --save to compare against")
 ap.add_argument("--no-idle-check", action="store_true")
+ap.add_argument("--trace", default=None,
+                help="worker trace file (server started with PLE_OFFLOAD_DEBUG_TRACE=<file>): "
+                     "compares the n-gram lookups of runs A and B")
 args = ap.parse_args()
 
 PROMPT = (
@@ -97,13 +100,40 @@ print(f"log: {log} (duplicate-PLE lines before: {dups0})")
 # warm-up: make the prompt prefix-cache resident so runs A and B see identical cache state
 # (a cache miss vs hit changes prefill numerics enough to flip a near-tie token later on)
 generate(16)
+def trace_lines():
+    try:
+        return open(args.trace).read().splitlines() if args.trace else []
+    except OSError:
+        return []
+t_before = len(trace_lines())
 a, na, dta = generate(args.tokens)
+t_mid = len(trace_lines())
 b, nb, dtb = generate(args.tokens)
+t_after = len(trace_lines())
 print(f"run A: {na} tokens in {dta:.1f}s ({na/dta:.1f} tok/s incl. prefill); run B: {nb} tokens in {dtb:.1f}s ({nb/dtb:.1f} tok/s)")
 if a != b:
     i = next((k for k, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
     print(f"   first divergence at char {i}: A={a[max(0,i-30):i+30]!r}\n                              B={b[max(0,i-30):i+30]!r}")
 check("determinism: two greedy runs identical", a == b)
+if args.trace:
+    lines = trace_lines()
+    ta = [l.split()[1:] for l in lines[t_before:t_mid]]   # drop seq: compare (tokens, reqs, ids, result)
+    tb = [l.split()[1:] for l in lines[t_mid:t_after]]
+    n = min(len(ta), len(tb))
+    first_diff = next((k for k in range(n) if ta[k] != tb[k]), None)
+    print(f"   n-gram lookups: run A {len(ta)} requests, run B {len(tb)}; first differing lookup: {first_diff}")
+    if first_diff is not None:
+        print(f"      A[{first_diff}]={ta[first_diff]}  B[{first_diff}]={tb[first_diff]}")
+    # a divergence of the *generated text* at token t must show up as differing input ids at
+    # lookup t+1 at the latest; if the lookups differ earlier than the text does, the PLE path
+    # itself (ids staged or result produced) is what diverged
+    # the first differing lookup must differ in its *input ids* (the text had already
+    # diverged upstream); equal ids with a different result = the PLE path itself diverged
+    ple_ok = first_diff is None or ta[first_diff][2] != tb[first_diff][2]
+    check("PLE path deterministic (lookups differ only after the input ids differ)", ple_ok,
+          "identical lookups" if first_diff is None else
+          ("ids differ first -> divergence originates upstream of the n-gram path" if ple_ok
+           else "same ids, different result -> n-gram path is non-deterministic"))
 issues = garble_report(a)
 check("garble scan on run A", not issues, "; ".join(issues) if issues else f"{len(a)} chars clean")
 if args.expect:

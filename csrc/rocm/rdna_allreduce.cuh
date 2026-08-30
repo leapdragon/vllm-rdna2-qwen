@@ -5,7 +5,14 @@
 //   * push, never pull        — peer STORE 14.3 GB/s vs peer LOAD 5.7 GB/s across PCIe;
 //   * staging is UNCACHED     — hipDeviceMallocUncached; a peer's write to coarse-grained
 //                               memory lands in DRAM while the owner keeps reading stale L2;
-//   * flags are host-coherent — device-memory flags cannot be polled across PCIe;
+//   * flags live in each rank's OWN uncached device memory (2026-08-30; they were a
+//     host-coherent page before): a peer announces by one posted P2P store into our flag
+//     slot and we poll locally — waiting no longer generates PCIe read traffic. With the
+//     host page, four GPUs hammered system memory with 32-bit reads across both root
+//     complexes for the whole barrier; on this machine that coincided with the SAS HBA's
+//     tape drive resetting and, twice, with cards dropping off the PCIe bus. Coarse-grained
+//     device memory would not work (a peer's write is invisible to the owner's L2, T18);
+//     uncached memory is exactly what the staging buffers already use for the same reason.
 //   * the sequence number is derived on-device from a local counter, never passed as a kernel
 //     argument (frozen at CUDA-graph capture, so every replay would fall through the wait);
 //   * bounded spins that set a sticky abort flag instead of hanging the GPU.
@@ -21,6 +28,7 @@
 #include <hip/hip_fp16.h>
 
 #define RDNA_AR_MAX_WORLD 8
+#define RDNA_AR_FLAG_PAGE 4096  // bytes appended to each staging buffer for the flag slots
 #define RDNA_AR_SPIN_CAP 2000000ull  // ~1 us per cross-PCIe poll -> ~2 s bound
 
 __device__ __forceinline__ float rdna_ar_to_f(float x) { return x; }
@@ -30,11 +38,16 @@ __device__ __forceinline__ void rdna_ar_from_f(__half& d, float v) { d = __float
 
 struct RdnaArPeers {
   void* stage[RDNA_AR_MAX_WORLD];  // peer j's staging buffer (IPC-mapped); [rank] = ours
+  int* flags[RDNA_AR_MAX_WORLD];   // peer j's flag slots [W] (uncached, after its staging)
 };
+
+// Backoff between polls: s_sleep(n) idles the wave ~64*n clocks (~0.2 us at n=8) so a
+// waiting rank does not saturate its memory path while spinning.
+#define RDNA_AR_POLL_PAUSE() __builtin_amdgcn_s_sleep(8)
 
 template <typename T>
 __global__ void rdna_ar_oneshot(const T* __restrict__ in, T* __restrict__ out,
-                                RdnaArPeers peers, int* flags,   // host-coherent, [W]
+                                RdnaArPeers peers,               // stage + flags per rank
                                 unsigned int* arrive,             // device, [2] per parity
                                 int* seqbuf,                      // device, local seq mirror
                                 unsigned* timeout,                // device, sticky abort
@@ -67,20 +80,29 @@ __global__ void rdna_ar_oneshot(const T* __restrict__ in, T* __restrict__ out,
     if (b == 0) {
       unsigned long long s = 0;
       while (__hip_atomic_load(&arrive[p], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) <
-             (unsigned)nblocks)
+             (unsigned)nblocks) {
+        RDNA_AR_POLL_PAUSE();
         if (++s > RDNA_AR_SPIN_CAP) { *timeout = 1u; s_abort = 1; break; }
+      }
       if (!s_abort) {
         arrive[1 - p] = 0u;
         __hip_atomic_store(seqbuf, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-        __hip_atomic_store(&flags[rank], seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        // announce: one posted P2P store into every peer's slot for us (and our own)
+        for (int j = 0; j < world; j++)
+          __hip_atomic_store(&peers.flags[j][rank], seq, __ATOMIC_RELEASE,
+                             __HIP_MEMORY_SCOPE_SYSTEM);
       }
     }
     if (!s_abort) {
+      // wait: poll OUR flag slots (local uncached memory, no PCIe traffic)
+      int* myflags = peers.flags[rank];
       for (int j = 0; j < world && !s_abort; j++) {
         if (j == rank) continue;
         unsigned long long s = 0;
-        while (__hip_atomic_load(&flags[j], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq)
+        while (__hip_atomic_load(&myflags[j], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+          RDNA_AR_POLL_PAUSE();
           if (++s > RDNA_AR_SPIN_CAP) { *timeout = 1u; s_abort = 1; break; }
+        }
       }
     }
   }

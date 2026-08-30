@@ -31,11 +31,9 @@ struct RdnaArState {
   bool ready = false;
   int rank = -1, world = 0;
   int64_t max_bytes = 0;
-  void* stage = nullptr;         // ours: 2 * world * max_bytes, uncached
-  RdnaArPeers peers{};           // [j] = peer j's staging (IPC), [rank] = ours
+  void* stage = nullptr;         // ours: 2 * world * max_bytes uncached, then the flag page
+  RdnaArPeers peers{};           // [j] = peer j's staging / flags (IPC), [rank] = ours
   bool opened[RDNA_AR_MAX_WORLD] = {};
-  void* shm = nullptr;           // 4096 B host-coherent page holding the flags
-  int* dflags = nullptr;         // device pointer to shm
   unsigned int* arrive = nullptr;
   int* seqbuf = nullptr;
   unsigned* timeout = nullptr;
@@ -77,29 +75,24 @@ at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_id
     // last-error slot and would surface at torch's next launch check -- clear it.
     (void)hipGetLastError();
   }
+  // staging slots followed by one 4 KB flag page: peers write flags[rank] = seq into it
+  // through the same IPC mapping (uncached, so a P2P write is visible to our polls)
   const size_t stage_bytes = 2ull * world * (size_t)max_bytes;
-  RDNA_AR_CHK(hipExtMallocWithFlags(&g.stage, stage_bytes, hipDeviceMallocUncached));
-  RDNA_AR_CHK(hipMemset(g.stage, 0, stage_bytes));
+  const size_t alloc_bytes = stage_bytes + RDNA_AR_FLAG_PAGE;
+  RDNA_AR_CHK(hipExtMallocWithFlags(&g.stage, alloc_bytes, hipDeviceMallocUncached));
+  RDNA_AR_CHK(hipMemset(g.stage, 0, alloc_bytes));
   RDNA_AR_CHK(hipMalloc((void**)&g.arrive, 8));
   RDNA_AR_CHK(hipMemset(g.arrive, 0, 8));
   RDNA_AR_CHK(hipMalloc((void**)&g.seqbuf, 4));
   RDNA_AR_CHK(hipMemset(g.seqbuf, 0, 4));
   RDNA_AR_CHK(hipMalloc((void**)&g.timeout, 4));
   RDNA_AR_CHK(hipMemset(g.timeout, 0, 4));
-  // host-coherent flag page shared by every rank of the group (rank 0 owns creation;
-  // the Python side orders init rank by rank with barriers)
-  if (rank == 0) shm_unlink(shm_name.c_str());
-  int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0600);
-  TORCH_CHECK(fd >= 0, "rdna_ar: shm_open failed: ", strerror(errno));
-  TORCH_CHECK(ftruncate(fd, 4096) == 0, "rdna_ar: ftruncate failed");
-  g.shm = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  close(fd);
-  TORCH_CHECK(g.shm != MAP_FAILED, "rdna_ar: mmap failed");
-  if (rank == 0) std::memset(g.shm, 0, 4096);
-  RDNA_AR_CHK(hipHostRegister(g.shm, 4096, hipHostRegisterMapped | hipHostRegisterPortable));
-  RDNA_AR_CHK(hipHostGetDevicePointer((void**)&g.dflags, g.shm, 0));
-  for (int j = 0; j < RDNA_AR_MAX_WORLD; j++) g.peers.stage[j] = nullptr;
+  // (shm_name is kept in the signature for the Python side; the host-coherent flag page it
+  // named is no longer used -- flags live in device memory, see rdna_allreduce.cuh)
+  (void)shm_name;
+  for (int j = 0; j < RDNA_AR_MAX_WORLD; j++) { g.peers.stage[j] = nullptr; g.peers.flags[j] = nullptr; }
   g.peers.stage[rank] = g.stage;
+  g.peers.flags[rank] = reinterpret_cast<int*>(static_cast<uint8_t*>(g.stage) + stage_bytes);
   hipIpcMemHandle_t h;
   RDNA_AR_CHK(hipIpcGetMemHandle(&h, g.stage));
   g_ninst++;
@@ -122,6 +115,8 @@ void rdna_ar_connect(int64_t handle, const at::Tensor& handles) {
     hipIpcMemHandle_t h;
     std::memcpy(&h, p + (size_t)j * sizeof(h), sizeof(h));
     RDNA_AR_CHK(hipIpcOpenMemHandle(&g.peers.stage[j], h, hipIpcMemLazyEnablePeerAccess));
+    g.peers.flags[j] = reinterpret_cast<int*>(static_cast<uint8_t*>(g.peers.stage[j]) +
+                                              2ull * g.world * (size_t)g.max_bytes);
     g.opened[j] = true;
   }
   g.ready = true;
@@ -150,13 +145,13 @@ at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in) {
     const long long max_elems = g.max_bytes / 2;
     rdna_ar_oneshot<__half><<<nblocks, threads, 0, stream>>>(
         reinterpret_cast<const __half*>(in.const_data_ptr()),
-        reinterpret_cast<__half*>(out.mutable_data_ptr()), g.peers, g.dflags, g.arrive,
+        reinterpret_cast<__half*>(out.mutable_data_ptr()), g.peers, g.arrive,
         g.seqbuf, g.timeout, g.rank, g.world, n, max_elems, nblocks);
   } else {
     const long long max_elems = g.max_bytes / 4;
     rdna_ar_oneshot<float><<<nblocks, threads, 0, stream>>>(
         reinterpret_cast<const float*>(in.const_data_ptr()),
-        reinterpret_cast<float*>(out.mutable_data_ptr()), g.peers, g.dflags, g.arrive,
+        reinterpret_cast<float*>(out.mutable_data_ptr()), g.peers, g.arrive,
         g.seqbuf, g.timeout, g.rank, g.world, n, max_elems, nblocks);
   }
   g.fast_calls++;
