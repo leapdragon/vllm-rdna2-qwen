@@ -44,13 +44,15 @@ The branch is upstream vLLM main (post-0.28.0) + the Flash-Next model branch (vL
 
 TheRock publishes PyTorch wheels for gfx110X/gfx120X/gfx94X/gfx950 — **not for gfx103X** — so
 PyTorch is built from source. Use the same pins as this fork's `docker/Dockerfile.rocm_base`
-(ROCm/pytorch `release/2.12` @ `6bbd260`, ROCm/triton @ `f0b55c0`). One script does it:
+(ROCm/pytorch `release/2.12` @ `6bbd260`, ROCm/triton @ `f0b55c0`, pytorch/vision `v0.27.1`). One script does it:
 
 ```bash
 uv venv --python 3.12 ~/venvs/vllm-rdna2-qwen
 source ~/venvs/vllm-rdna2-qwen/bin/activate
 tools/rdna2/build-torch-rocm714.sh          # ~2–3 h on 32 cores; writes wheels to ~/wheels/rdna2/
-uv pip install ~/wheels/rdna2/torch-*.whl ~/wheels/rdna2/triton-*.whl   # BEFORE any other dep:
+uv pip install ~/wheels/rdna2/torch-*.whl ~/wheels/rdna2/triton-*.whl ~/wheels/rdna2/torchvision-*.whl
+                                             # (torchvision: CPU ops only, but transformers'
+                                             # Qwen2-VL image processor imports it) BEFORE any other dep:
                                              # several vLLM deps require torch and pip would
                                              # otherwise fetch the CUDA torch from PyPI
 python -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.get_arch_list())"
