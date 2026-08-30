@@ -14,10 +14,15 @@ import torch.nn as nn
 import zmq
 # See ple_offload_layer: cuda-python is NVIDIA-only, so importing it must not
 # break module import on ROCm. Only the offload data path dereferences it.
-try:
-    from cuda.bindings import driver as cuda_driver
-except ImportError:  # pragma: no cover - platform dependent
-    from vllm.v1.ple_offload import hip_driver as cuda_driver  # type: ignore[no-redef]
+# On ROCm the HIP shim is always the right driver: cuda-bindings may well be
+# importable (it is a transitive dependency) but there is no libcuda to dlopen.
+if torch.version.hip is not None:
+    from vllm.v1.ple_offload import hip_driver as cuda_driver
+else:
+    try:
+        from cuda.bindings import driver as cuda_driver
+    except ImportError:  # pragma: no cover - platform dependent
+        from vllm.v1.ple_offload import hip_driver as cuda_driver  # type: ignore[no-redef]
 
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group

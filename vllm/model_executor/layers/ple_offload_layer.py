@@ -30,7 +30,11 @@ from torch import nn
 # ships here, so import lazily: everything except the actual offload path must
 # keep working on ROCm (the layer base class is imported by every qwen4_exp
 # build, offloaded or not).
+# On ROCm the HIP shim is always the right driver: cuda-bindings may be
+# importable (a transitive dependency of a full install) but has no libcuda.
 try:
+    if torch.version.hip is not None:
+        raise ImportError("ROCm: use the HIP driver shim")
     from cuda.bindings import driver as cuda_driver
     from cuda.bindings.driver import CUstreamWaitValue_flags
 
