@@ -1,38 +1,16 @@
-/.venv
-/build
-/artifacts/vllm-rocm-install/
-/bake-config-build-*.json
-/wheel-export/
+# Build context for containers/Dockerfile is the repository root; keep it small and free of
+# host-only state (the models/ symlinks point at 100+ GB of weights on the host).
+.git
+models
+logs
+hf-cache
+.compile-cache
+.state
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+build
 dist
-vllm/*.so
-vllm/vllm-rs
-
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-.mypy_cache
-
-# Distribution / packaging
-.Python
-/build/
-cmake-build-*/
-CMakeUserPresets.json
-develop-eggs/
-/dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-rust/target/
+.venv
+vllm/*.abi3.so
+vllm/_version.py
