@@ -99,6 +99,8 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
    what you were doing. That file answers most questions before I have to ask them.
 3. [`docs/rdna2/README.md`](docs/rdna2/README.md) §9 has the remaining known issues.
 
+## Housekeeping
+
 **To see what was changed**: the GitHub compare view
 [`2a46f85b43...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...rdna2/qwen38-flash-next)
 shows only this fork's commits and diff (everything after the merge of the Flash-Next model
