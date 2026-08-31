@@ -3,19 +3,35 @@
 # vllm-rdna2-qwen — base image: TheRock ROCm 7.14 + PyTorch 2.12 / Triton 3.7 / torchvision built
 # from source for gfx1030 (TheRock publishes no torch wheels for the gfx103X family).
 #
-# TheRock 7.14 has since left AMD's public download channels (they now carry 10.x), so the ROCm
-# install is supplied as a BuildKit build context — the /opt/rocm tree of any TheRock 7.14 install:
+# ROCm comes from TheRock's public multi-arch tarball, pinned by URL + sha256 (the 7.14 line lives
+# on the *legacy* indexes: repo.amd.com/rocm/tarball-multi-arch for releases, rocm.prereleases.amd.com
+# for the 7.14.0rcN candidates). To build from a local TheRock install instead — e.g. the exact
+# 7.14.0rc3 tree the fork was validated on — override the `rocm` stage with a build context:
 #
-#   docker buildx build -f containers/Dockerfile.base --build-context rocm=/opt/TheRock/rocm/core-7.14 \
-#       -t <base-tag> containers/            (driven by containers/build.sh --base; 2–3 h on 32 cores)
+#   docker buildx build -f containers/Dockerfile.base --target final -t <base-tag> containers/
+#   docker buildx build … --build-context rocm=/opt/TheRock/rocm/core-7.14 …    (local install)
 #
-# The published base image is therefore the durable 7.14 artifact; the runtime image builds FROM it.
+# Driven by containers/build.sh --base (2–3 h on 32 cores: torch/triton/vision from source).
 # ---------------------------------------------------------------------------------------------
 ARG UBUNTU=ubuntu:24.04
 ARG MAX_JOBS=24
+ARG THEROCK_URL=https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx103X-all-7.14.1.tar.gz
+ARG THEROCK_SHA256=6ce28f2b29988473a3f77b78178ac0c3f83c8e660699b844930d4a5e33d192cc
 ARG PYTORCH_REF=6bbd260
 ARG TRITON_REF=f0b55c0
 ARG VISION_REF=v0.27.1
+
+# ---- stage 0: the ROCm tree. `rocm` is a plain filesystem stage so that `--build-context rocm=<dir>`
+#      can replace it with a local install; by default it is the pinned public tarball. -----------
+FROM ${UBUNTU} AS rocm-download
+ARG THEROCK_URL THEROCK_SHA256
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/* \
+ && curl -fL --retry 3 -o /tmp/therock.tar.gz "${THEROCK_URL}" \
+ && echo "${THEROCK_SHA256}  /tmp/therock.tar.gz" | sha256sum -c - \
+ && mkdir -p /rocm && tar -xzf /tmp/therock.tar.gz -C /rocm && rm /tmp/therock.tar.gz \
+ && echo "${THEROCK_URL}" > /rocm/.therock-source
+FROM scratch AS rocm
+COPY --from=rocm-download /rocm /
 
 # ---- stage 1: ROCm + toolchain -----------------------------------------------------------------
 FROM ${UBUNTU} AS rocm-base
