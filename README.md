@@ -74,12 +74,30 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
 
    ```bash
    python tools/rdna2/validate.py        # must print PASS
-   python tools/rdna2/bench.py 3 256     # expect ~95-105 tokens/s decode
+   python tools/rdna2/bench.py 3 256     # expect ~60-65 tokens/s decode (MTP=0; ~60-72 with MTP=3)
    ```
 
-**If something goes wrong**: [`docs/rdna2/TROUBLESHOOTING.md`](docs/rdna2/TROUBLESHOOTING.md)
-first (this platform's failure modes point away from their causes), then
-[`docs/rdna2/README.md`](docs/rdna2/README.md) §9.
+## Troubleshooting
+
+1. **Read [`docs/rdna2/TROUBLESHOOTING.md`](docs/rdna2/TROUBLESHOOTING.md) first.** This
+   platform's failure modes point away from their causes (a PLE timeout is usually storage,
+   RAM or a missing env var; a "hang with MTP" is usually the drafter; a wrong GPU identity is
+   a kernel-line issue). For anything involving the n-gram table, PLE timeouts or slow
+   lookups, the step-by-step is [`docs/rdna2/PLE-DIAGNOSTIC-TREE.md`](docs/rdna2/PLE-DIAGNOSTIC-TREE.md).
+2. **Run the report script and send it to me.**
+
+   ```bash
+   tools/rdna2/system-report.sh --probe      # add --tests if no server is running
+   ```
+
+   It writes `system-report.log` (host, PCIe links, GPUs, ROCm, venv, torch/vLLM build,
+   model files and their storage, the resolved serve command, running processes, a digest of
+   your newest serve log, the kernel log of this and the previous boot; `--probe` adds a live
+   health/metrics/tiny-completion check). It modifies nothing and redacts home paths, user,
+   hostname, IPs and anything that looks like a secret — skim it, then **DM it to me on
+   Discord (`<DISCORD-HANDLE>`)** together with the exact error text and one paragraph on
+   what you were doing. That file answers most questions before I have to ask them.
+3. [`docs/rdna2/README.md`](docs/rdna2/README.md) §9 has the remaining known issues.
 
 **To see what was changed**: the GitHub compare view
 [`2a46f85b43...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...rdna2/qwen38-flash-next)
