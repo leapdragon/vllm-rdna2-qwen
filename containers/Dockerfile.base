@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The TheRock install, verbatim (bin/ lib/ llvm/ .kpack/ share/ …).
 COPY --from=rocm . /opt/rocm
 ENV ROCM_PATH=/opt/rocm ROCM_HOME=/opt/rocm HIP_PATH=/opt/rocm \
-    PATH=/opt/venv/bin:/opt/rocm/bin:/opt/rocm/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PATH=/opt/venv/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/opt/rocm/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     LD_LIBRARY_PATH=/opt/rocm/lib
 RUN test -x /opt/rocm/bin/hipcc && test -d /opt/rocm/.kpack \
  && python3.12 -m venv /opt/venv && pip install --upgrade pip wheel \
