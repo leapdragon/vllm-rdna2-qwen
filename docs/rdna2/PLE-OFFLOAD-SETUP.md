@@ -184,6 +184,16 @@ Also worth knowing: on the fixed protocol MTP=3 measured **60–72 t/s vs 62–6
 our hardware — at ~70 % draft acceptance it is a wash. Unless your workload's acceptance is
 high, `MTP=0` is the better trade and sidesteps this entire branch.
 
+Also, a subtlety that matters when MTP=0 works and MTP=3 times out: the host-side PLE wait
+sits at the head of every engine step, and step N's lookup request is only *sent* once all of
+step N-1's GPU work — including the drafter's extra forwards — has finished. **Any GPU-side
+stall in the MTP drafter is therefore reported as a PLE timeout**, with `done` frozen one
+behind the launch number. Discriminate in one step: during the stall, check GPU busy
+(`rocm-smi`) — pegged high means the drafter is stuck on your hardware and PLE is the
+messenger, not the fault; near zero means the worker/storage side really is stuck. Report
+busy%, `free -g` in both MTP configurations, the exact `done=M`, and whether it happens at
+warmup or mid-serving.
+
 **F. None of the above messages — the server just stalls or dies**
 → Platform, not PLE: check the kernel log (`journalctl -k`) for `amdgpu`/queue-eviction/PCIe
 events, confirm the T41 stability kernel line and env from CHANGES §4, and never leave a
