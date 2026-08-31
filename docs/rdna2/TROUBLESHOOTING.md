@@ -197,6 +197,11 @@ lists the forks, images and toolboxes worth knowing about. Notably, the wiki doc
 
 ## 5a. Traps found on the Flash-Next fork (2026-08-29/30)
 
+**PLE timeouts or slow lookups?** Start with `PLE-OFFLOAD-SETUP.md` — environment recipe from
+step 0 and a diagnostic tree keyed to the exact messages. Most reports are environment
+(sidecar path/storage/RAM, the 600 s default readiness timeout, raw `vllm serve` without the
+offload env), not code.
+
 All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 15-minute boot.
 
 - **A lever "did nothing" although the kernel is correct.** vLLM compiles the model once for a

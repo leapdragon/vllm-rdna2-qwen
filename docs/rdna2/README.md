@@ -96,7 +96,8 @@ hf download wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --local-dir models/qwen38-flash
 hf download primitive-ai/Qwen3.8-Flash-Next-PLE-quant --include "ples_int4/*" --local-dir models/qwen38-flash-next-ple
 ```
 
-`models/qwen38-flash-next-ple/ples_int4/META.json` must read
+Environment details, RAM/storage requirements and a timeout diagnostic tree:
+`PLE-OFFLOAD-SETUP.md`. `models/qwen38-flash-next-ple/ples_int4/META.json` must read
 `"layout": "group16_int4_fp16scale_lownibblefirst", "rows": 320001536, "width": 160`.
 
 The same download serves both with and without the MTP draft head. `model_mtp.safetensors`
