@@ -194,6 +194,40 @@ messenger, not the fault; near zero means the worker/storage side really is stuc
 busy%, `free -g` in both MTP configurations, the exact `done=M`, and whether it happens at
 warmup or mid-serving.
 
+**E2. Boots clean, then the FIRST request stalls: one `>5 s` warning at a small launch
+number, and the engine dies waiting for `sample_tokens` (graphs + MTP only)**
+
+→ Decode the launch number first: dummy and capture forwards do **not** increment it, so
+launch N is the Nth *real* PLE-bearing forward. For a single short request, launch 1 is the
+prefill chunk and launch 8 ≈ the 7th decode step — several graph replays already succeeded
+before one wedged. That pattern (runs briefly, then a replay freezes) is almost never the PLE
+worker: the host-side PLE wait sits at the head of every step, so it is simply the first thing
+to *report* a GPU-side wedge (branch E). At MTP=3 the wedging step replays the drafter graphs
+and the M=4 verify graph, whose small collectives run the one-shot all-reduce **inside the
+replay** — and the boot self-test probes its collectives *outside* graph capture, so a board
+whose P2P wedges only under replay cadence passes the self-test and still freezes here.
+
+Note also: the engine's execute-model timeout (default 300 s) kills the workers before the PLE
+wait's own 600 s error can print `done=M`. For one diagnostic run,
+`export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=900` so the PLE side gets to report first.
+
+Run these in order and report each result:
+
+1. **During the stall**: `rocm-smi` — GPU busy pegged ⇒ a wedged replay (PLE is the
+   messenger); ~0 % ⇒ genuinely the worker/storage side (branches C/D).
+2. **`VLLM_RDNA_AR=0`**, same command (RCCL takes the small collectives): freeze gone ⇒ your
+   board's P2P-under-replay is the story (branch G) — stay on RCCL.
+3. Axis bisection: `EAGER=1` with MTP=3 (graphs off); graphs with `MTP=0`; then `MTP=1`.
+4. **`PLE_OFFLOAD_DEBUG_TRACE=/tmp/ple-trace.log`** on the serve: after the freeze, does the
+   trace show the worker *received and answered* the stalled launch? Answered ⇒ GPU side for
+   certain; never received ⇒ transport — report that line.
+5. `tools/rdna2/system-report.sh --log <serve log>` and send the report.
+
+For contrast: the `>5 s` warning alone is a stall detector, not a failure. On our hardware at
+HEAD, a vision request's first-exposure Triton JIT compiles produced warnings on launches
+23–28 (at MTP=0, graphs uninvolved) that all self-resolved, `done=` advancing, serving
+uninterrupted. Frozen `done=`, no recovery, engine timeout ⇒ this branch.
+
 **F. None of the above messages — the server just stalls or dies**
 → Platform, not PLE: check the kernel log (`journalctl -k`) for `amdgpu`/queue-eviction/PCIe
 events, confirm the T41 stability kernel line and env from CHANGES §4, and never leave a
