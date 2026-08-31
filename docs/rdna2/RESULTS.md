@@ -225,4 +225,11 @@ fused lookup / prefault / rank-side copy of the same day) because the CPU lookup
 genuinely waited for; two greedy runs are byte-identical (they
 were not before — the old all-reduce could read a few stale payload elements); a 5-minute soak
 logs no PCIe-fabric events. The 98–106 t/s MTP=3 and 70–72 t/s MTP=0 figures were measured
-with the broken wait and should be read as upper bounds until the lookup path is optimised.
+with the broken wait.
+
+**Re-measured on the fixed protocol (2026-08-30 21:40, MTP=3 + vision at 64k):** boot, warmup
+and a full suite with **zero PLE warnings or timeouts**; greedy runs byte-identical under
+speculative decoding; draft acceptance 70.7 %; decode **60–72 t/s** at 256–1024 tokens —
+roughly a wash with MTP=0's 62–65 at this acceptance rate, because the honest n-gram wait now
+amortises over ~2.9 tokens per step but the drafter's extra forwards absorb the gain. MTP is
+correct on the current protocol; choose it only when your workload's acceptance is high.
