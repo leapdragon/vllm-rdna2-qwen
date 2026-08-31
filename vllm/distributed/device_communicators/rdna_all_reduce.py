@@ -99,11 +99,54 @@ class RdnaOneShotAllReduce:
             logger.warning("rdna_ar: disabled -- connect failed: %s", status)
             return
         dist.barrier(group=group)
+
+        # Boot self-test (2026-08-31): on boards where GPU P2P is slow or broken
+        # (ACS redirect, chipset-routed slots, cross-socket paths) init can succeed
+        # while every collective then spins to its ~2 s cap and aborts WITHOUT
+        # writing the output -- silent corruption plus stalls that get reported by
+        # whatever waits next (usually the PLE handshake). Verify the path with
+        # known patterns before trusting it; all ranks agree on the verdict.
+        err = self._self_test(device)
+        dist.all_gather_object(status, err, group=group)
+        if any(s is not None for s in status):
+            logger.warning(
+                "rdna_ar: disabled -- boot self-test failed on some rank "
+                "(weak GPU peer-to-peer on this board? falling back to RCCL): %s",
+                [s for s in status if s is not None][:1],
+            )
+            return
+        dist.barrier(group=group)
         self.disabled = False
         logger.info(
             "rdna_ar: one-shot all-reduce active (handle %d, rank %d/%d, devices %s, max %d KB)",
             self.handle, self.rank, self.world_size, gathered, max_kb,
         )
+
+    def _self_test(self, device: torch.device) -> str | None:
+        """Three verified all-reduces on the fast path; returns an error string or None."""
+        import time
+
+        try:
+            with torch.cuda.device(device):
+                for trial, numel in enumerate((1024, 4096, self.max_bytes // 2)):
+                    inp = torch.full(
+                        (numel,), float(self.rank + 1) * (trial + 1), dtype=torch.float16, device=device
+                    )
+                    expect = float((trial + 1) * self.world_size * (self.world_size + 1) // 2)
+                    t0 = time.perf_counter()
+                    out = self._ops.rdna_ar_all_reduce(self.handle, inp)
+                    torch.cuda.synchronize(device)
+                    dt = time.perf_counter() - t0
+                    if self._ops.rdna_ar_timed_out(self.handle):
+                        return f"spin-cap timeout in self-test trial {trial} ({dt * 1e3:.0f} ms)"
+                    if not bool((out == expect).all()):
+                        got = out.float().mean().item()
+                        return f"wrong result in self-test trial {trial}: mean {got:.2f}, expected {expect:.1f}"
+                    if dt > 0.05:
+                        return f"self-test trial {trial} took {dt * 1e3:.0f} ms for {numel * 2} bytes (P2P too slow; RCCL will be faster)"
+        except Exception as e:  # noqa: BLE001
+            return str(e)
+        return None
 
     def should_use(self, inp: torch.Tensor) -> bool:
         return (not self.disabled) and self._ops.rdna_ar_can(self.handle, inp)

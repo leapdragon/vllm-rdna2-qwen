@@ -119,3 +119,12 @@ warmup or mid-serving.
 **F. None of the above** → platform, not PLE: `journalctl -k` for amdgpu/PCIe events, the
 stability kernel line from CHANGES §4, and never leave a GPU-side stream wait pending on
 gfx1030 (CHANGES §8a tells that story).
+
+**G. Suspected board/fabric differences (different mainboard, ACS, chipset-routed or
+cross-socket slots)** → the one-shot all-reduce needs healthy GPU↔GPU P2P posted writes.
+Since 2026-08-31 it **self-tests at boot** (three verified collectives + a latency bound) and
+falls back to RCCL group-wide with `rdna_ar: disabled -- boot self-test failed` if your
+board's P2P is broken or slow — so on current trees a bad fabric downgrades performance
+instead of corrupting output. Two manual probes: boot once with `VLLM_RDNA_AR=0` (forces
+RCCL for the small collectives — if your stalls vanish, your board's P2P is the story), and
+check the boot log for the `rdna_ar: one-shot all-reduce active` vs `disabled` lines.
