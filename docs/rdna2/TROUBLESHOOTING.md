@@ -195,7 +195,7 @@ lists the forks, images and toolboxes worth knowing about. Notably, the wiki doc
 `v620_toolbox` unlocks a 120 W power floor on hardware that otherwise refuses anything under
 250 W, which is directly relevant to §4's power-transient story.
 
-## 5. Step 0 when something is wrong: run the report script
+### 5.0 Step 0 when something is wrong: run the report script
 
 ```bash
 tools/rdna2/system-report.sh --probe        # add --tests if no server is running
