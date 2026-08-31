@@ -3,7 +3,8 @@
 The n-gram (PLE) table is this model's unusual organ: a 51-billion-row embedding table that
 lives on the **CPU**, served to the GPUs by a dedicated offload worker, request by request,
 every step. Almost every "PLE timeout" report we have seen traces back to the environment
-around that worker — not to the code. This page is (1) the environment recipe from step 0,
+around that worker — not to the code. A condensed hand-out edition lives at [PLE-DIAGNOSTIC-TREE.md](PLE-DIAGNOSTIC-TREE.md);
+keep the two in sync. This page is (1) the environment recipe from step 0,
 (2) a statement of exactly what we did and did not do to the weights, and (3) a diagnostic
 tree keyed to the exact messages the server prints.
 
