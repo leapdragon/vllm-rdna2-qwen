@@ -195,6 +195,20 @@ lists the forks, images and toolboxes worth knowing about. Notably, the wiki doc
 `v620_toolbox` unlocks a 120 W power floor on hardware that otherwise refuses anything under
 250 W, which is directly relevant to §4's power-transient story.
 
+## 5. Step 0 when something is wrong: run the report script
+
+```bash
+tools/rdna2/system-report.sh --probe        # add --tests if no server is running
+```
+
+It writes `system-report.log` (host, PCIe links, GPUs, ROCm, venv packages, torch/vLLM
+build and its gfx targets, model inventory + storage class, the resolved serve command,
+running processes and their environment, a digest of the newest serve log, the kernel log
+of this and the previous boot; `--probe` adds a live health/metrics/tiny-completion check).
+It never modifies anything, masks secrets, and redacts home paths/hostname/IPs by default.
+Skim it, then send it with the exact error text. Nine times out of ten it answers the
+question before anyone has to ask it.
+
 ## 5a. Traps found on the Flash-Next fork (2026-08-29/30)
 
 **PLE timeouts or slow lookups?** Start with `PLE-OFFLOAD-SETUP.md` — environment recipe from

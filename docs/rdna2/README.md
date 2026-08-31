@@ -210,6 +210,9 @@ launch to a model source line. That pair found every lever in `CHANGES.md` §5�
 
 ## 9. If it does not work
 
+First: `tools/rdna2/system-report.sh --probe` → send us `system-report.log` with the exact
+error text (see TROUBLESHOOTING.md §5). Then:
+
 `TROUBLESHOOTING.md` first. Then, in the order they bit us: cards missing from `rocminfo`
 (another GPU in the machine), `Failed to dlopen libcuda.so.1` from the PLE offload connector
 (a `cuda-bindings` package in the venv is being preferred over the HIP shim — fixed in this

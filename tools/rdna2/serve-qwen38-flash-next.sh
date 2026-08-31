@@ -93,14 +93,24 @@ if [ -n "${PROFILE:-}" ]; then
   PROF=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir="$TRACES")
 fi
 
-exec python3 -m vllm.entrypoints.openai.api_server \
-  --model "$MODEL" --served-model-name qwen38-flash-next \
-  --dtype float16 \
-  --tensor-parallel-size 4 --enable-expert-parallel \
-  --max-model-len "$MAXLEN" --gpu-memory-utilization "$GPUUTIL" \
-  --max-num-seqs 4 --max-num-batched-tokens 2048 \
-  ${EAGER:+--enforce-eager} \
-  "${VISIONARGS[@]}" \
-  --enable-prefix-caching \
-  "${SPEC[@]}" "${TOOLARGS[@]}" "${CHATARGS[@]}" "${PROF[@]}" ${EXTRA_ARGS:-} \
-  --host 0.0.0.0 --port "$PORT"
+CMD=(python3 -m vllm.entrypoints.openai.api_server
+  --model "$MODEL" --served-model-name qwen38-flash-next
+  --dtype float16
+  --tensor-parallel-size 4 --enable-expert-parallel
+  --max-model-len "$MAXLEN" --gpu-memory-utilization "$GPUUTIL"
+  --max-num-seqs 4 --max-num-batched-tokens 2048
+  ${EAGER:+--enforce-eager}
+  "${VISIONARGS[@]}"
+  --enable-prefix-caching
+  "${SPEC[@]}" "${TOOLARGS[@]}" "${CHATARGS[@]}" "${PROF[@]}" ${EXTRA_ARGS:-}
+  --host 0.0.0.0 --port "$PORT")
+
+if [ "${DRYRUN:-0}" = "1" ]; then
+  # tools/rdna2/system-report.sh uses this: show the resolved environment and command, launch nothing
+  echo "# environment this script exports:"
+  env | grep -E '^(ROCR_|ROCM_|HSA_|NCCL_|VLLM_|TORCH_BLAS|FLASH_ATTENTION|PYTORCH_|MM_ELIDE)' | sort | sed 's/^/#   /'
+  echo "# command:"
+  printf '%q ' "${CMD[@]}"; echo
+  exit 0
+fi
+exec "${CMD[@]}"
