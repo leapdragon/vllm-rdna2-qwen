@@ -10,7 +10,10 @@
 #   ./containers/build.sh --push          push what this run built (docker login ghcr.io first)
 #
 # Env: REGISTRY_REPO (ghcr.io/leapdragon/vllm-rdna2-qwen)  VERSION (<date>-g<sha>)  BASE_TAG  BASE_IMAGE
-#      ROCM_DIR (/opt/rocm)  MAX_JOBS (24)
+#      ROCM_DIR (unset = download)  MAX_JOBS (24)  THEROCK_URL + THEROCK_SHA256 (which public tarball;
+#      default 7.14.1 stable — for the exact ROCm the numbers were measured on, the 7.14.0rc3 candidate:
+#        THEROCK_URL=https://rocm.prereleases.amd.com/tarball-multi-arch/therock-dist-linux-gfx103X-all-7.14.0rc3.tar.gz \
+#        THEROCK_SHA256=ce9a5be2b43ee1bdd85de3fa9ea3c3d5dcb6875445acf7281c3763a4ee783f19 BASE_TAG=therock7.14.0rc3-torch2.12-gfx1030 ./containers/build.sh --base)
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; root="$(cd "$here/.." && pwd)"
 REGISTRY_REPO="${REGISTRY_REPO:-ghcr.io/leapdragon/vllm-rdna2-qwen}"
@@ -34,8 +37,9 @@ if [ "$do_base" = 1 ]; then
   else
     log "base $BASE_IMAGE from the pinned public TheRock tarball (MAX_JOBS=$MAX_JOBS)"
   fi
+  ROCK_ARGS=(); [ -n "${THEROCK_URL:-}" ] && ROCK_ARGS+=(--build-arg "THEROCK_URL=$THEROCK_URL"); [ -n "${THEROCK_SHA256:-}" ] && ROCK_ARGS+=(--build-arg "THEROCK_SHA256=$THEROCK_SHA256")
   docker buildx build --load --progress=plain -f "$here/Dockerfile.base" --target final \
-    "${ROCM_CTX[@]}" --build-arg "MAX_JOBS=$MAX_JOBS" \
+    "${ROCM_CTX[@]}" "${ROCK_ARGS[@]}" --build-arg "MAX_JOBS=$MAX_JOBS" \
     --label "org.opencontainers.image.revision=$sha" --label "org.opencontainers.image.created=$(date -u +%FT%TZ)" \
     -t "$BASE_IMAGE" "$here"
   built+=("$BASE_IMAGE")
