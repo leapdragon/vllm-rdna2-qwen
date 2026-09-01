@@ -1,16 +1,24 @@
-# Build context for containers/Dockerfile is the repository root; keep it small and free of
-# host-only state (the models/ symlinks point at 100+ GB of weights on the host).
-.git
-models
-logs
-hf-cache
-.compile-cache
-.state
-**/__pycache__
-**/*.pyc
-**/*.egg-info
 build
+# Build context for containers/Dockerfile is the repository root; keep it small and free of
+cmake-build*
+CMakeCache.txt
+CMakeFiles
+.compile-cache
+.deps
 dist
+**/*.egg-info
+.git
+hf-cache
+# host-only state (the models/ symlinks point at 100+ GB of weights on the host).
+logs
+models
+.mypy_cache
+**/*.pyc
+**/__pycache__
+.pytest_cache
+.ruff_cache
+_skbuild
+.state
 .venv
 vllm/*.abi3.so
 vllm/_version.py
