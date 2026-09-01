@@ -120,6 +120,9 @@ MODEL=models/qwen38-flash-next PLE_INT4=models/qwen38-flash-next-ple/ples_int4 \
   tools/rdna2/serve-qwen38-flash-next.sh
 ```
 
+Or, without building anything, the container image runs this same script as its entrypoint with the
+same knobs as `-e` — [containers/README.md](../../containers/README.md).
+
 That script is the whole configuration; read it. The knobs that are not optional are explained
 in `CHANGES.md` §4 (expert parallelism, fp16, language-model-only, the stability env). Boot
 takes ~13–15 minutes (weights, torch.compile, CUDA-graph capture, the MTP head). `curl

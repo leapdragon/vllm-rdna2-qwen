@@ -81,17 +81,31 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
 
 The whole stack is also published as an image — TheRock ROCm 7.14, PyTorch 2.12 / Triton 3.7 built
 for gfx1030, this fork built as docs/rdna2/README.md §3–4 prescribe — so a host needs only the
-`amdgpu` driver, Docker, four gfx103x cards and the two weight downloads:
+`amdgpu` driver (plus the kernel line from docs/rdna2/README.md §1), Docker, ≥ 96 GB RAM, four
+gfx103x cards with 32 GB, and the two weight downloads (no conversion):
 
-    docker run -d --network=host --device /dev/kfd --device /dev/dri \
+    mkdir -p models && cd models
+    hf download wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --local-dir qwen38-flash-next \
+       --exclude "model-00001-of-00005.safetensors"                          # 73 GB; shard 1 is not needed
+    hf download primitive-ai/Qwen3.8-Flash-Next-PLE-quant --include "ples_int4/*" \
+       --local-dir qwen38-flash-next-ple                                      # 30 GB int4 n-gram sidecar
+    cd ..
+
+    docker run -d --name qwen38 --network=host --device /dev/kfd --device /dev/dri \
       --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
-      --ipc=host --ulimit memlock=-1 -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+      --ipc=host --ulimit memlock=-1 --security-opt seccomp=unconfined \
+      -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
       -v "$PWD/models:/models" -v qwen38-compile-cache:/compile-cache \
       ghcr.io/leapdragon/vllm-rdna2-qwen:latest
 
-Every knob of `tools/rdna2/serve-qwen38-flash-next.sh` works as `-e` (MTP, MAXLEN, VISION, …).
-Walkthrough, knobs, and how the image is built (and why its ROCm comes from TheRock's legacy
-tarball index): [containers/README.md](containers/README.md).
+    docker logs -f qwen38        # first boot 15–20 min (compile + sidecar prefault); later boots ~5 min
+    curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+      -d '{"model":"qwen38-flash-next","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":64}'
+
+Every knob of `tools/rdna2/serve-qwen38-flash-next.sh` works as `-e` (`MTP=0` for no speculative
+decoding, `MAXLEN`, `VISION=1`, `CHAT_KWARGS`, `PORT`, `DRYRUN=1`, …). Full walkthrough — flags
+explained, stop/update, getting a support report, how the image is built and why its ROCm comes from
+TheRock's legacy tarball index: [containers/README.md](containers/README.md).
 
 ## Troubleshooting
 

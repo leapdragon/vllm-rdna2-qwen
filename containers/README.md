@@ -41,11 +41,19 @@ docker run -d --name qwen38 --network=host \
   ghcr.io/leapdragon/vllm-rdna2-qwen:latest
 ```
 
+- Flags, and why: `--device /dev/kfd --device /dev/dri` + the `render`/`video` group adds give the
+  container the GPUs (group ids differ per distro, hence `getent`); `--ipc=host` and
+  `--ulimit memlock=-1` are required — the n-gram worker and the four GPU workers share pinned
+  host buffers; `--security-opt seccomp=unconfined` lets ROCm's memory mapping work;
+  `--network=host` exposes port 8000 directly (the only mode we test).
 - `ROCR_VISIBLE_DEVICES` — your four serving cards, in `rocm-smi` order.
 - `/models` must hold `qwen38-flash-next/` and `qwen38-flash-next-ple/ples_int4/` (override with
   `-e MODEL=… -e PLE_INT4=…`). Weights are never shipped in the image.
-- `/compile-cache` (a named volume is fine) persists torch.compile: **first boot ≈ 15 min**
-  (compile + the 30 GB sidecar prefault), later boots ≈ 3–4 min. The healthcheck allows 40 min.
+- `/compile-cache` (a named volume is fine) persists torch.compile: **first boot ≈ 15–20 min**
+  (measured 17–19: compile + the 30 GB sidecar prefault), later boots ≈ 4–5 min. The healthcheck
+  allows 40 min; `docker inspect --format '{{.State.Health.Status}}' qwen38` says `healthy` when
+  the server answers. Keep `/models` on an SSD — a spinning disk or network share under the sidecar
+  produces the slow-lookup symptoms in the PLE diagnostic tree.
 - Knobs: `MTP` (3; `0` disables speculative decoding and frees ~150k tokens of KV),
   `MAXLEN` (131072), `GPUUTIL` (0.90), `VISION` (0/1), `CHAT_KWARGS`
   (`'{"preserve_thinking": true, "reasoning_effort": "medium"}'`), `TOOLS` (1), `PORT` (8000 —
@@ -65,12 +73,32 @@ runs). **The first few minutes after a boot decode slower** (we saw 50–59 t/s)
 prefaulted, but loading the 73 GB backbone afterwards evicts part of it on a ≤128 GB host, and the
 n-gram rows real requests need fault back in from disk until they are resident — the PLE worker's
 `lookup` time in the log falls from ~45 ms to ~15–20 ms per request as that happens. Nothing to fix
-in the container; more RAM or a warm second boot makes it disappear. Anything else: `docker run --rm … IMAGE tools/rdna2/system-report.sh` produces the support report
-([TROUBLESHOOTING.md](../docs/rdna2/TROUBLESHOOTING.md) §5.0); PLE timeouts have their own tree in
-[PLE-DIAGNOSTIC-TREE.md](../docs/rdna2/PLE-DIAGNOSTIC-TREE.md).
+in the container; more RAM or a warm second boot makes it disappear.
+
+**4. Stop, restart, update**
+
+```bash
+docker stop -t 60 qwen38            # graceful: the GPU workers take ~20 s to unwind ROCm; SIGKILL leaves VRAM held until they exit
+docker start qwen38                 # same configuration, warm compile cache: ~4–5 min to healthy
+docker rm qwen38                    # to change knobs (e.g. -e MTP=0), remove and run again with the new -e
+docker pull ghcr.io/leapdragon/vllm-rdna2-qwen:latest   # a new image version: rm + run again; a code change
+                                                         # invalidates the compile cache, so expect one cold boot
+```
+
+**5. If something is wrong** — get the support report from inside the container and send it with
+your issue ([TROUBLESHOOTING.md](../docs/rdna2/TROUBLESHOOTING.md) §5.0):
+
+```bash
+docker logs qwen38 > qwen38.log 2>&1
+docker cp qwen38.log qwen38:/tmp/serve.log
+docker exec qwen38 tools/rdna2/system-report.sh --log /tmp/serve.log --out /tmp/system-report.log
+docker cp qwen38:/tmp/system-report.log .            # review it (it is redacted), then attach it
+```
+
+PLE timeouts have their own decision tree: [PLE-DIAGNOSTIC-TREE.md](../docs/rdna2/PLE-DIAGNOSTIC-TREE.md).
 
 Any other command after the image name runs inside the environment (`bash`, `python3`,
-`tools/rdna2/validate.py`, …) — `serve` is the default.
+`tools/rdna2/validate.py`, `tools/rdna2/bench.py`, …) — `serve` is the default.
 
 ## Why the base is built the way it is
 

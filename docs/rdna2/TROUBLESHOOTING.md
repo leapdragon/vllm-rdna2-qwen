@@ -209,6 +209,14 @@ It never modifies anything, masks secrets, and redacts home paths/hostname/IPs b
 Skim it, then send it with the exact error text. Nine times out of ten it answers the
 question before anyone has to ask it.
 
+**From the container image** (the serve log is the container's stdout, so hand it to the script):
+
+```bash
+docker logs qwen38 > qwen38.log 2>&1 && docker cp qwen38.log qwen38:/tmp/serve.log
+docker exec qwen38 tools/rdna2/system-report.sh --log /tmp/serve.log --out /tmp/system-report.log
+docker cp qwen38:/tmp/system-report.log .
+```
+
 ## 5a. Traps found on the Flash-Next fork (2026-08-29/30)
 
 **PLE timeouts or slow lookups?** Start with `PLE-OFFLOAD-SETUP.md` — environment recipe from
