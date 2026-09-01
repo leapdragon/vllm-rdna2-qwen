@@ -171,7 +171,13 @@ caps the blocks per launch (4 → 42 µs/op) and `VLLM_RDNA_AR_PACE` (0..127) id
 clocks per unit between strided stores (4 blocks + pace 16 → 45 µs/op). At ~95 collectives per
 step that is ≈ +1.0 / +1.4 ms per ~39 ms step (2.5–3.5 %) — versus RCCL's ~156 µs/op (+11 ms).
 Defaults are unchanged (auto blocks, pace 0); all variants pass `tools/rdna2/ar_ops_test.py`
-(eager + graph replay, bit-identical across ranks). Motivation and what the knobs do NOT touch:
+(eager + graph replay, bit-identical across ranks), and the staggered kernel serves at the recorded
+rate (60–62 t/s at MTP=0 in-server, 2026-09-01). **Boot self-test hardened the same day:** it used to
+time a single collective per size against a 50 ms bound, which on a freshly rebooted machine failed on
+trial 1 (59 ms — rank skew at boot, not P2P speed) and silently fell back to RCCL at −25 % decode. It
+now warms each size up untimed and judges the minimum of three timed repeats, which a genuinely slow
+P2P path cannot pass. If you see `rdna_ar: disabled -- boot self-test failed` on an otherwise healthy
+board, update to a tree with this change before concluding anything about your fabric. Motivation and what the knobs do NOT touch:
 the one-shot path only carries decode-size messages (≤ 64 KB); prefill collectives are RCCL.
 
 ## 7. T45 — int8 shadows of the dense projections

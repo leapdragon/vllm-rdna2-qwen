@@ -164,7 +164,7 @@ gfx1030 (CHANGES §8a tells that story).
 
 **G. Suspected board/fabric differences (different mainboard, ACS, chipset-routed or
 cross-socket slots)** → the one-shot all-reduce needs healthy GPU↔GPU P2P posted writes.
-Since 2026-08-31 it **self-tests at boot** (three verified collectives + a latency bound) and
+Since 2026-08-31 it **self-tests at boot** (verified collectives at three sizes, warm-up then the minimum of three timed repeats against a 50 ms bound — since 2026-09-01; earlier trees timed a single cold collective and could fall back spuriously) and
 falls back to RCCL group-wide with `rdna_ar: disabled -- boot self-test failed` if your
 board's P2P is broken or slow — so on current trees a bad fabric downgrades performance
 instead of corrupting output. Two manual probes: boot once with `VLLM_RDNA_AR=0` (forces
