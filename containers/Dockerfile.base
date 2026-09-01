@@ -70,8 +70,10 @@ ARG MAX_JOBS PYTORCH_REF TRITON_REF VISION_REF
 # is one). Done here, not in rocm-base, so the torch build stage above stays cached. cp312 wheels
 # are ABI-compatible across 3.12.x.
 ARG PYTHON_BUILD=cpython-3.12.13-linux-x86_64-gnu
-RUN python3.12 -m pip install --break-system-packages -q uv \
- && uv python install ${PYTHON_BUILD} && rm -rf /opt/venv && uv venv --seed --python ${PYTHON_BUILD} /opt/venv \
+# uv must live outside /opt/venv (PATH resolves python3.12 to the venv, which is replaced below).
+RUN /usr/bin/python3.12 -m pip install --break-system-packages -q uv \
+ && /usr/local/bin/uv python install ${PYTHON_BUILD} && rm -rf /opt/venv \
+ && /usr/local/bin/uv venv --seed --python ${PYTHON_BUILD} /opt/venv \
  && python -c 'import sys; assert sys.version.startswith("3.12.13"), sys.version; print("venv python", sys.version.split()[0])'
 RUN --mount=type=bind,from=build,source=/build/wheels,target=/wheels \
     pip install /wheels/torch-*.whl /wheels/triton-*.whl /wheels/torchvision-*.whl \
