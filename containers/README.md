@@ -153,10 +153,13 @@ event forces it) and its rescan loop has no backoff. No environment knob of the 
 runtime disables it (`HSA_ENABLE_INTERRUPT`, `ROC_ACTIVE_WAIT_TIMEOUT`,
 `hipSetDeviceFlags(BlockingSync)` all measured ineffective with >1 visible GPU).
 
-A one-hunk patch adds a bounded poll cadence (default 100 µs, tunable via
-`HSA_ASYNC_EVENTS_POLL_US`, `0` restores stock behavior); measured: idle spin eliminated,
-GEMM/serve latency unchanged. Patch (applies to rocm-systems @ `ca887ee`,
-`projects/rocr-runtime/.../core/runtime/runtime.cpp`):
+A small patch series adds bounded backoff to all four spin sites (AsyncEventsLoop polling
+mode, BusyWaitSignal and forced-ACTIVE waits, and an InterruptSignal livelock where the
+kernel event wait returns instantly on a stale event — cf. ROCm/ROCm#6522). Knobs:
+`HSA_ASYNC_EVENTS_POLL_US` (default 100), `HSA_BUSY_WAIT_GRACE_US` (default 1000),
+`HSA_BUSY_WAIT_POLL_US` (default 20; `0` restores the stock spin). Measured on 4× V620:
+idle spin ~1 core/HIP process → a few percent; GEMM/serve latency unchanged. Patch
+(applies to rocm-systems @ `ca887ee`):
 `https://github.com/leapdragon/vllm-rdna2/blob/main/patches/rocr-async-events-poll-backoff.patch`
 (also usable outside containers: build ROCR, then `LD_PRELOAD` the patched
 `libhsa-runtime64.so.1.21.0` into the serve).
