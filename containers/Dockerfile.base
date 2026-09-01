@@ -46,13 +46,8 @@ COPY --from=rocm . /opt/rocm
 ENV ROCM_PATH=/opt/rocm ROCM_HOME=/opt/rocm HIP_PATH=/opt/rocm \
     PATH=/opt/venv/bin:/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/opt/rocm/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     LD_LIBRARY_PATH=/opt/rocm/lib
-# The venv runs the same interpreter build as the validated host: python-build-standalone 3.12.13 via
-# uv (Ubuntu's 3.12.3 measured ~1.4x slower on pure-Python loops — the PLE offload worker is one).
-ARG PYTHON_BUILD=cpython-3.12.13-linux-x86_64-gnu
 RUN test -x /opt/rocm/bin/hipcc && test -d /opt/rocm/.kpack \
- && python3.12 -m pip install --break-system-packages -q uv \
- && uv python install ${PYTHON_BUILD} && uv venv --seed --python ${PYTHON_BUILD} /opt/venv \
- && /opt/venv/bin/python -c 'import sys; print(sys.version)' && pip install --upgrade pip wheel \
+ && python3.12 -m venv /opt/venv && pip install --upgrade pip wheel \
  && grep -H . /opt/rocm/.info/version
 
 # ---- stage 2: build the wheels with the fork's own script -----------------------------------
@@ -70,6 +65,14 @@ RUN SRC=/build/src OUT=/build/wheels MAX_JOBS=${MAX_JOBS} PYTORCH_REF=${PYTORCH_
 # ---- stage 3: the base image -----------------------------------------------------------------
 FROM rocm-base AS final
 ARG MAX_JOBS PYTORCH_REF TRITON_REF VISION_REF
+# The serving venv runs the same interpreter build as the validated host — python-build-standalone
+# 3.12.13 via uv (Ubuntu's 3.12.3 measured ~1.4x slower on pure-Python loops; the PLE offload worker
+# is one). Done here, not in rocm-base, so the torch build stage above stays cached. cp312 wheels
+# are ABI-compatible across 3.12.x.
+ARG PYTHON_BUILD=cpython-3.12.13-linux-x86_64-gnu
+RUN python3.12 -m pip install --break-system-packages -q uv \
+ && uv python install ${PYTHON_BUILD} && rm -rf /opt/venv && uv venv --seed --python ${PYTHON_BUILD} /opt/venv \
+ && python -c 'import sys; assert sys.version.startswith("3.12.13"), sys.version; print("venv python", sys.version.split()[0])'
 RUN --mount=type=bind,from=build,source=/build/wheels,target=/wheels \
     pip install /wheels/torch-*.whl /wheels/triton-*.whl /wheels/torchvision-*.whl \
  && cp -r /opt/rocm/share/amd_smi /tmp/amd_smi && pip install /tmp/amd_smi && rm -rf /tmp/amd_smi \
