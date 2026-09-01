@@ -126,9 +126,17 @@ class RdnaOneShotAllReduce:
             self.handle, self.rank, self.world_size, gathered, max_kb, os.getenv("VLLM_RDNA_AR_BLOCKS", "auto"), os.getenv("VLLM_RDNA_AR_PACE", "0"))
 
     def _self_test(self, device: torch.device) -> str | None:
-        """Three verified all-reduces on the fast path; returns an error string or None."""
+        """Verified all-reduces on the fast path at three sizes; returns an error string or None.
+
+        Per size: one untimed warm-up collective (first launch loads the code object and
+        first-touches the IPC mappings), then REPEATS timed collectives judged on their MINIMUM.
+        The minimum is what a slow P2P path cannot hide; the maximum only measures how far the
+        ranks were out of step at boot -- which once failed a healthy machine at 59 ms (2026-09-01).
+        Every collective is checked for the spin-cap timeout and for the exact fp32 result.
+        """
         import time
 
+        REPEATS = 3
         try:
             with torch.cuda.device(device):
                 for trial, numel in enumerate((1024, 4096, self.max_bytes // 2)):
@@ -136,17 +144,23 @@ class RdnaOneShotAllReduce:
                         (numel,), float(self.rank + 1) * (trial + 1), dtype=torch.float16, device=device
                     )
                     expect = float((trial + 1) * self.world_size * (self.world_size + 1) // 2)
-                    t0 = time.perf_counter()
-                    out = self._ops.rdna_ar_all_reduce(self.handle, inp)
-                    torch.cuda.synchronize(device)
-                    dt = time.perf_counter() - t0
-                    if self._ops.rdna_ar_timed_out(self.handle):
-                        return f"spin-cap timeout in self-test trial {trial} ({dt * 1e3:.0f} ms)"
-                    if not bool((out == expect).all()):
-                        got = out.float().mean().item()
-                        return f"wrong result in self-test trial {trial}: mean {got:.2f}, expected {expect:.1f}"
-                    if dt > 0.05:
-                        return f"self-test trial {trial} took {dt * 1e3:.0f} ms for {numel * 2} bytes (P2P too slow; RCCL will be faster)"
+                    times: list[float] = []
+                    for rep in range(REPEATS + 1):  # rep 0 = warm-up, untimed
+                        t0 = time.perf_counter()
+                        out = self._ops.rdna_ar_all_reduce(self.handle, inp)
+                        torch.cuda.synchronize(device)
+                        dt = time.perf_counter() - t0
+                        if self._ops.rdna_ar_timed_out(self.handle):
+                            return f"spin-cap timeout in self-test trial {trial} rep {rep} ({dt * 1e3:.0f} ms)"
+                        if not bool((out == expect).all()):
+                            got = out.float().mean().item()
+                            return f"wrong result in self-test trial {trial} rep {rep}: mean {got:.2f}, expected {expect:.1f}"
+                        if rep > 0:
+                            times.append(dt)
+                    best = min(times)
+                    if best > 0.05:
+                        return (f"self-test trial {trial} best {best * 1e3:.1f} ms of {REPEATS} for {numel * 2} bytes "
+                                f"(all: {', '.join(f'{t * 1e3:.1f}' for t in times)} ms; P2P too slow, RCCL will be faster)")
         except Exception as e:  # noqa: BLE001
             return str(e)
         return None
