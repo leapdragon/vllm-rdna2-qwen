@@ -142,3 +142,21 @@ gh auth refresh -h github.com -s write:packages && gh auth token | docker login 
 ```
 
 First push creates the package private — make it public in Package settings.
+
+## Known issue: idle CPU spin in the bundled ROCm runtime
+
+TheRock 7.14's `libhsa-runtime64.so` (ROCR 1.21 line) busy-spins one full CPU core per
+HIP process even when the GPU is completely idle — in a 4-way TP serve that is several
+cores of standing load and heat ([ROCm/TheRock#7051](https://github.com/ROCm/TheRock/issues/7051)).
+Root cause: `AsyncEventsLoop` falls into a polling mode (any async signal without a kernel
+event forces it) and its rescan loop has no backoff. No environment knob of the stock
+runtime disables it (`HSA_ENABLE_INTERRUPT`, `ROC_ACTIVE_WAIT_TIMEOUT`,
+`hipSetDeviceFlags(BlockingSync)` all measured ineffective with >1 visible GPU).
+
+A one-hunk patch adds a bounded poll cadence (default 100 µs, tunable via
+`HSA_ASYNC_EVENTS_POLL_US`, `0` restores stock behavior); measured: idle spin eliminated,
+GEMM/serve latency unchanged. Patch (applies to rocm-systems @ `ca887ee`,
+`projects/rocr-runtime/.../core/runtime/runtime.cpp`):
+`https://github.com/leapdragon/vllm-rdna2/blob/main/patches/rocr-async-events-poll-backoff.patch`
+(also usable outside containers: build ROCR, then `LD_PRELOAD` the patched
+`libhsa-runtime64.so.1.21.0` into the serve).
