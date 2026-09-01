@@ -163,6 +163,17 @@ ahead of every other path, one instance per process group (vLLM builds several
 `GroupCoordinator`s over the same ranks — a singleton deadlocked three of four ranks), fast
 path ≤ 64 KB (prefill chunks are faster on RCCL). `VLLM_RDNA_AR=0` disables.
 
+**Fabric-friendliness knobs (2026-09-01).** The pushes now go out in a rank-staggered peer order —
+at any instant each destination GPU is written by one source instead of all W−1 at once (a pure
+reorder: 30.9 µs/op vs 33 before) — and two environment knobs bound the burst into the receiving
+GPU's root complex, where other devices' DMA completions queue behind it: `VLLM_RDNA_AR_BLOCKS`
+caps the blocks per launch (4 → 42 µs/op) and `VLLM_RDNA_AR_PACE` (0..127) idles each wave ~64
+clocks per unit between strided stores (4 blocks + pace 16 → 45 µs/op). At ~95 collectives per
+step that is ≈ +1.0 / +1.4 ms per ~39 ms step (2.5–3.5 %) — versus RCCL's ~156 µs/op (+11 ms).
+Defaults are unchanged (auto blocks, pace 0); all variants pass `tools/rdna2/ar_ops_test.py`
+(eager + graph replay, bit-identical across ranks). Motivation and what the knobs do NOT touch:
+the one-shot path only carries decode-size messages (≤ 64 KB); prefill collectives are RCCL.
+
 ## 7. T45 — int8 shadows of the dense projections
 
 `gemv_i8_rdna2` + `vllm/model_executor/layers/rdna_dense_int8.py`: per-output-channel symmetric

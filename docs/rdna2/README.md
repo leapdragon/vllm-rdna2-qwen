@@ -177,6 +177,11 @@ a warm boot in either direction. `tools/rdna2/watch.py` shows the live acceptanc
 only reads the OpenAI-style `reasoning`), so clients that echo vLLM's own responses back got an
 empty `<think>` block — this fork accepts both fields (`vllm/entrypoints/chat_utils.py`).
 
+Fabric-friendliness knobs for the one-shot all-reduce (CHANGES §6): `VLLM_RDNA_AR_BLOCKS=4`
+(fewer concurrent PCIe push streams, ≈ +2.5 % step time) and `VLLM_RDNA_AR_PACE=16` (idle between
+pushes, ≈ +1 % more). Try them if other PCIe devices misbehave under load or if the all-reduce
+self-test passes but serving stalls; `VLLM_RDNA_AR=0` (RCCL) remains the last resort at ≈ −25 %.
+
 ## 7. Validate and measure
 
 ```bash
