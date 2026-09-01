@@ -16,18 +16,17 @@ ENV DEBIAN_FRONTEND=noninteractive PIP_ROOT_USER_ACTION=ignore PIP_NO_CACHE_DIR=
 COPY . /app/vllm
 WORKDIR /app/vllm
 
-# README §4 verbatim: build deps WITHOUT torch/triton (requirements/build/rocm.txt would drag in a
-# PyPI torch with its own bundled ROCm — the mixed-ROCm trap), then the extensions, then runtime deps.
-# Versions come from the constraints file (the validated venv), not from README §4's ranges — the
-# venv itself drifted past some of them (cmake 4.x) and is what the numbers were measured with.
-RUN pip install -c containers/constraints-runtime.txt \
-      cmake packaging setuptools setuptools-scm setuptools-rust wheel jinja2 ninja \
-      -r requirements/common.txt
+# The validated venv is installed as a *working set*: every pin from containers/constraints-runtime.txt
+# verbatim with --no-deps (the venv itself was assembled with --no-deps steps per README §4 and is
+# internally inconsistent by pip's resolver — e.g. click 8.3.3 next to a huggingface-hub that wants
+# 8.4 — yet it is exactly what every number was measured with). No PyPI torch can sneak in: torch,
+# triton and torchvision are absent from the list and already present from the base.
+RUN pip install --no-deps -r containers/constraints-runtime.txt
 RUN VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1030 ROCM_PATH=/opt/rocm MAX_JOBS=${MAX_JOBS} \
     VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE} \
     pip install -e . --no-build-isolation --no-deps
-RUN pip install -c containers/constraints-runtime.txt -r requirements/rocm.txt --no-deps \
- && pip check || true
+# Report (never fail on) the resolver's complaints — README §4 lists the expected ones.
+RUN pip check || true
 
 # Verification — no GPU needed: torch's compiled arch flags, HIP 7.14, this fork's RDNA ops bound.
 RUN python - <<'PY'

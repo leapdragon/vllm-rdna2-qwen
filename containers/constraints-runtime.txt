@@ -1,8 +1,6 @@
 # Runtime dependency pins captured from the validated host venv (~/venvs/vllm-rdna2-qwen) on 2026-08-31
 # with `pip freeze`, minus torch/torchvision/triton (built from source in the base image), vllm (this
 # tree) and amdsmi (installed from TheRock's own /opt/rocm/share/amd_smi). Used as `pip install -c`.
-# Pins dropped 2026-08-31 because they violate the tree's own requirements/*.txt bounds (pip then picks
-# within the bound): setuptools -r -r -r -r -r
 accelerate==1.14.0
 agent-detector==1.1.0
 aiohappyeyeballs==2.7.1
@@ -191,3 +189,4 @@ yarl==1.24.5
 z3-solver==4.15.4.0
 zipp==4.1.0
 zstandard==0.25.0
+setuptools==81.0.0
