@@ -167,5 +167,5 @@ kernel event wait returns instantly on a stale event — cf. ROCm/ROCm#6522). Kn
 idle spin ~1 core/HIP process → a few percent; GEMM/serve latency unchanged. Patch
 (applies to rocm-systems @ `ca887ee`):
 `https://github.com/leapdragon/vllm-rdna2/blob/main/patches/rocr-async-events-poll-backoff.patch`
-(also usable outside containers: build ROCR, then `LD_PRELOAD` the patched
-`libhsa-runtime64.so.1.21.0` into the serve).
+(for a host source build — rebuild only ROCR and `LD_PRELOAD` it, no torch/vLLM rebuild —
+see [docs/rdna2/ROCR-CPU-FIX.md](../docs/rdna2/ROCR-CPU-FIX.md)).
