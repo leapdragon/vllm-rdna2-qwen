@@ -123,7 +123,7 @@ class RdnaOneShotAllReduce:
         self.disabled = False
         logger.info(
             "rdna_ar: one-shot all-reduce active (handle %d, rank %d/%d, devices %s, max %d KB; blocks cap %s, pace %s)",
-            self.handle, self.rank, self.world_size, gathered, max_kb,, os.getenv("VLLM_RDNA_AR_BLOCKS", "auto"), os.getenv("VLLM_RDNA_AR_PACE", "0"))
+            self.handle, self.rank, self.world_size, gathered, max_kb, os.getenv("VLLM_RDNA_AR_BLOCKS", "auto"), os.getenv("VLLM_RDNA_AR_PACE", "0"))
 
     def _self_test(self, device: torch.device) -> str | None:
         """Three verified all-reduces on the fast path; returns an error string or None."""
