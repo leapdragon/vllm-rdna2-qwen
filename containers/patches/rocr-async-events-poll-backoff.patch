@@ -1,0 +1,190 @@
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/default_signal.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/default_signal.cpp
+index 537bd07f66..eb7b779c24 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/default_signal.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/default_signal.cpp
+@@ -40,6 +40,10 @@
+ //
+ ////////////////////////////////////////////////////////////////////////////////
+ 
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include "core/util/os.h"
+ #include "core/inc/default_signal.h"
+ 
+ #if defined(__i386__) || defined(__x86_64__)
+@@ -108,6 +112,25 @@ hsa_signal_value_t BusyWaitSignal::WaitRelaxed(hsa_signal_condition_t condition,
+       // Use timer-enabled mwaitx for busy waiting
+       timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), value, 60000, true);
+     }
++    {  // backoff applies with or without mwaitx (mwaitx still accounts as 100% busy CPU)
++      // vllm-rdna2 patch (ROCm/TheRock#7051 family): this loop spun userspace at 100%
++      // of a core for the whole wait -- indefinitely for idle service threads (e.g.
++      // RCCL) parked on busy-wait/IPC signals. After a grace window of pure spinning,
++      // poll at a bounded cadence instead. HSA_BUSY_WAIT_GRACE_US (default 1000) /
++      // HSA_BUSY_WAIT_POLL_US (default 20; 0 = original spin).
++      static const long poll_us_ = [] {
++        const char* e = std::getenv("HSA_BUSY_WAIT_POLL_US");
++        return e ? std::atol(e) : 20L;
++      }();
++      static const timer::fast_clock::duration grace_ =
++          std::chrono::duration_cast<timer::fast_clock::duration>(
++              std::chrono::microseconds([] {
++                const char* e = std::getenv("HSA_BUSY_WAIT_GRACE_US");
++                return e ? std::atol(e) : 1000L;
++              }()));
++      if (poll_us_ > 0 && timer::fast_clock::now() - start_time > grace_)
++        os::uSleep(poll_us_);
++    }
+   }
+ }
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
+index f35b98edc0..4f36b7d1f4 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
+@@ -40,6 +40,10 @@
+ //
+ ////////////////////////////////////////////////////////////////////////////////
+ 
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include "core/util/os.h"
+ #include "core/inc/interrupt_signal.h"
+ #include "core/inc/runtime.h"
+ #include "core/util/locks.h"
+@@ -154,6 +158,7 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(hsa_signal_condition_t condition
+   const uint32_t &signal_abort_timeout =
+     core::Runtime::runtime_singleton_->flag().signal_abort_timeout();
+ 
++  uint64_t spin_iters_ = 0;
+   while (true) {
+     if (!IsValid()) return 0;
+ 
+@@ -175,10 +180,38 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(hsa_signal_condition_t condition
+         // Short timeout for active waiting
+         timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), value, 1000, true);
+       }
++      {  // backoff applies with or without mwaitx (mwaitx still accounts as 100% busy CPU)
++        // vllm-rdna2 patch (ROCm/TheRock#7051 family): ACTIVE-hint waits (requested by
++        // HIP service threads, or forced above when KFD lacks event-age and the signal
++        // already has a waiter) spun userspace at 100% of a core for the whole wait --
++        // indefinitely for idle service threads. After a grace window of pure spinning,
++        // poll at a bounded cadence. HSA_BUSY_WAIT_GRACE_US (default 1000) /
++        // HSA_BUSY_WAIT_POLL_US (default 20; 0 = original spin).
++        static const long poll_us_ = [] {
++          const char* e = std::getenv("HSA_BUSY_WAIT_POLL_US");
++          return e ? std::atol(e) : 20L;
++        }();
++        static const timer::fast_clock::duration grace_ =
++            std::chrono::duration_cast<timer::fast_clock::duration>(
++                std::chrono::microseconds([] {
++                  const char* e = std::getenv("HSA_BUSY_WAIT_GRACE_US");
++                  return e ? std::atol(e) : 1000L;
++                }()));
++        if (poll_us_ > 0 && now - start_time > grace_)
++          os::uSleep(poll_us_);
++      }
++      if (++spin_iters_ > 2000) {
++        static const long poll3_us_ = [] {
++          const char* e = std::getenv("HSA_BUSY_WAIT_POLL_US");
++          return e ? std::atol(e) : 20L;
++        }();
++        if (poll3_us_ > 0) os::uSleep(poll3_us_);
++      }
+       continue;
+     }
+ 
+     if (now - start_time < kMaxElapsed) {
++      ++spin_iters_;
+       if (g_use_mwaitx) {
+         // Longer timeout with timer for passive waiting
+         timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), value, 60000, true);
+@@ -195,6 +228,18 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(hsa_signal_condition_t condition
+     );
+ 
+     HSAKMT_CALL(hsaKmtWaitOnEvent_Ext(event_, wait_ms, &event_age));
++
++    // vllm-rdna2 patch, branch-agnostic guard: a healthy blocked wait iterates this
++    // loop only on real wakeups. Thousands of iterations inside one call mean some
++    // path is returning instantly (ACTIVE spin, mwaitx, or a stale-event fast return
++    // livelocking the kmt wait, cf. ROCm/ROCm#6522) -- back off at a bounded cadence.
++    if (++spin_iters_ > 2000) {
++      static const long poll2_us_ = [] {
++        const char* e = std::getenv("HSA_BUSY_WAIT_POLL_US");
++        return e ? std::atol(e) : 20L;
++      }();
++      if (poll2_us_ > 0) os::uSleep(poll2_us_);
++    }
+   }
+ }
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
+index ff82ca70b8..0bf7be4133 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
+@@ -43,6 +43,7 @@
+ #include <cassert>
+ #include <algorithm>
+ #include <chrono>
++#include <cstdlib>
+ #include <thread>
+ #include <cstring>
+ #include <regex>
+@@ -2004,6 +2005,20 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
+           }
+           init_age = false;
+         }
++
++        // vllm-rdna2 patch (ROCm/TheRock#7051): signals without an EopEvent force this
++        // loop into polling mode, and the rescan had no backoff at all -- the thread
++        // spun at 100% of a CPU core for the life of the process whenever such a signal
++        // stayed incomplete (idle included). Poll at a bounded cadence instead.
++        // HSA_ASYNC_EVENTS_POLL_US tunes the cadence (default 100us; 0 = original spin).
++        if (polling && !finish) {
++          static const long poll_us_ = [] {
++            const char* e = std::getenv("HSA_ASYNC_EVENTS_POLL_US");
++            return e ? std::atol(e) : 100L;
++          }();
++          if (poll_us_ > 0)
++            std::this_thread::sleep_for(std::chrono::microseconds(poll_us_));
++        }
+       }
+     }
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/signal.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/signal.cpp
+index c6170812f1..40e6325b86 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/signal.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/signal.cpp
+@@ -43,6 +43,8 @@
+ #ifndef HSA_RUNTME_CORE_SIGNAL_CPP_
+ #define HSA_RUNTME_CORE_SIGNAL_CPP_
+ 
++#include <cstdlib>
++#include "core/util/os.h"
+ #include "core/inc/signal.h"
+ 
+ #include <algorithm>
+@@ -313,6 +315,21 @@ uint32_t Signal::WaitMultiple(uint32_t signal_count, const hsa_signal_t* hsa_sig
+     }
+ 
+     if (wait_hint == HSA_WAIT_STATE_ACTIVE) {
++      // vllm-rdna2 patch: forced-ACTIVE waits (signals without an EopEvent, or secondary
++      // waiters without KFD event-age support) spun userspace with no backoff. Same
++      // knobs as BusyWaitSignal::WaitRelaxed: HSA_BUSY_WAIT_GRACE_US / HSA_BUSY_WAIT_POLL_US.
++      static const long poll_us_ = [] {
++        const char* e = std::getenv("HSA_BUSY_WAIT_POLL_US");
++        return e ? std::atol(e) : 20L;
++      }();
++      static const timer::fast_clock::duration grace_ =
++          std::chrono::duration_cast<timer::fast_clock::duration>(
++              std::chrono::microseconds([] {
++                const char* e = std::getenv("HSA_BUSY_WAIT_GRACE_US");
++                return e ? std::atol(e) : 1000L;
++              }()));
++      if (poll_us_ > 0 && time - start_time > grace_)
++        os::uSleep(poll_us_);
+       continue;
+     }
+ 

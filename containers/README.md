@@ -143,7 +143,13 @@ gh auth refresh -h github.com -s write:packages && gh auth token | docker login 
 
 First push creates the package private — make it public in Package settings.
 
-## Known issue: idle CPU spin in the bundled ROCm runtime
+## Fixed here: idle CPU spin in TheRock's ROCm runtime
+
+**Images built from this tree bundle a patched `libhsa-runtime64`** (stage `rocr-patch` in
+`Dockerfile.base`, patch vendored at `containers/patches/`): idle CPU per HIP process drops
+from ~1–2 full cores to a few percent, with serve throughput unchanged. Tunables baked into
+the patch: `HSA_ASYNC_EVENTS_POLL_US` (default 100), `HSA_BUSY_WAIT_GRACE_US` (1000),
+`HSA_BUSY_WAIT_POLL_US` (20; set `0` to restore the stock spin for A/B). Background below.
 
 TheRock 7.14's `libhsa-runtime64.so` (ROCR 1.21 line) busy-spins one full CPU core per
 HIP process even when the GPU is completely idle — in a 4-way TP serve that is several

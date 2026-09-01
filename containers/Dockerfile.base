@@ -17,6 +17,7 @@ ARG UBUNTU=ubuntu:24.04
 ARG MAX_JOBS=24
 ARG THEROCK_URL=https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx103X-all-7.14.1.tar.gz
 ARG THEROCK_SHA256=6ce28f2b29988473a3f77b78178ac0c3f83c8e660699b844930d4a5e33d192cc
+ARG ROCM_SYSTEMS_REF=ca887ee80abfb82671fe1d6d8da708a713438e05
 ARG PYTORCH_REF=6bbd260
 ARG TRITON_REF=f0b55c0
 ARG VISION_REF=v0.27.1
@@ -62,9 +63,38 @@ RUN SRC=/build/src OUT=/build/wheels MAX_JOBS=${MAX_JOBS} PYTORCH_REF=${PYTORCH_
     bash /build/build-torch-rocm714.sh \
  && ls -la /build/wheels/*.whl
 
+# ---- stage 2b: patched ROCR runtime ----------------------------------------------------------
+# TheRock 7.14's bundled ROCR 1.21 busy-spins CPU cores at idle (AsyncEventsLoop polling mode,
+# busy-wait/forced-ACTIVE signal waits, and an InterruptSignal livelock on RCCL's HIP service
+# thread — ROCm/TheRock#7051, ROCm/ROCm#6522): ~1 core per idle HIP process, one per TP rank
+# extra. Rebuild libhsa-runtime64 from the same rocm-systems commit TheRock 7.14.1 pins, with
+# a bounded-backoff patch (grace window + poll cadence; HSA_BUSY_WAIT_POLL_US=0 restores the
+# stock spin). See containers/patches/ and the README's known-issue section.
+FROM rocm-base AS rocr-patch
+ARG ROCM_SYSTEMS_REF
+COPY patches/rocr-async-events-poll-backoff.patch /src/rocr.patch
+# Build against TheRock's bundled sysdeps libdrm (newer than Ubuntu 24.04's) — same as the stock lib.
+ENV PKG_CONFIG_PATH=/opt/rocm/lib/rocm_sysdeps/lib/pkgconfig
+# xxd: needed by the trap-handler header generator; stage-local so rocm-base's cache is untouched.
+RUN apt-get update && apt-get install -y --no-install-recommends xxd patchelf && rm -rf /var/lib/apt/lists/*
+RUN git clone --filter=blob:none --no-checkout --sparse https://github.com/ROCm/rocm-systems.git /src/rocm-systems \
+ && cd /src/rocm-systems && git sparse-checkout set projects/rocr-runtime \
+ && git fetch -q origin ${ROCM_SYSTEMS_REF} && git checkout -q ${ROCM_SYSTEMS_REF} \
+ && git apply --stat --apply /src/rocr.patch \
+ && cmake -G Ninja -S projects/rocr-runtime -B /src/build -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=ON -DCMAKE_PREFIX_PATH="/opt/rocm/lib/rocm_sysdeps;/opt/rocm;/opt/rocm/lib/llvm" > /src/configure.log 2>&1 \
+      || { echo '--- configure failed, tail:'; tail -80 /src/configure.log; exit 1; } \
+ && cmake --build /src/build -j $(nproc) > /src/build.log 2>&1 \
+      || { echo '--- build failed, errors:'; grep -B1 -A14 -E 'FAILED:|error' /src/build.log | tail -120; exit 1; } \
+ && test -f /src/build/rocr/lib/libhsa-runtime64.so.1.21.0 \
+ && patchelf --set-rpath '$ORIGIN:$ORIGIN/rocm_sysdeps/lib' /src/build/rocr/lib/libhsa-runtime64.so.1.21.0 \
+ && (readelf -d /src/build/rocr/lib/libhsa-runtime64.so.1.21.0 | grep -q 'libhsa-runtime64.so.1')
+
 # ---- stage 3: the base image -----------------------------------------------------------------
 FROM rocm-base AS final
-ARG MAX_JOBS PYTORCH_REF TRITON_REF VISION_REF
+ARG MAX_JOBS PYTORCH_REF TRITON_REF VISION_REF ROCM_SYSTEMS_REF
+# Patched ROCR replaces the tarball's spinning build (see stage 2b). Same soname/exports.
+COPY --from=rocr-patch /src/build/rocr/lib/libhsa-runtime64.so.1.21.0 /opt/rocm/lib/libhsa-runtime64.so.1.21.0
 # The serving venv runs the same interpreter build as the validated host — python-build-standalone
 # 3.12.13 via uv (Ubuntu's 3.12.3 measured ~1.4x slower on pure-Python loops; the PLE offload worker
 # is one). Done here, not in rocm-base, so the torch build stage above stays cached. cp312 wheels
@@ -88,7 +118,8 @@ open("/opt/versions.txt", "w").write(
     f"rocm=TheRock {open('/opt/rocm/.info/version').read().strip()}\ntorch={torch.__version__} (ROCm/pytorch {'%s'})\n"
     f"triton={triton.__version__} (ROCm/triton {'%s'})\ntorchvision={torchvision.__version__} ({'%s'})\n" % ("PYTORCH_REF", "TRITON_REF", "VISION_REF"))
 PY
-RUN sed -i "s/PYTORCH_REF/${PYTORCH_REF}/; s/TRITON_REF/${TRITON_REF}/; s/VISION_REF/${VISION_REF}/" /opt/versions.txt \
+RUN echo "rocr=patched backoff series (rocm-systems ${ROCM_SYSTEMS_REF}, TheRock#7051)" >> /opt/versions.txt \
+ && sed -i "s/PYTORCH_REF/${PYTORCH_REF}/; s/TRITON_REF/${TRITON_REF}/; s/VISION_REF/${VISION_REF}/" /opt/versions.txt \
  && cat /opt/rocm/share/therock/therock_manifest.json | head -c 400 | grep -oE '"(the_rock_commit|rocm_package_version)" *: *"[^"]+"' >> /opt/versions.txt; cat /opt/versions.txt
 LABEL org.opencontainers.image.title="TheRock ROCm 7.14 + PyTorch 2.12 base for vllm-rdna2-qwen (gfx1030)" \
       org.opencontainers.image.source="https://github.com/leapdragon/vllm-rdna2-qwen" \
