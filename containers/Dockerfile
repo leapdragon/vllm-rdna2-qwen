@@ -18,9 +18,11 @@ WORKDIR /app/vllm
 
 # README §4 verbatim: build deps WITHOUT torch/triton (requirements/build/rocm.txt would drag in a
 # PyPI torch with its own bundled ROCm — the mixed-ROCm trap), then the extensions, then runtime deps.
+# Versions come from the constraints file (the validated venv), not from README §4's ranges — the
+# venv itself drifted past some of them (cmake 4.x) and is what the numbers were measured with.
 RUN pip install -c containers/constraints-runtime.txt \
-      "cmake>=3.26.1,<4" "packaging>=24.2" "setuptools>=77.0.3,<80" "setuptools-scm>=8" \
-      "setuptools-rust>=1.9.0" wheel "jinja2>=3.1.6" ninja -r requirements/common.txt
+      cmake packaging setuptools setuptools-scm setuptools-rust wheel jinja2 ninja \
+      -r requirements/common.txt
 RUN VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1030 ROCM_PATH=/opt/rocm MAX_JOBS=${MAX_JOBS} \
     VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE} \
     pip install -e . --no-build-isolation --no-deps
