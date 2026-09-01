@@ -52,7 +52,7 @@ __global__ void rdna_ar_oneshot(const T* __restrict__ in, T* __restrict__ out,
                                 int* seqbuf,                      // device, local seq mirror
                                 unsigned* timeout,                // device, sticky abort
                                 int rank, int world, int n, long long max_elems,
-                                int nblocks) {
+                                int nblocks, int pace) {
   __shared__ int s_seq;
   __shared__ int s_abort;
   const int t = threadIdx.x, nt = blockDim.x, b = blockIdx.x;
@@ -65,11 +65,19 @@ __global__ void rdna_ar_oneshot(const T* __restrict__ in, T* __restrict__ out,
   const int p = seq & 1;
   const int gid = b * nt + t, gstride = nblocks * nt;
 
-  // 1. push our slice into every peer's staging slot for us (posted PCIe writes)
-  for (int j = 0; j < world; j++) {
-    if (j == rank) continue;
+  // 1. push our slice into every peer's staging slot for us (posted PCIe writes).
+  //    The peer order is staggered by rank, so at any instant each destination is being
+  //    written by ONE source instead of all W-1 at once; `pace` idles the wave ~64 clocks per
+  //    unit between strided stores to bound the burst rate (0 = off). Both are for the rest of
+  //    the machine: these pushes land in the receiving GPU's root complex, where other devices'
+  //    DMA completions queue behind them (2026-09-01: the SAS HBA on this box lives there).
+  for (int k = 1; k < world; k++) {
+    const int j = (rank + k) % world;
     T* dst = reinterpret_cast<T*>(peers.stage[j]) + ((long long)p * world + rank) * max_elems;
-    for (int i = gid; i < n; i += gstride) dst[i] = in[i];
+    for (int i = gid; i < n; i += gstride) {
+      dst[i] = in[i];
+      for (int q = 0; q < pace; q++) __builtin_amdgcn_s_sleep(1);
+    }
   }
   __syncthreads();
 

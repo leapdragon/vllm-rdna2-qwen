@@ -16,6 +16,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
 #include <string>
 
 #include "rdna_allreduce.cuh"
@@ -38,6 +40,8 @@ struct RdnaArState {
   int* seqbuf = nullptr;
   unsigned* timeout = nullptr;
   int64_t fast_calls = 0;
+  int blocks_cap = 0;            // VLLM_RDNA_AR_BLOCKS: cap on blocks per launch (0 = auto)
+  int pace = 0;                  // VLLM_RDNA_AR_PACE: s_sleep units between strided pushes
 };
 // One instance per process group (vLLM builds several GroupCoordinators over the same
 // ranks: world, TP, EP ...). Addressed by the handle rdna_ar_init returns.
@@ -58,6 +62,11 @@ at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_id
   const int64_t handle_id = g_ninst;
   TORCH_CHECK(world >= 2 && world <= RDNA_AR_MAX_WORLD, "rdna_ar: world must be 2..8");
   TORCH_CHECK(rank >= 0 && rank < world, "rdna_ar: bad rank");
+  // Fabric-friendliness knobs (2026-09-01). Fewer blocks = fewer concurrent PCIe push streams
+  // (T44: 20 KB at 16/4/1 blocks = 33/36/76 us -- the first step down is almost free); pace
+  // idles each wave between strided stores. See rdna_allreduce.cuh step 1.
+  if (const char* e = std::getenv("VLLM_RDNA_AR_BLOCKS")) g.blocks_cap = std::max(0, std::atoi(e));
+  if (const char* e = std::getenv("VLLM_RDNA_AR_PACE")) g.pace = std::max(0, std::min(127, std::atoi(e)));
   TORCH_CHECK(device_ids.numel() == world && device_ids.scalar_type() == at::kLong,
               "rdna_ar: device_ids must be int64[world]");
   g.rank = (int)rank;
@@ -138,7 +147,8 @@ at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in) {
   const int64_t bytes = (int64_t)n * in.element_size();
   // Measured on 4x V620 (T44): 20 KB 1/4/16 blocks = 76/36/33 us; 5 KB 1/4/8 = 27/15/18 us;
   // 80 KB 4/16/32 = 115/91/85 us. More blocks = more concurrent PCIe pushes.
-  const int nblocks = bytes <= 8192 ? 4 : (bytes <= 32768 ? 16 : 32);
+  int nblocks = bytes <= 8192 ? 4 : (bytes <= 32768 ? 16 : 32);
+  if (g.blocks_cap > 0 && nblocks > g.blocks_cap) nblocks = g.blocks_cap;
   const int threads = 256;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (in.scalar_type() == at::kHalf) {
@@ -146,13 +156,13 @@ at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in) {
     rdna_ar_oneshot<__half><<<nblocks, threads, 0, stream>>>(
         reinterpret_cast<const __half*>(in.const_data_ptr()),
         reinterpret_cast<__half*>(out.mutable_data_ptr()), g.peers, g.arrive,
-        g.seqbuf, g.timeout, g.rank, g.world, n, max_elems, nblocks);
+        g.seqbuf, g.timeout, g.rank, g.world, n, max_elems, nblocks, g.pace);
   } else {
     const long long max_elems = g.max_bytes / 4;
     rdna_ar_oneshot<float><<<nblocks, threads, 0, stream>>>(
         reinterpret_cast<const float*>(in.const_data_ptr()),
         reinterpret_cast<float*>(out.mutable_data_ptr()), g.peers, g.arrive,
-        g.seqbuf, g.timeout, g.rank, g.world, n, max_elems, nblocks);
+        g.seqbuf, g.timeout, g.rank, g.world, n, max_elems, nblocks, g.pace);
   }
   g.fast_calls++;
   return out;

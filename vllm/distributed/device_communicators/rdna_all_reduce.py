@@ -17,6 +17,10 @@ disables the instance on all ranks (a rank that bailed out of an ordered
 barrier loop deadlocked its peers in boot 4 of T44).
 
 Enabled by default on gfx10x for world sizes 2..8; VLLM_RDNA_AR=0 disables,
+VLLM_RDNA_AR_BLOCKS caps the blocks per launch and VLLM_RDNA_AR_PACE (0..127)
+idles each wave between strided pushes -- fabric-friendliness knobs (2026-09-01):
+fewer, paced push streams into the receiving GPU's root complex, at a few us per
+collective (T44: 20 KB at 16/4 blocks = 33/36 us). Peer order is always rank-staggered.
 VLLM_RDNA_AR_MAX_KB (default 512) bounds the fast path; larger tensors and
 other dtypes take the stock path.
 """
@@ -118,9 +122,8 @@ class RdnaOneShotAllReduce:
         dist.barrier(group=group)
         self.disabled = False
         logger.info(
-            "rdna_ar: one-shot all-reduce active (handle %d, rank %d/%d, devices %s, max %d KB)",
-            self.handle, self.rank, self.world_size, gathered, max_kb,
-        )
+            "rdna_ar: one-shot all-reduce active (handle %d, rank %d/%d, devices %s, max %d KB; blocks cap %s, pace %s)",
+            self.handle, self.rank, self.world_size, gathered, max_kb,, os.getenv("VLLM_RDNA_AR_BLOCKS", "auto"), os.getenv("VLLM_RDNA_AR_PACE", "0"))
 
     def _self_test(self, device: torch.device) -> str | None:
         """Three verified all-reduces on the fast path; returns an error string or None."""
