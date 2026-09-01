@@ -91,6 +91,14 @@ the prefault line's duration; check `free -g` (need ~35 GB headroom); check noth
 `PLE_OFFLOAD_PREFAULT=0`. Occasional in the first minute on a cold cache = benign; sustained =
 storage or RAM pressure, always.
 
+A specific, benign flavour of C seen on our own 125 GB host (2026-08-31): the sidecar prefault
+completes (`32.0 GB in 40–65 s`), but the **73 GB backbone load that follows evicts part of it**,
+so the first minutes of serving fault the n-gram rows back in from disk — the worker's periodic
+`PLE offload timing … lookup NN ms per request` line starts near 45 ms and falls to ~15–20 ms as
+the rows become resident, and decode climbs from ~50 to the recorded ~70 t/s. It happens equally
+on the host and in the container image. More RAM, or a second boot with a warm page cache, removes
+it; a short-lived `>5 s` warning during this window is not a fault.
+
 **D. `PLE offload worker did not complete launch N within 600 s (done=M)`** → (1) the worker
 crashed — find its traceback above (`PleOffloadWorker pid=…`); report *that*, not the timeout.
 (2) `done` climbing slowly → extreme storage latency, same as C. (3) `done` frozen with no

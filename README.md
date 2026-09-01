@@ -77,6 +77,22 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
    python tools/rdna2/bench.py 3 256     # expect ~60-65 tokens/s decode (MTP=0; ~60-72 with MTP=3)
    ```
 
+## Container image
+
+The whole stack is also published as an image — TheRock ROCm 7.14, PyTorch 2.12 / Triton 3.7 built
+for gfx1030, this fork built as docs/rdna2/README.md §3–4 prescribe — so a host needs only the
+`amdgpu` driver, Docker, four gfx103x cards and the two weight downloads:
+
+    docker run -d --network=host --device /dev/kfd --device /dev/dri \
+      --group-add "$(getent group render | cut -d: -f3)" --group-add "$(getent group video | cut -d: -f3)" \
+      --ipc=host --ulimit memlock=-1 -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+      -v "$PWD/models:/models" -v qwen38-compile-cache:/compile-cache \
+      ghcr.io/leapdragon/vllm-rdna2-qwen:latest
+
+Every knob of `tools/rdna2/serve-qwen38-flash-next.sh` works as `-e` (MTP, MAXLEN, VISION, …).
+Walkthrough, knobs, and how the image is built (and why its ROCm comes from TheRock's legacy
+tarball index): [containers/README.md](containers/README.md).
+
 ## Troubleshooting
 
 1. **Read [`docs/rdna2/TROUBLESHOOTING.md`](docs/rdna2/TROUBLESHOOTING.md) first.** This

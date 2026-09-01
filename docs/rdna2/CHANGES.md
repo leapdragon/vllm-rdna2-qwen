@@ -11,6 +11,15 @@ subjects carry the original patch numbers (`port: 000N …`, `T43 …`) so they 
 the experiment log in `RESULTS.md`. Nothing here is a config-only tweak: the numbers came
 from profiling inside the serving process and writing kernels for what the profile showed.
 
+**2026-08-31 — container image.** `containers/` builds the fork as a Docker image in two layers:
+a base (TheRock ROCm 7.14 from the public *legacy* multi-arch tarball index — 7.14.1 by default, the
+host-exact 7.14.0rc3 candidate as an alternative pin, both sha256-pinned — plus torch 2.12 / Triton
+3.7 / torchvision compiled for gfx1030 by `tools/rdna2/build-torch-rocm714.sh`) and a runtime image
+(this tree built per README §4, dependency pins captured from the validated venv, RDNA-op and
+PLE-offload verification at build time). The entrypoint is the serve script; weights mount at
+`/models`. TheRock publishes no gfx103X torch wheels, and the 7.14 line has moved off AMD's current
+channels — the published base image is the durable artifact. See containers/README.md.
+
 ## How to see exactly what this fork changed (on GitHub)
 
 The branch has three layers, and GitHub's compare view can show each:

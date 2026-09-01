@@ -15,6 +15,11 @@ boot.
 
 ---
 
+> **Shortcut:** all of §1–§4 below is prebuilt as a container image —
+> `ghcr.io/leapdragon/vllm-rdna2-qwen` ([containers/README.md](../../containers/README.md)). You still
+> need the hardware in §1, the kernel line, and the two downloads in §5; the image replaces the ROCm,
+> PyTorch and vLLM builds.
+
 ## 1. What you need
 
 | item | ours | notes |
