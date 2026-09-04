@@ -55,8 +55,20 @@ export NCCL_P2P_LEVEL="${P2P:-SYS}"
 export VLLM_ROCM_USE_AITER=0
 export TORCH_BLAS_PREFER_HIPBLASLT=0
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-# TunableOp: lookup-only; never autotune inside a serving process on this chip
-export PYTORCH_TUNABLEOP_ENABLED="${PYTORCH_TUNABLEOP_ENABLED:-0}"
+# TunableOp: LOOKUP-ONLY in production; never autotune inside a serving process (T31).
+# The shipped rows in tunableop/ (551 fp16 GEMM shapes, gfx1030, TP=4) are worth
+# +6% prefill at 3.3k and +13% at 30k vs untuned, decode unchanged, validate PASS
+# (measured 2026-09-04, matched A/B at the 170 W cap).
+# Offline retune only: TUNEOP_TUNING=1, cards capped LOW and the workload paced --
+# a tuning run at 220 W caps tripped the 15 A sub-breaker (all four cards at max,
+# no idle between GEMM candidates), and tuning also makes prefill bimodal and
+# perturbs greedy output, so its numbers mean nothing.
+_SERVE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_REPO_ROOT="$(cd "$_SERVE_DIR/../.." && pwd)"
+export PYTORCH_TUNABLEOP_ENABLED="${PYTORCH_TUNABLEOP_ENABLED:-1}"
+export PYTORCH_TUNABLEOP_TUNING="${TUNEOP_TUNING:-0}"
+export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
+export PYTORCH_TUNABLEOP_FILENAME="${TUNEOP_FILE:-$_REPO_ROOT/tunableop/tunableop_results.csv}"
 
 # --- this fork's features ---------------------------------------------------------------
 # n-gram table served from the int4 sidecar by a CPU worker process (CHANGES.md #3)
