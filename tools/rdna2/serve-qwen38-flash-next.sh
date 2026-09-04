@@ -45,7 +45,12 @@ export ROCR_VISIBLE_DEVICES="$GPUS"
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 # T41 stability stack for flat TP=4 on PCIe (with the kernel line in docs/rdna2/README.md #1)
 export HSA_NO_SCRATCH_RECLAIM=1
-export NCCL_P2P_LEVEL="${P2P:-PXB}"
+# RCCL P2P level. SYS (host-staged collectives) measured FASTER than PXB here: prefill
+# 738/735 t/s at 3.3k and 760 at 30k vs 682/679/703 on PXB (+8%), decode unchanged at
+# 61.5-61.9 t/s, validate PASS (2026-09-04, two independent boots, cap 220 W). Cross-die
+# P2P on this 2-die X399 traverses the weak inter-die fabric; host staging avoids it.
+# P2P=PXB restores the old behaviour.
+export NCCL_P2P_LEVEL="${P2P:-SYS}"
 # nothing from the CDNA world exists on gfx1030
 export VLLM_ROCM_USE_AITER=0
 export TORCH_BLAS_PREFER_HIPBLASLT=0
