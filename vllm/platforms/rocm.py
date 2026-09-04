@@ -823,43 +823,33 @@ class RocmPlatform(Platform):
         return True
 
     @classmethod
-    def device_id_to_physical_device_id(cls, device_id: int):
-        """ROCm: honor ROCR_VISIBLE_DEVICES, which the base map ignores.
+    def _amdsmi_index(cls, device_id: int) -> int:
+        """Map a logical device id to an amdsmi processor-handle index.
 
-        The base implementation is keyed on device_control_env_var
-        (CUDA_VISIBLE_DEVICES here, synced with HIP_VISIBLE_DEVICES) and falls
-        back to the identity map when it is unset. amdsmi enumerates ALL physical
-        GPUs (ROCR_VISIBLE_DEVICES is a runtime-level filter), so a serve that
-        selects cards with ROCR alone had every device-keyed lookup -- the
-        fused-MoE config filename, capability checks -- index physical card 0
-        (measured 2026-09-04: a TP=4 V620 serve looked up its MoE config as
-        device_name=AMD_Radeon_RX_6700_XT, the display card). The two filters
-        compose: HIP/CUDA_VISIBLE_DEVICES select INTO the ROCR-visible set.
-        Explicitly assigned physical ids keep precedence.
+        amdsmi enumerates ALL physical GPUs. ROCR_VISIBLE_DEVICES is a runtime-level
+        filter amdsmi never sees, so on a serve that selects cards with ROCR alone the
+        handle list is unfiltered and index 0 is the first physical GPU -- not the first
+        card the serve is using. Measured 2026-09-04 on 4x V620 (ROCR=1,2,3,4, display
+        card physical 0): the fused-MoE config was looked up as
+        device_name=AMD_Radeon_RX_6700_XT, so the kernel fell back to a default config
+        on the largest bucket of prefill time.
+
+        Only the amdsmi lookup is remapped: device_id_to_physical_device_id itself must
+        keep returning a torch-visible ordinal (torch only sees the ROCR-filtered set,
+        so returning a true physical id there raises "invalid device ordinal").
         """
-        from vllm.platforms.interface import get_assigned_physical_gpu_ids
-
+        base = cls.device_id_to_physical_device_id(device_id)
         rocr = os.environ.get("ROCR_VISIBLE_DEVICES")
-        if get_assigned_physical_gpu_ids() is not None or not rocr:
-            return super().device_id_to_physical_device_id(device_id)
-        rocr_ids = [int(x) for x in rocr.split(",") if x.strip()]
-        ctl = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
-            "CUDA_VISIBLE_DEVICES"
-        )
-        idx = int(ctl.split(",")[device_id]) if ctl else device_id
-        if idx >= len(rocr_ids):
-            raise IndexError(
-                f"device_id {device_id} -> visible index {idx} is out of range "
-                f"for ROCR_VISIBLE_DEVICES={rocr_ids}"
-            )
-        return rocr_ids[idx]
+        if not rocr:
+            return base
+        ids = [int(x) for x in rocr.split(",") if x.strip()]
+        return ids[base] if 0 <= base < len(ids) else base
 
     @classmethod
     @with_amdsmi_context
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
-        physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        handle = amdsmi_get_processor_handles()[physical_device_id]
+        handle = amdsmi_get_processor_handles()[cls._amdsmi_index(device_id)]
         asic_info = amdsmi_get_gpu_asic_info(handle)
         asic_info_device_id: str = asic_info["device_id"]
         if asic_info_device_id in _ROCM_DEVICE_ID_NAME_MAP:
