@@ -823,6 +823,38 @@ class RocmPlatform(Platform):
         return True
 
     @classmethod
+    def device_id_to_physical_device_id(cls, device_id: int):
+        """ROCm: honor ROCR_VISIBLE_DEVICES, which the base map ignores.
+
+        The base implementation is keyed on device_control_env_var
+        (CUDA_VISIBLE_DEVICES here, synced with HIP_VISIBLE_DEVICES) and falls
+        back to the identity map when it is unset. amdsmi enumerates ALL physical
+        GPUs (ROCR_VISIBLE_DEVICES is a runtime-level filter), so a serve that
+        selects cards with ROCR alone had every device-keyed lookup -- the
+        fused-MoE config filename, capability checks -- index physical card 0
+        (measured 2026-09-04: a TP=4 V620 serve looked up its MoE config as
+        device_name=AMD_Radeon_RX_6700_XT, the display card). The two filters
+        compose: HIP/CUDA_VISIBLE_DEVICES select INTO the ROCR-visible set.
+        Explicitly assigned physical ids keep precedence.
+        """
+        from vllm.platforms.interface import get_assigned_physical_gpu_ids
+
+        rocr = os.environ.get("ROCR_VISIBLE_DEVICES")
+        if get_assigned_physical_gpu_ids() is not None or not rocr:
+            return super().device_id_to_physical_device_id(device_id)
+        rocr_ids = [int(x) for x in rocr.split(",") if x.strip()]
+        ctl = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
+            "CUDA_VISIBLE_DEVICES"
+        )
+        idx = int(ctl.split(",")[device_id]) if ctl else device_id
+        if idx >= len(rocr_ids):
+            raise IndexError(
+                f"device_id {device_id} -> visible index {idx} is out of range "
+                f"for ROCR_VISIBLE_DEVICES={rocr_ids}"
+            )
+        return rocr_ids[idx]
+
+    @classmethod
     @with_amdsmi_context
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
