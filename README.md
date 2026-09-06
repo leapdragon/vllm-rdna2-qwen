@@ -1,3 +1,9 @@
+# WHAT'S HERE
+
+- vLLM fork for 4x Radeon Pro v620
+- Specifically targeting Qwen 3.8 Flash Next
+- Benching at **64 t/s decode** at MTP=0 and **1200 t/s prefill**
+
 # GETTING STARTED WITH THIS FORK
 
 This is a fork of [vLLM](https://github.com/vllm-project/vllm) that serves the
