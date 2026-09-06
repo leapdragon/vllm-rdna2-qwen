@@ -276,10 +276,41 @@ byte-identical, waiting generates no PCIe traffic, and a 5-minute soak (`soak_fa
 logged no `mpt2sas`/amdgpu events — this box audibly resets its tape drive under fabric
 stress, and twice that day cards dropped off the bus during generation.
 
+## 8b. Vision (2026-08-30)
+
+The checkpoint ships a full Qwen3-VL-style vision tower (27 blocks, hidden 1152, patch 16,
+2×2 merge; 333 `model.visual.*` tensors, 0.90 GB bf16 in shard 2) which `--language-model-only`
+had been skipping. `VISION=1` in the serve script enables it. Facts that matter on gfx1030:
+
+- The ViT attention backend resolves to **Torch SDPA** (no `flash_attn` package, AITER is
+  CDNA-only, the Triton-AMD FA subpackage is absent). SDPA's math path materialises the
+  N² attention matrix, and the image processor's default ceiling is `longest_edge: 16777216`
+  — the startup memory profiler builds a 16 MP dummy image and dies asking for **64 GiB**.
+  The serve script therefore caps images at `--mm-processor-kwargs '{"max_pixels": 1638400}'`
+  (≈1280×1280 → 6,400 patches → a ~1.3 GB attention matrix). Raise it only with a
+  linear-memory ViT backend.
+- The tower is **replicated on every TP rank** (not sharded): ~0.9 GB/card plus encoder
+  activations; at 196k context the KV pool drops from 541k to 405k tokens (2.06×).
+- Verified with `tools/rdna2/vision_test.py` (synthetic images, deterministic answers):
+  colour+shape, OCR ("SUNRISE 42" read exactly), counting (5 squares), quadrant colours,
+  two-images-which-has-the-triangle, an 1800×1400 star, a 5th image rejected with HTTP 400,
+  and text-only decode afterwards. TTFT 1.3–5 s per image prompt (encoder is eager);
+  text decode and the PLE consistency test are unaffected.
+- **Over-limit conversations are elided, not rejected** (`MM_ELIDE=1`, the default with
+  vision on). Stock vLLM 400s a prompt whose accumulated images exceed
+  `--limit-mm-per-prompt`; in an agent loop the history only grows, so after the Nth
+  screenshot every subsequent request fails and platforms that cannot rewrite past turns
+  (proxy-fronted chat UIs, Kilocode-style agents) are wedged. The renderer
+  (`_elide_over_limit_images`, `vllm/renderers/online_renderer.py`) now keeps the newest
+  `limit` images and replaces older image parts with a short text marker before templating,
+  preserving turn structure. Verified: 6 images at limit 4 → HTTP 200, log line
+  "Elided 2 over-limit image(s)", and the model demonstrably no longer sees the elided
+  (oldest) image while a 4-image control still does. `MM_ELIDE=0` restores the strict 400.
+
 ## 8c. PLE round-trip: doorbell, page-table populate, faster lookup — 2026-09-05
 
 Sized first (the "PLE offload host wait" log line is a host-thread wait overlapped with the
-previous forward, not a stall — see the research repo's 2026-09-05 notes): a
+previous forward, not a stall — see RESULTS.md, 2026-09-05): a
 `PLE_OFFLOAD_DEBUG_DELAY_MS` sweep gave a slope of 1.0 ms/step per ms of lookup latency (fully
 serial) and a decode profile put the exposure at ~1.0–1.4 ms of a 16.2 ms step, the gap that
 sits right before `__amd_rocclr_copyBuffer` (the result copy). Per-hop stamps
@@ -324,49 +355,93 @@ pickling under torch's `file_system` strategy copies the storage into a new mapp
 the data pointer (torch views follow, numpy views do not) — all four workers SIGSEGV'd at the
 first step after graph capture. Take numpy views of shared pages only after registration.
 
-## 8b. Vision (2026-08-30)
+## 8d. Prefill on gfx1030 — 2026-09-04/05
 
-The checkpoint ships a full Qwen3-VL-style vision tower (27 blocks, hidden 1152, patch 16,
-2×2 merge; 333 `model.visual.*` tensors, 0.90 GB bf16 in shard 2) which `--language-model-only`
-had been skipping. `VISION=1` in the serve script enables it. Facts that matter on gfx1030:
+Prefill had been left where the decode work put it (767–778 tok/s at a 3.3k prompt, 835 at 30k,
+measured inside the server at 170 W power caps). Two days of prefill-only work, every lever
+sized from in-server measurements, and every closed lever closed with data:
 
-- The ViT attention backend resolves to **Torch SDPA** (no `flash_attn` package, AITER is
-  CDNA-only, the Triton-AMD FA subpackage is absent). SDPA's math path materialises the
-  N² attention matrix, and the image processor's default ceiling is `longest_edge: 16777216`
-  — the startup memory profiler builds a 16 MP dummy image and dies asking for **64 GiB**.
-  The serve script therefore caps images at `--mm-processor-kwargs '{"max_pixels": 1638400}'`
-  (≈1280×1280 → 6,400 patches → a ~1.3 GB attention matrix). Raise it only with a
-  linear-memory ViT backend.
-- The tower is **replicated on every TP rank** (not sharded): ~0.9 GB/card plus encoder
-  activations; at 196k context the KV pool drops from 541k to 405k tokens (2.06×).
-- Verified with `tools/rdna2/vision_test.py` (synthetic images, deterministic answers):
-  colour+shape, OCR ("SUNRISE 42" read exactly), counting (5 squares), quadrant colours,
-  two-images-which-has-the-triangle, an 1800×1400 star, a 5th image rejected with HTTP 400,
-  and text-only decode afterwards. TTFT 1.3–5 s per image prompt (encoder is eager);
-  text decode and the PLE consistency test are unaffected.
-- **Over-limit conversations are elided, not rejected** (`MM_ELIDE=1`, the default with
-  vision on). Stock vLLM 400s a prompt whose accumulated images exceed
-  `--limit-mm-per-prompt`; in an agent loop the history only grows, so after the Nth
-  screenshot every subsequent request fails and platforms that cannot rewrite past turns
-  (litellm-fronted chat UIs, Kilocode-style agents) are wedged. The renderer
-  (`_elide_over_limit_images`, `vllm/renderers/online_renderer.py`) now keeps the newest
-  `limit` images and replaces older image parts with a short text marker before templating,
-  preserving turn structure. Verified: 6 images at limit 4 → HTTP 200, log line
-  "Elided 2 over-limit image(s)", and the model demonstrably no longer sees the elided
-  (oldest) image while a 4-image control still does. `MM_ELIDE=0` restores the strict 400.
+- **`NCCL_P2P_LEVEL=SYS` is now the serve script's default** (`P2P=` overrides): +8 % prefill,
+  decode unchanged. On this 2+2 PCIe layout RCCL's ring is already die-local
+  (`NCCL_GRAPH_DUMP_FILE` shows two cross-die hops, the minimum) with one channel over PHB,
+  so the remaining knobs do nothing: `NCCL_PROTO=LL` −12 %, 16/32 channels neutral,
+  `NCCL_NTHREADS` neutral, tree −3 %, `NCCL_BUFFSIZE` neutral. The collective log
+  (`NCCL_DEBUG_SUBSYS=COLL`) shows every prefill collective is a per-layer hidden-state
+  AllReduce (two per layer per chunk, ~10.5 MB), so EP-versus-TP cannot change the volume.
+- **TunableOp rows for the dense GEMM shapes ship in `tunableop/`** and the serve script
+  enables TunableOp **lookup-only** (`PYTORCH_TUNABLEOP_TUNING=0`; `TUNEOP_TUNING=1` for a
+  deliberate tuning boot). The top dense prefill kernel (`Cijk_… MT32x32x8`) went 734 → 259 ms
+  per 3.3k prefill on its own. Tuning mode must never run in production: it autotunes every
+  never-seen GEMM shape mid-request (prefill M is prompt-length dependent), which makes prefill
+  bimodal (771 vs 37 tok/s measured) and perturbs greedy output while it runs.
+- **`ROCR_VISIBLE_DEVICES` is honoured in the logical→physical device map** used for the amdsmi
+  device-name lookup (`vllm/platforms/rocm.py`). Tuned-kernel configs are keyed by device
+  name; with a different card at physical index 0 the lookup named the wrong device.
+- **A tuned fused-MoE config for the int4 wna16 Triton prefill kernel**
+  (`vllm/model_executor/layers/fused_moe/configs/E=128,N=640,device_name=AMD_Radeon_Pro_V620,dtype=int4_w4a16.json`):
+  the default 64×64×32 tiles, 4 warps, **`num_stages=1`** — prefill **767/835 → 1038/1127 tok/s
+  (+31 % / +35 %)**, decode unchanged (decode takes the CUDA `moe_wna16_gemm` path below
+  `M·topk/E_local ≤ 6`). Every larger K tile and the 128×128 tiles lost, some below untuned.
+  The file is keyed **per rank and packed**: `E` = experts ÷ EP, `N` = the packed `w2` N × 2 —
+  not the model-level 512/1280 — and `device_name` comes from amdsmi. The serve log says
+  `Using configuration from …` when it loads and `Using default MoE config … Config file not found
+  at <exact paths>` when it does not; the latter names the filename it wants. Re-tune if EP/TP or
+  the quantisation packing changes (`benchmarks/kernels/benchmark_moe.py` recognises Qwen4Exp).
+- **QSA launch tiles** (`vllm/models/qwen4_exp/amd/ops/qsa.py`): sparse prefill attention
+  BLOCK_N 64 → 32 with 4 warps, indexer (MQA scoring) BLOCK_N 32 → 128 with 8 warps: +3 % at
+  3.3k, +5 % at 30k. Sparse BLOCK_N = 128 is catastrophic; MQA `num_stages=1` neutral. Env
+  overrides remain for re-tuning: `VLLM_RDNA_QSA_MQA_BLOCK_N`, `VLLM_RDNA_QSA_MQA_WARPS`,
+  `VLLM_RDNA_QSA_MQA_STAGES`, `VLLM_RDNA_QSA_BLOCK_N`, `VLLM_RDNA_QSA_SPLITS`,
+  `VLLM_RDNA_QSA_WARPS`, `VLLM_RDNA_QSA_STAGES`; the boot log line `QSA launch params: …`
+  shows what took effect.
+- **The gfx1030 `num_stages` rule.** Triton's AMD backend defaults to `num_stages=2` (CUDA's is 3);
+  on this chip that halves occupancy and `num_stages=1` wins. Three instances so far: the prefill
+  attention kernels, the QSA partial kernel, and the fused-MoE int4 kernel above — the last one
+  hides differently, because its stages come from the config JSON, so *no JSON* means the
+  default. Never trust a tuning result whose load you did not verify in the serve log.
+
+Result at 170 W caps: prefill **767/778 → 1074–1107 at 3.3k (+40 %), 835 → 1178–1189 at 30k
+(+42 %)**; decode unchanged. Profile of a 3.3k prefill afterwards (3,278 ms of kernels): MoE
+27.6 %, RCCL 22.1 %, QSA 21.5 %, dense GEMM 21.1 %.
+
+Measured and closed: hipBLASLt (unsupported on gfx1030 — PyTorch logs "Attempting to use
+hipBLASLt on an unsupported architecture" and falls back to hipBLAS; rocBLAS already runs the
+dense GEMMs at 34.4 TFLOP/s ≈ 76–93 % of fp16 peak); `--max-num-batched-tokens` (2048 is the
+optimum: 1024 −15 % / −27 %, 4096 −5 % / −10 %); `compile_sizes: [2048]` (crashes: the runner
+slices a `[3, 2049]` MRoPE positions buffer and Inductor's static-stride guard wants `[3, 2048]`
+contiguous — root-caused in `gpu_model_runner.py`, not fixed). Short-prompt time-to-first-token
+has a ~0.3 s floor that is **host-dispatch-bound**: a 40-word prompt has ~0.17 s of GPU work
+per rank and the rest is the CPU issuing ~3,500 eager launches through Inductor wrappers and
+custom-op dispatch across 48 layers while the ranks wait on each other; long prefill is 91 %
+GPU-busy. Graph capture (or launch fusion) for small prefill batches is the lever there.
 
 ## 9. What was measured but not adopted
 
 - YTILE=2 (two rows per wave) and LDS-staged activations for `gemv_f16_rdna2`: no gain.
 - A 4-deep unroll of the MoE int4 GEMV: no gain (not memory-level-parallelism bound).
-- `NCCL_P2P_LEVEL=SYS`: no gain; cards read 99 % busy while idle.
+- `NCCL_P2P_LEVEL=SYS`: no gain at decode (2026-08-29); re-measured for prefill 2026-09-04 at +8 %
+  and made the default (§8d).
+- A RAM-contiguous copy of the n-gram table in the sidecar: gather 27 → 9 µs per step for an
+  unevictable 32 GB of host memory (§8c).
+- Hand-written GDN decode kernels: GDN is 0.36 ms of a 15.6 ms decode step (§10), so even an
+  infinite speed-up buys ≤ 0.4 ms.
+- An MoE tile sweep beyond `num_stages=1`: every K ≥ 64 and 128×128 tile lost (§8d).
 - `num_speculative_tokens` 4: +0.4 accepted tokens/step for +1 draft forward — a wash at 256
   tokens, +2 % on 1024-token generations.
 
-## 10. What is left (per ~29 ms step)
+## 10. What is left
 
-All-reduce 4.9 ms (the kernel is 33 µs; the rest is waiting for the slowest rank — EP
-imbalance), MoE int4 GEMV 4.3 ms (per-block LDS staging of activations suspected), ~9 ms of
-launch bubbles over 1,788 kernels (the GDN core op's internal copies are the next ~250), the MTP
-head's unquantised MoE (0.6 ms), lm_head int8 at 49 % of the bandwidth ceiling, prefill
-(500–750 t/s warm; 100–180 t/s on first touch of a context length while sidecar pages are cold).
+**Decode (per 15.6 ms step at MTP=0, 2026-09-05 kernel budget, rank 0):** kernels 14.6 ms —
+MoE decode kernels ~4.8 (int4 GEMV family + `topkGating`), dense int8 GEMV 2.6 (158 launches),
+the one-shot all-reduce 2.5 (97 launches, includes peer spin), norm/elementwise ~1.1, QSA 0.4,
+GDN recurrent 0.4, the lm_head logits AllGather 0.08 (one RCCL call per step, 62,080 fp16 per
+rank × 4 = the 248,320 vocabulary). Host-side idle ≈ 0.5 ms, nearly all the PLE round-trip
+(§8c; a zero-copy read of the pinned result would drop the per-step H2D copy, ≤ 0.3 ms more).
+With MTP=3 the same fixed per-step costs amortise over ~2.4 accepted tokens per step but the
+drafter's forwards and the larger verify batch (each extra token pulls its own experts) absorb
+the gain at typical acceptance — choose by measured acceptance, not by default.
+
+**Prefill (per 3.3k prompt):** MoE, RCCL, QSA and the dense GEMMs at roughly a quarter each
+(§8d); the all-reduces are per-layer hidden-state exchanges over PCIe that no RCCL knob improves
+at this topology; `compile_sizes` static shapes are blocked by the positions-buffer stride
+(§8d); short-prompt TTFT is host-dispatch-bound (§8d).

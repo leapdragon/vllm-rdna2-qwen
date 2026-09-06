@@ -77,7 +77,7 @@ sh_run "lscpu (model/cores/NUMA)" "lscpu | grep -E 'Model name|^CPU\(s\)|Socket|
 run "free -g" free -g
 sh_run "swap / overcommit / memlock / ptrace" "echo \"swap devices: \$(swapon --show --noheadings 2>/dev/null | wc -l)\"; echo vm.overcommit_memory=\$(cat /proc/sys/vm/overcommit_memory); echo memlock ulimit=\$(ulimit -l); echo ptrace_scope=\$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"
 sh_run "IOMMU" "ls /sys/class/iommu 2>/dev/null | head; journalctl -k -b --no-pager 2>/dev/null | grep -iE 'AMD-Vi|DMAR|iommu' | head -5"
-sh_run "tmux / systemd user" "tmux -V 2>/dev/null; systemctl --user is-system-running 2>/dev/null; loginctl show-user \$USER -p Linger 2>/dev/null"
+sh_run "systemd user session" "systemctl --user is-system-running 2>/dev/null; loginctl show-user \$USER -p Linger 2>/dev/null"
 run "uptime" uptime -p
 
 # ---- 2. PCIe ------------------------------------------------------------------------------
@@ -137,8 +137,8 @@ for k in MTP MAXLEN VISION GPUUTIL CHAT_KWARGS COMPILE_CACHE_OFF DENSE_INT8 TOOL
   v="SC_$k"; [ -n "${!v+x}" ] && DRYENV+=("$k=${!v}")
 done
 run "serve script dry run (what would launch, with the site config applied)" "${DRYENV[@]}" bash -c "cd '$REPO' && tools/rdna2/serve-qwen38-flash-next.sh 2>&1 | head -60"
-sh_run "running vLLM processes (pid ppid rss-MB elapsed cmd)" "ps -eo pid,ppid,rss,etime,args | grep -E 'openai\.api_server|VLLM::|ple_offload|spawn_main|manage-gpu-fans|llama-server|vllm serve' | grep -vE 'grep|system-report' | awk '{printf \"%s %s %.0fMB %s \", \$1, \$2, \$3/1024, \$4; for(i=5;i<=NF&&i<12;i++) printf \"%s \", \$i; print \"\"}'"
-sh_run "duplicate-instance check" "for pat in 'openai\.api_server' 'manage-gpu-fans' 'PleOffloadWorker|ple_offload/worker'; do n=\$(ps -eo args | grep -E \"\$pat\" | grep -vcE 'grep|system-report'); echo \"\$pat: \$n\"; done"
+sh_run "running vLLM processes (pid ppid rss-MB elapsed cmd)" "ps -eo pid,ppid,rss,etime,args | grep -E 'openai\.api_server|VLLM::|ple_offload|spawn_main|llama-server|vllm serve' | grep -vE 'grep|system-report' | awk '{printf \"%s %s %.0fMB %s \", \$1, \$2, \$3/1024, \$4; for(i=5;i<=NF&&i<12;i++) printf \"%s \", \$i; print \"\"}'"
+sh_run "duplicate-instance check" "for pat in 'openai\.api_server' 'PleOffloadWorker|ple_offload/worker'; do n=\$(ps -eo args | grep -E \"\$pat\" | grep -vcE 'grep|system-report'); echo \"\$pat: \$n\"; done"
 sh_run "running api_server environment (filtered)" "p=\$(pgrep -f 'openai\.api_server' | head -1); if [ -n \"\$p\" ]; then tr '\0' '\n' < /proc/\$p/environ | grep -E '^(VLLM_|ROCR_|HSA_|HIP_|NCCL_|PLE_|MM_|PYTORCH_|TORCH_|FLASH_|MTP|MAXLEN|GPUUTIL|VISION)' | sort; ps -o args= -p \$p | tr ' ' '\n' | grep -nE '^--' | head -40; else echo '(no server running)'; fi"
 sh_run "listening ports" "ss -ltnp 2>/dev/null | grep -E ':$PORT |python' | head -5"
 
@@ -154,7 +154,7 @@ fi
 # ---- 9. serve log digest ------------------------------------------------------------------------
 section "9. serve log digest"
 if [ -z "$LOG" ]; then
-  LOG="$(ls -t "$REPO"/logs/host-serve-*.log "$HOME"/repos/vllm-rdna2/logs/host-serve-*.log 2>/dev/null | head -1)"
+  LOG="$(ls -t "$REPO"/logs/host-serve-*.log "$REPO"/logs/*.log 2>/dev/null | head -1)"
 fi
 if [ -n "$LOG" ] && [ -f "$LOG" ]; then
   echo "log: $LOG ($(du -h "$LOG" | cut -f1), modified $(stat -c %y "$LOG" | cut -c1-19))" >> "$TMP"

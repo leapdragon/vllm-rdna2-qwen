@@ -9,7 +9,7 @@
 #
 # Knobs (env): GPUS (ROCR device ids, default 1,2,3,4), PORT (8000), MTP (3), GPUUTIL (0.90),
 #   DENSE_INT8 (1), EAGER (unset), PROFILE (unset), TRACES (dir for torch-profiler traces),
-#   COMPILE_CACHE_OFF (1), P2P (PXB), MAXLEN (131072; the model allows 262144 and the KV pool
+#   COMPILE_CACHE_OFF (1), P2P (SYS; NCCL_P2P_LEVEL, +8% prefill), MAXLEN (131072; the model allows 262144 and the KV pool
 #   at GPUUTIL 0.86 held ~177-197k tokens, i.e. 1.35-1.5 concurrent 128k requests), EXTRA_ARGS,
 #   TOOLS (1: OpenAI tool calling with tool_choice "auto" for agentic clients such as Kilocode /
 #   Cline / Roo; the model's chat template emits Qwen3-Coder-style <function=…><parameter=…> XML,
@@ -92,8 +92,16 @@ if [ -n "${CHAT_KWARGS:-}" ]; then
 fi
 TOOLARGS=()
 if [ "${TOOLS:-1}" = "1" ]; then
-  TOOLARGS=(--enable-auto-tool-choice --tool-call-parser "${TOOL_PARSER:-qwen3_coder}"
-            --reasoning-parser "${REASONING_PARSER:-qwen3}")
+  TOOLARGS=(--enable-auto-tool-choice --tool-call-parser "${TOOL_PARSER:-qwen3_coder}")
+  # REASONING_PARSER= (explicitly empty) turns OFF vLLM-side reasoning splitting: thinking
+  # text then arrives inline in `content` instead of `reasoning_content`. Note that vLLM's
+  # chat endpoint still strips the template's </think> terminator from the content stream
+  # (measured 2026-09-04), so a client cannot split on it either way.
+  # ${VAR-default}, NOT ${VAR:-default}: the ':-' form replaces an *empty* value with the
+  # default, making disable impossible.
+  if [ -n "${REASONING_PARSER-qwen3}" ]; then
+    TOOLARGS+=(--reasoning-parser "${REASONING_PARSER-qwen3}")
+  fi
 fi
 VISIONARGS=(--language-model-only --skip-mm-profiling)
 if [ "${VISION:-0}" = "1" ]; then

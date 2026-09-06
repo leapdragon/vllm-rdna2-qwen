@@ -87,7 +87,8 @@ def gpu_busy():
             vals.append(int(open(p).read()))
     return vals
 
-log = args.log or (sorted(glob.glob(os.path.expanduser("~/repos/vllm-rdna2/logs/host-serve-*.log")),
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+log = args.log or (sorted(glob.glob(os.path.join(_REPO, "logs", "host-serve-*.log")),
                           key=os.path.getmtime) or [None])[-1]
 dups0 = dup_count(log) if log else -1
 ok = True

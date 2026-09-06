@@ -10,11 +10,11 @@ import os, sys, time
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.expanduser("~/repos/vllm-rdna2-qwen"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from vllm.v1.ple_offload.worker import _PleQuantTable  # noqa: E402
 
-quant_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser(
-    "~/repos/vllm-rdna2-qwen/models/qwen38-flash-next-ple/ples_int4")
+quant_dir = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
+    "VLLM_PLE_QUANT_DIR", "models/qwen38-flash-next-ple/ples_int4")
 num_reqs = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 HEADS, WIDTH, ROWS = 16, 160, 320001536
 tbl = _PleQuantTable(quant_dir, ROWS, WIDTH)

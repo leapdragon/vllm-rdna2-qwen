@@ -1,7 +1,7 @@
 # Measured results — Qwen3.8-Flash-Next on 4× Radeon PRO V620 (T42–T46)
 
-These are the experiment-log entries, verbatim, from the campaign that produced this fork
-(`docs/TESTS_RESULTS.md` in the research repository). "T-numbers" are experiment ids; "boot N"
+These are the experiment-log entries, verbatim, from the campaign that produced this fork.
+"T-numbers" are experiment ids; "boot N"
 is one server restart. Every number was measured inside the serving process on this hardware.
 Read `CHANGES.md` for what each change is and why, and `README.md` for how to reproduce.
 
@@ -21,7 +21,7 @@ int4 PLE sidecar, `language_model_only`, `skip_mm_profiling`, BATCHTOK 2048.
 | + MTP=3 | **30.96** | **29.19** | **28.76** | **1.9x more; 5.6x total** |
 
 **llama.cpp on this same box and model: 29.05 t/s at -c 4096, 30.10 t/s with the
-full server flag set** (`~/repos/llama.cpp-qwen4exp-official/LOCAL-CHANGES.md`).
+full server flag set** (its own tuned launch configuration).
 So vLLM now matches it at short context and, unlike that measurement (taken at
 -c 4096), holds 28.76 t/s at 41k.
 
@@ -233,3 +233,61 @@ speculative decoding; draft acceptance 70.7 %; decode **60–72 t/s** at 256–1
 roughly a wash with MTP=0's 62–65 at this acceptance rate, because the honest n-gram wait now
 amortises over ~2.9 tokens per step but the drafter's extra forwards absorb the gain. MTP is
 correct on the current protocol; choose it only when your workload's acceptance is high.
+
+## Prefill campaign and decode round-trip (2026-09-04/05, TheRock 7.14 host build, 170 W caps)
+
+Power caps were 170 W per card for everything in this section (232 W earlier in this file);
+all numbers from inside the serving process, MTP=0, `tools/rdna2/bench.py` and a fresh-prompt
+prefill harness. Changes: CHANGES.md §8c–§8d.
+
+| prefill, tok/s | 3.3k prompt (×2) | 30k prompt |
+|---|---|---|
+| start of 2026-09-05 (P2P=SYS + TunableOp rows already in) | 767 / 778 | 835 |
+| + tuned int4 MoE config, `num_stages=1` | 1038 / 1026 | 1127 |
+| + QSA launch tiles (**shipped**) | 1074–1107 / 1070–1098 | 1178–1189 |
+| | **+40 %** | **+42 %** |
+
+Closed with data the same day: hipBLASLt (unsupported on gfx1030), `--max-num-batched-tokens`
+1024 (−15 % / −27 %) and 4096 (−5 % / −10 %), every RCCL protocol/channel/thread/tree/buffer
+knob, ring order (already die-local), EP-vs-TP (all collectives are hidden-state all-reduces),
+`compile_sizes: [2048]` (crashes, root-caused). Profile of a 3.3k prefill after the changes:
+MoE 27.6 %, RCCL 22.1 %, QSA 21.5 %, dense GEMM 21.1 % of 3,278 ms.
+
+**Decode: the n-gram sidecar round-trip.** Sizing first — injecting a delay into every sidecar
+lookup (`PLE_OFFLOAD_DEBUG_DELAY_MS`) gave a slope of 1.0: the round-trip is fully serial.
+
+| injected delay | decode t/s (×3) | ms/step |
+|---|---|---|
+| 0 ms | 61.8 / 61.9 / 62.0 | 16.16 |
+| 2 ms | 54.4 / 54.5 / 54.6 | 18.34 |
+| 5 ms | 46.6 / 46.8 / 46.8 | 21.39 |
+| 10 ms | 37.9 / 38.0 / 38.0 | 26.35 |
+
+A decode profile put the kernel time at 14.57 ms of the 16.16 ms step and the once-per-step
+gap right before the result copy; per-hop stamps (`PLE_OFFLOAD_DEBUG_HOPS=1`) split the 1.42 ms
+round-trip and the rework in CHANGES.md §8c took it to 0.49 ms:
+
+| hop (median µs) | before (mean) | after |
+|---|---|---|
+| D2H done → request sent | 303 | 34 |
+| sent → sidecar received | 172 | 5 |
+| received → lookup done | 623 | 181 |
+| lookup → published | 41 | 23 |
+| published → seen by the model thread | 105 | 73 |
+| seen → copy enqueued | 172 | 117 |
+| **total** | **1,416** | **485** |
+
+| decode, 256 tokens ×3, MTP=0 | t/s |
+|---|---|
+| before | 61.8 / 61.9 / 62.0 |
+| after (**shipped**; prefill 1107 / 1070 / 1178 unchanged; validate pass) | 64.07 / 64.09 / 64.00 |
+
+In-server bit check: `PLE_OFFLOAD_FUSED_CHECK=1` compared 995 fused lookups of 1,000 requests
+against the reference path — 0 mismatches, max abs diff 0.
+
+**Decode kernel budget (rank 0, ms per 14.57 ms of kernels):** dense int8 GEMV 2.58 (158×),
+MoE int4 decode kernels 2.60 + `moe_w13_silu_gemv` 0.92 + `moe_w2_gemv` 0.87 + `topkGating`
+0.43, one-shot all-reduce `rdna_ar_oneshot` 2.47 (97×), the lm_head logits AllGather 0.08,
+GDN `fused_recurrent_gated_delta_rule` 0.36, QSA sparse + MQA 0.37, `copyBuffer` 0.11 (71×).
+Short-prompt time-to-first-token (40-word prompt, 0.31–0.37 s): ~0.17 s of GPU work per rank,
+the rest host-side launch dispatch (CHANGES.md §8d).

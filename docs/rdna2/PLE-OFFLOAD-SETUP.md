@@ -102,7 +102,11 @@ error about max seq len vs KV cache size, this is it, not a PLE problem.
 Bound IPC address ipc:///tmp/…; waiting for 4 GPU worker registration(s).
 PLE quant table: group16_int4_fp16scale_lownibblefirst, 128 shards mmapped from …/ples_int4
 GPU worker N registered (dp_rank=0, tp_rank=N, layers=['…layers.1.ple.ple_embedding'])   × 4
-PLE sidecar prefaulted into the page cache: 32.0 GB in ~30 s        (SSD; minutes on slow disk)
+Busy-loop started.
+PLE doorbell: polling shared pages for 1 DP rank(s); ZMQ still accepted.
+PLE sidecar populated (page cache + page tables): 32.0 GB in ~2 s   (warm cache; minutes from a cold disk;
+                                                                     reads `prefaulted … ~30 s` on kernels
+                                                                     without MADV_POPULATE_READ)
 … torch.compile (~12 min cold, ~1 s warm) … CUDA graph capture …
 GPU KV cache size: NNN,NNN tokens
 Application startup complete.

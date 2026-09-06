@@ -294,6 +294,46 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   under 16 MB sit in the Infinity Cache in a timing loop and read as 800 GB/s. Warm the card;
   believe the DRAM-streaming number.
 
+### 5b. Traps found during the prefill and decode round-trip work (2026-09-04/05)
+
+- **A tuned fused-MoE config "did nothing".** The serve log says which file loaded: `Using
+  configuration from …` means the JSON was found; `Using default MoE config … Config file not found
+  at <paths>` names the exact filename it wanted. The key is **per rank and packed** (`E` =
+  experts ÷ EP, `N` = packed `w2` N × 2, `device_name` from amdsmi — which needs the
+  `ROCR_VISIBLE_DEVICES` device-map fix in this fork when another card sits at physical index 0).
+  `VLLM_TUNED_CONFIG_FOLDER` does reach the workers; `/proc/<pid>/environ` shows exec-time state
+  and misleads. Never trust a tuning result whose load you did not verify.
+- **The first boot of a new compile configuration looks wedged.** A changed
+  `--max-num-batched-tokens`, `compile_sizes`, etc. compiles for 1.5–3 min and then spends 6+
+  minutes in a silent Triton-JIT first run (only `tl.make_block_ptr` warnings and the
+  `shm_broadcast … 60 seconds` INFO spam). A 10-minute health timeout kills it and it looks like a
+  hang; allow 30 minutes for a first boot. The second boot hits the saved cache and is fast.
+- **`compile_sizes: [2048]` crashes** with `assert_size_stride(arg…, (3, 2048), (2048, 1))`: the
+  runner passes `[:, :2048]` of a `[3, 2049]` MRoPE positions buffer and the static-shape guard
+  wants a contiguous stride (`gpu_model_runner.py`; the text-only path still routes positions
+  through MRoPE). Not fixed.
+- **`PLE offload host wait over N launches: … wait X ms per step` is not a GPU stall.** It is a
+  host-thread wait that overlaps the previous forward under async scheduling, averaged over every
+  launch in the window — a window holding a 30k prefill reads 50–60 ms; a decode-only window reads
+  ~11 ms; the actual exposed cost was ~1.4 ms and is now ~0.5 ms (CHANGES.md §8c). To size it,
+  use `PLE_OFFLOAD_DEBUG_DELAY_MS=<n>` (slope of ms/step vs injected delay) and
+  `PLE_OFFLOAD_DEBUG_HOPS=1` (per-hop medians every 500 decode launches).
+- **All four workers SIGSEGV at the first step after graph capture, right after touching the PLE
+  connector.** A numpy view of a shared CPU tensor taken *before* the registration pickle dangles:
+  pickling under torch's `file_system` sharing strategy copies the storage into a new mapping and
+  swaps the data pointer; torch views follow, numpy views do not. Take numpy views of shared pages
+  only after registration.
+- **Two Python threads spinning in one worker starve each other for the GIL.** A wait loop that
+  spins in the model thread delayed the request thread's hand-off by the 5 ms switch interval
+  (a hop went 0.3 → 1.5 ms, decode fell to 55 t/s). The doorbell path now does the whole hand-off
+  on the model thread, and every spin loop yields with `time.sleep(0)` every 64 iterations.
+- **`curl -X POST /stop_profile` may never return** although every rank has already written its
+  trace (seen with 4 × 70 MB decode traces). Always pass `--max-time`; the traces on disk are
+  complete once their sizes stop changing.
+- **The torch profiler inflates host-side gaps.** It adds ~4.4 ms/step of launch overhead on a
+  16 ms decode step (with Python stack tracing on, more). Trust kernel durations (GPU-timestamped)
+  and compute idle as the untraced step minus kernel time; do not read idle off the trace.
+
 ## 6. Meta-lessons (the generalizable part)
 
 - **Keep the KFD homogeneous.** Only put GPUs in the machine that your

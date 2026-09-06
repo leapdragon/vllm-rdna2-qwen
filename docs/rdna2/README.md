@@ -26,7 +26,7 @@ boot.
 |---|---|---|
 | GPUs | 4× Radeon PRO V620 (Navi 21, gfx1030, 32 GB each) | Any 4 gfx103x cards with 32 GB should behave the same; 24 GB cards will not fit the 18.3 GiB/card backbone plus KV |
 | Host | Ubuntu (kernel 7.0), 32 cores, 128 GB RAM, ~250 GB free disk | RAM: the 30 GB n-gram sidecar must sit in page cache. Disk: 73 GB backbone + 30 GB sidecar + ~40 GB of build trees |
-| ROCm | **TheRock 7.14** runfile install at `/opt/rocm` (→ `/opt/TheRock/rocm/core-7.14`) | `rocminfo` must list your cards as `gfx1030`. Nothing else in ROCm needs to be installed; do **not** mix in apt ROCm packages |
+| ROCm | **TheRock 7.14** install, reachable as `/opt/rocm` (a symlink to wherever the tarball unpacked is fine) | `rocminfo` must list your cards as `gfx1030`. Nothing else in ROCm needs to be installed; do **not** mix in apt ROCm packages |
 | Kernel command line | `amdgpu.pcie_gen_cap=0x00070007 amdgpu.aspm=0 amdgpu.runpm=0 amdgpu.gpu_recovery=1 amdgpu.noretry=1 amd_iommu=on iommu=pt` | The flat-TP=4 stability stack. Without it, four of these cards under tensor parallelism drop off the PCIe bus (§4 of TROUBLESHOOTING) |
 | Python | 3.12 via `uv` (`/snap/bin/uv` or `pip install uv`) | 3.13/3.14 have no working torch build path here |
 | Tools | git, cmake ≥ 3.26, ninja, gcc 13+, `hf` (Hugging Face CLI) | |
@@ -156,7 +156,13 @@ merged into every request's `chat_template_kwargs`, request values win; this tem
 `TOOLS=0` (off: tool calling — on by default, `--enable-auto-tool-choice --tool-call-parser
 qwen3_coder --reasoning-parser qwen3`, which is what agentic clients such as Kilocode, Cline or
 Roo need for `tool_choice: "auto"`; the model's template emits Qwen3-Coder-style
-`<function=…><parameter=…>` XML and `<think>` blocks land in `reasoning_content`).
+`<function=…><parameter=…>` XML and `<think>` blocks land in `reasoning_content`;
+`REASONING_PARSER=` (empty) turns the reasoning parser off so thinking text arrives inline in
+`content` — note vLLM's chat endpoint still strips the template's `</think>` marker, so a client
+cannot split on it), `P2P=` (`NCCL_P2P_LEVEL`, default `SYS`: +8 % prefill on a 2+2 PCIe layout,
+CHANGES.md §8d), `TUNEOP_TUNING=1` (TunableOp *tuning* boot — never in production, CHANGES.md
+§8d; the shipped rows in `tunableop/` are used lookup-only by default), and the QSA re-tuning
+overrides `VLLM_RDNA_QSA_*` (CHANGES.md §8d).
 
 ### Switching MTP and thinking defaults — plain vLLM arguments, no code changes
 
@@ -195,14 +201,16 @@ Greedy sanity: `python tools/rdna2/validate.py` (chat completions, `enable_think
 temperature 0): `17 * 23` → `391`, capital of Australia → `Canberra`, first five primes →
 `2, 3, 5, 7, 11`, and a "why is the sky blue" that must mention scattering.
 
-What you should see (our numbers, `RESULTS.md`):
+What you should see (our numbers, `RESULTS.md`; the MTP=3 rows are the 2026-08-30 re-measure on
+the corrected n-gram wait, the MTP=0 and prefill rows are 2026-09-05 at 170 W power caps):
 
-| | decode t/s |
+| | |
 |---|---|
-| 256 tokens, ×3 | 98 / 105 / 96 on the host build (98 / 101 / 97 in the validated container) |
-| 1024 tokens | 106 (95 container) |
-| 2.9k / 10.6k / 27k context | 78 / 108 / 88 (acceptance-driven; no context slope) |
-| per MTP step | ~29 ms, ~1,800 kernels |
+| decode, MTP=0, 256 tokens ×3 | **64.0 / 64.1 / 64.0 t/s** (15.6 ms/step, 14.6 ms of kernels) |
+| decode, MTP=3, 256–1024 tokens | 60–72 t/s, acceptance-driven (70 % on the test prompts) |
+| prefill, fresh 3.3k / 30k prompt | **1.07–1.11k / 1.18k tok/s** |
+| time-to-first-token, 40-word prompt | 0.31–0.37 s (host-dispatch-bound, CHANGES.md §8d) |
+| 2.9k / 10.6k / 27k context, MTP=3 | 78 / 108 / 88 t/s (2026-08-29, before the wait fix; no context slope) |
 
 After every run: `journalctl -k | grep amdgpu` should show nothing new, and `rocm-smi --showtemp`
 should be under 60 °C. Container logs are UTC and the host journal is local time — convert

@@ -10,7 +10,7 @@
 > with a pointer to the relevant section here.
 >
 > **Scope boundary.** Application-level results (tokens/sec, cache hit rates, model configs, which
-> vLLM patch does what) belong in `STATE.md` and `TESTS_RESULTS.md`, *not* here. This file is about
+> vLLM patch does what) belong in `RESULTS.md` and `CHANGES.md`, *not* here. This file is about
 > the silicon. Where §11 cites application numbers, it does so only to express them as a percentage
 > of a hardware ceiling, and marks them as such.
 
@@ -252,6 +252,17 @@ The hardware does **not** need many workgroups to saturate memory. So the attent
 
 **Design consequence:** raising the split-K/segment count was a workaround, not the cure. The cure is more independent loads in flight *per wave* — which is exactly what a register-accumulator vector formulation gives (many independent per-lane loads) and what a `tl.dot` staged-tile formulation does not. This is now the primary argument for the rewrite, and it is stronger than the "no matrix unit" argument.
 
+### 6b. Triton pipelining stages on gfx1030 — `num_stages=1` (2026-09-05)
+
+Triton's AMD backend defaults to `num_stages=2` (CUDA's is 3). On this chip the extra stage
+halves occupancy and loses every time it has been measured: prefill attention (2×), the QSA
+partial kernel, and the fused-MoE int4 prefill kernel (+31 % / +35 % prefill from that one
+setting, CHANGES.md §8d). Pass `num_stages=1` explicitly in any Triton kernel tuned for
+gfx1030, and remember that kernels whose stages come from a config JSON (fused MoE) fall back
+to the default when the JSON is not found — verify the load in the serve log. hipBLASLt is
+unsupported on gfx1030 (no Tensile data); rocBLAS runs the dense GEMMs at 34.4 TFLOP/s,
+76–93 % of fp16 peak, so the dense-GEMM library is not a lever here.
+
 ## 7. Scheduling & issue
 
 - 1 instruction issue per SIMD32 per clock; no VOPD dual-issue (that is RDNA3) [published].
@@ -358,6 +369,8 @@ The hardware does **not** need many workgroups to saturate memory. So the attent
 | Server-level graph capture | ⚠️ **Corrected 2026-08-20 [T26].** The 2× FULL_AND_PIECEWISE regression (T7) **does not reproduce** — it dated from the throttled, pre-Exllama-dispatch era. Re-measured with the current stack, FULL_DECODE_ONLY and FULL_AND_PIECEWISE are **within 0.1%** of each other (28.27 vs 28.26 ms/token), and enabling compilation (`mode:3`, VLLM_COMPILE) is worth **+20%**. `mode:0` was adopted on the strength of the obsolete result and cost ~20% for months. | |
 | **rocBLAS fp16 GEMV at real layer shapes** [probed, T-A2] | 5120×5120 **443.9 GB/s (87.7%)** · 5120×17408 260.7 (51.5%) · lm_head 5120×248320 **277.7 (54.9%)**. **M=1 through M=8 are identical to within 1%** — already memory-bound, so batching to M=8 is free. The two wide shapes leave ~1.8× on the table; the fp16 lm_head is 15.3% of per-token bytes, so its 54.9% efficiency is worth ~4 ms/token at TP=1. | |
 | **Cooperative grid barrier** [probed, T-O6] | **0.43–0.53 µs** at 72–144 workgroups (2.89 µs at 36). Persistent single-device kernels are viable. *Cross-device persistent designs are not — see T-N2.* | |
+
+| **Application level, 2026-09-05** (this fork, TheRock 7.14, 4× V620 TP=4/EP=4, 170 W caps) | prefill **1.07–1.11k tok/s at 3.3k, 1.18k at 30k** · decode **64 t/s at MTP=0** (15.6 ms/step, 14.6 ms of kernels) · RESULTS.md | |
 
 **Consequence:** the attention kernel is at **17% of what this silicon does**, not the ~35% previously believed — the headroom is roughly 6×, not 3×. Weight streaming at 70% is respectable; TP=2's 49% per card reflects comms overhead and less work per card, and is a separate lever.
 

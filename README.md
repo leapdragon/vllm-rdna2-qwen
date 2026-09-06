@@ -74,7 +74,7 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
 
    ```bash
    python tools/rdna2/validate.py        # must print PASS
-   python tools/rdna2/bench.py 3 256     # expect ~60-65 tokens/s decode (MTP=0; ~60-72 with MTP=3)
+   python tools/rdna2/bench.py 3 256     # expect ~64 tokens/s decode (MTP=0; ~60-72 with MTP=3, acceptance-driven)
    ```
 
 ## Container image
