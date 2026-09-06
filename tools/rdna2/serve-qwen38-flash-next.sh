@@ -9,7 +9,8 @@
 #
 # Knobs (env): GPUS (ROCR device ids, default 1,2,3,4), PORT (8000), MTP (3), GPUUTIL (0.90),
 #   DENSE_INT8 (1), EAGER (unset), PROFILE (unset), TRACES (dir for torch-profiler traces),
-#   COMPILE_CACHE_OFF (1), P2P (SYS; NCCL_P2P_LEVEL, +8% prefill), MAXLEN (131072; the model allows 262144 and the KV pool
+#   COMPILE_CACHE_OFF (1), P2P (SYS; NCCL_P2P_LEVEL, +8% prefill), CG_SIZES (piecewise CUDA-graph
+#   capture sizes, default '1 2 4 8 16 32 64 128 256'; empty = vLLM default), MAXLEN (131072; the model allows 262144 and the KV pool
 #   at GPUUTIL 0.86 held ~177-197k tokens, i.e. 1.35-1.5 concurrent 128k requests), EXTRA_ARGS,
 #   TOOLS (1: OpenAI tool calling with tool_choice "auto" for agentic clients such as Kilocode /
 #   Cline / Roo; the model's chat template emits Qwen3-Coder-style <function=…><parameter=…> XML,
@@ -135,6 +136,16 @@ if [ "${VISION:-0}" = "1" ]; then
   export MM_ELIDE_OVER_LIMIT="${MM_ELIDE:-1}"
 fi
 PROF=()
+# CUDA-graph capture sizes (2026-09-06). vLLM caps the default piecewise list at
+# min(max_num_seqs * 2, 512) tokens -- with --max-num-seqs 4 that is 8, so every real prefill batch
+# ran its compiled pieces eagerly (~3,500 launches for a 40-word prompt). Capturing up to 256 tokens
+# takes short-prompt TTFT from 0.38-0.42 s to 0.25 s (-35%); decode and long prefill unchanged.
+# Cost: graph memory 0.64 -> 1.31 GiB per card (KV pool 353k -> 309k tokens). Larger lists cost
+# more (<=512: 262k tokens; <=2048: 221k) for no further TTFT gain on this workload; the
+# cached-prefix turn is bounded by the partial-block recompute, not by launches.
+# CG_SIZES= (empty) restores vLLM's default list.
+CG_SIZES="${CG_SIZES-1 2 4 8 16 32 64 128 256}"
+CGARGS=(); [ -n "$CG_SIZES" ] && CGARGS=(--cudagraph-capture-sizes $CG_SIZES)
 if [ -n "${PROFILE:-}" ]; then
   PROF=(--profiler-config.profiler=torch --profiler-config.torch_profiler_dir="$TRACES")
 fi
@@ -148,7 +159,7 @@ CMD=(python3 -m vllm.entrypoints.openai.api_server
   ${EAGER:+--enforce-eager}
   "${VISIONARGS[@]}"
   --enable-prefix-caching
-  "${SPEC[@]}" "${TOOLARGS[@]}" "${CHATARGS[@]}" "${PROF[@]}" ${EXTRA_ARGS:-}
+  "${SPEC[@]}" "${TOOLARGS[@]}" "${CHATARGS[@]}" "${PROF[@]}" "${CGARGS[@]}" ${EXTRA_ARGS:-}
   --host 0.0.0.0 --port "$PORT")
 
 if [ "${DRYRUN:-0}" = "1" ]; then

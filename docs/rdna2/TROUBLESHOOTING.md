@@ -335,6 +335,14 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   nothing matches; if you set `TUNEOP_FILE=` by hand, make sure the rows were tuned on the same
   library build. `tools/rdna2/tunableop_rows_probe.py <csv>` runs every row as a matmul and lists
   the rejected ones.
+- **`--compilation-config '{…json…}'` fails with `Invalid JSON: key must be a string`** when the flag
+  travels through an env variable and an unquoted `${EXTRA_ARGS}` expansion: the quotes are stripped.
+  Use the dedicated flags (`--cudagraph-capture-sizes 1 2 4 …`, `--max-cudagraph-capture-size`)
+  instead; they are plain integers and survive word splitting.
+- **Prefill batches never use CUDA graphs although the mode is FULL_AND_PIECEWISE.** Check the boot
+  log's `Capturing CUDA graphs (PIECEWISE): 0/N` count: vLLM caps the default list at
+  `min(max_num_seqs × 2, 512)` tokens, so a small `--max-num-seqs` (4 here → 8 tokens) leaves every
+  real prefill eager. Pass the sizes explicitly (CHANGES.md §8e).
 - **`curl -X POST /stop_profile` may never return** although every rank has already written its
   trace (seen with 4 × 70 MB decode traces). Always pass `--max-time`; the traces on disk are
   complete once their sizes stop changing.

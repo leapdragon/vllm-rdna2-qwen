@@ -421,7 +421,43 @@ per rank and the rest is the CPU issuing ~3,500 eager launches through Inductor 
 custom-op dispatch across 48 layers while the ranks wait on each other; long prefill is 91 %
 GPU-busy. Graph capture (or launch fusion) for small prefill batches is the lever there.
 
-## 9. What was measured but not adopted
+## 8e. Time-to-first-token: CUDA-graph capture sizes for prefill batches — 2026-09-06
+
+The serve configuration already ran `FULL_AND_PIECEWISE`, but vLLM caps the default piecewise
+capture list at `min(max_num_seqs × decode_query_len × 2, 512)` tokens — with `--max-num-seqs 4`
+that is **8**, so the list was `[1, 2, 4, 8]` and every real prefill batch ran its compiled pieces
+eagerly (~3,500 launches for a 40-word prompt, CPU-bound, ranks waiting on each other every layer,
+§8d). All attention/GDN/QSA/PLE-conv ops are splitting ops, so capturing larger sizes covers exactly
+the dense/MoE/norm launches. The serve script now passes `--cudagraph-capture-sizes 1 2 4 8 16 32 64
+128 256` (`CG_SIZES=` overrides; empty restores vLLM's default).
+
+Measured at 160 W caps, MTP=0, streaming time to first content token:
+
+| case | before | after |
+|---|---|---|
+| short prompt (40 words) | 0.38–0.42 s | **0.25–0.26 s** (−35 %) |
+| 3.3k prompt, cold | 2.59 s | 2.48–2.50 s |
+| 3.3k prompt, fully cached | 0.745 s | 0.74 s |
+| cached prefix + ~55-token tail (agent turn) | 0.83–0.89 s | 0.83–0.88 s |
+| decode / prefill / validate | 63.4–63.8 / 1043–1068 @3.3k | 64.0–64.6 / unchanged / pass |
+
+Cost: graph memory 0.64 → 1.31 GiB per card, KV pool 353k → 309k tokens (−12 %). Larger lists
+buy nothing more here: 14 sizes ≤512 → 262k tokens, 18 sizes ≤2048 → 221k (+2–3 % prefill at 3.3k
+from replaying the 2048 chunks, −4 % cold 3.3k TTFT) — the memory is per captured size and grows
+with size. Boot adds ~20–40 s of capture, and the capture list is part of the compile-cache key
+(a changed list is a cold compile).
+
+**The cached-turn floor is a different mechanism, and this vLLM's knobs do not reach it.** The
+prefix-cache counters (`/metrics` deltas: `prefix_cache_queries_total` / `hits_total`) show a
+2642-token prompt re-sent hits 2352 = 3 × 784 tokens and recomputes ~300, at small-batch efficiency
+(~600 tok/s) — that is the ~0.5 s above the floor. With `--block-size 256 --mamba-block-size 256`
+the hit *fell* to 2048 (recompute 594): in `align` mode the Mamba state is checkpointed only where
+a prefill scheduler step ends on a block boundary, and a 2048-token chunk plus a 594-token remainder
+leaves nothing cached past 2048 (784 happened to give 1568 + 784 = 2352). `--mamba-cache-mode all`
+did not change the counters for this model. The lever is a scheduler change: end the final prefill
+step of a prompt on a block boundary so the largest aligned prefix is checkpointed, leaving a
+recompute of < block_size tokens on re-send (~0.5 s → ~0.45 s with 256-token blocks). Not done.
+
 
 - YTILE=2 (two rows per wave) and LDS-staged activations for `gemv_f16_rdna2`: no gain.
 - A 4-deep unroll of the MoE int4 GEMV: no gain (not memory-level-parallelism bound).

@@ -160,7 +160,9 @@ Roo need for `tool_choice: "auto"`; the model's template emits Qwen3-Coder-style
 `REASONING_PARSER=` (empty) turns the reasoning parser off so thinking text arrives inline in
 `content` — note vLLM's chat endpoint still strips the template's `</think>` marker, so a client
 cannot split on it), `P2P=` (`NCCL_P2P_LEVEL`, default `SYS`: +8 % prefill on a 2+2 PCIe layout,
-CHANGES.md §8d), `TUNEOP_TUNING=1` (TunableOp *tuning* boot — never in production, CHANGES.md
+CHANGES.md §8d), `CG_SIZES=` (piecewise CUDA-graph capture sizes, default `1 2 4 8 16 32 64 128 256`:
+short-prompt TTFT 0.4 → 0.25 s for 0.7 GiB/card of graph memory; empty = vLLM's default, which
+`--max-num-seqs 4` caps at 8 tokens, CHANGES.md §8e), `TUNEOP_TUNING=1` (TunableOp *tuning* boot — never in production, CHANGES.md
 §8d; the shipped rows in `tunableop/rocblas-<build>/` are used lookup-only when their rocBLAS
 build matches yours, otherwise TunableOp is off and the serve log says so), and the QSA re-tuning
 overrides `VLLM_RDNA_QSA_*` (CHANGES.md §8d).
@@ -210,7 +212,8 @@ the corrected n-gram wait, the MTP=0 and prefill rows are 2026-09-05 at 170 W po
 | decode, MTP=0, 256 tokens ×3 | **64.0 / 64.1 / 64.0 t/s** (15.6 ms/step, 14.6 ms of kernels) |
 | decode, MTP=3, 256–1024 tokens | 60–72 t/s, acceptance-driven (70 % on the test prompts) |
 | prefill, fresh 3.3k / 30k prompt | **1.07–1.11k / 1.18k tok/s** |
-| time-to-first-token, 40-word prompt | 0.31–0.37 s (host-dispatch-bound, CHANGES.md §8d) |
+| time-to-first-token, 40-word prompt | **0.25 s** streaming (0.17 s in bench.py) with the captured prefill sizes; 0.31–0.42 s before (CHANGES.md §8e) |
+| time-to-first-token, cached 3.3k prefix + short tail | 0.83–0.88 s (partial-block recompute, CHANGES.md §8e) |
 | 2.9k / 10.6k / 27k context, MTP=3 | 78 / 108 / 88 t/s (2026-08-29, before the wait fix; no context slope) |
 
 After every run: `journalctl -k | grep amdgpu` should show nothing new, and `rocm-smi --showtemp`
