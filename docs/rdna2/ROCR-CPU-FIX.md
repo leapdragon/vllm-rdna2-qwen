@@ -68,7 +68,7 @@ git apply <clone>/containers/patches/rocr-async-events-poll-backoff.patch
 Or fetch it straight from GitHub:
 
 ```bash
-curl -fL https://github.com/leapdragon/vllm-rdna2-qwen/raw/main/containers/patches/rocr-async-events-poll-backoff.patch \
+curl -fL https://github.com/leapdragon/vllm-rdna2-qwen/raw/rdna2/qwen38-flash-next/containers/patches/rocr-async-events-poll-backoff.patch \
   | git apply
 ```
 
