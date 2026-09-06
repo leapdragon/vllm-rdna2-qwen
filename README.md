@@ -1,3 +1,5 @@
+This repo is AI slop.
+
 # WHAT'S IN THE BRANCH
 
 - vLLM fork for 4x Radeon Pro v620
