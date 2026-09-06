@@ -165,9 +165,7 @@ short-prompt TTFT 0.4 → 0.25 s for 0.7 GiB/card of graph memory; empty = vLLM'
 `--max-num-seqs 4` caps at 8 tokens, CHANGES.md §8e), `TUNEOP_TUNING=1` (TunableOp *tuning* boot — never in production, CHANGES.md
 §8d; the shipped rows in `tunableop/rocblas-<build>/` are used lookup-only when their rocBLAS
 build matches yours, otherwise TunableOp is off and the serve log says so), and the QSA re-tuning
-overrides `VLLM_RDNA_QSA_*` (CHANGES.md §8d). Plain vLLM env that matters here: `VLLM_USE_V2_MODEL_RUNNER=0`
-selects the V1 model runner (default is V2 on this model); a user reported it as the fix for large-prompt
-failures they hit on V2 — see TROUBLESHOOTING.md §5b before flipping it.
+overrides `VLLM_RDNA_QSA_*` (CHANGES.md §8d).
 
 ### Switching MTP and thinking defaults — plain vLLM arguments, no code changes
 
