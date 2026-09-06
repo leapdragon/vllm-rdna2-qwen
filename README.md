@@ -30,7 +30,7 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
 
    ```bash
    git clone https://github.com/leapdragon/vllm-rdna2-qwen.git
-   cd vllm-rdna2-qwen        # you are on branch rdna2/qwen38-flash-next
+   cd vllm-rdna2-qwen        # you are on main, the release line
    ```
 
 2. **Build PyTorch, Triton and torchvision for gfx1030** (TheRock does not publish PyTorch
@@ -132,16 +132,18 @@ TheRock's legacy tarball index: [containers/README.md](containers/README.md).
 ## Housekeeping
 
 **To see what was changed**: the GitHub compare view
-[`2a46f85b43...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...rdna2/qwen38-flash-next)
+[`2a46f85b43...main`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...main)
 shows only this fork's commits and diff (everything after the merge of the Flash-Next model
-branch); [`main...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/main...rdna2/qwen38-flash-next)
+branch); [`6cddad414...main`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/6cddad414...main)
 shows everything vs upstream vLLM. `docs/rdna2/CHANGES.md` opens with a map of where the code lives.
 
 **To understand or reuse the work**: [`docs/rdna2/CHANGES.md`](docs/rdna2/CHANGES.md) — every
 change and the reason for it; [`docs/rdna2/RESULTS.md`](docs/rdna2/RESULTS.md) — the measured
 numbers; [`docs/rdna2/PROFILE-NAVI21.md`](docs/rdna2/PROFILE-NAVI21.md) — the silicon profile the
 kernels were designed against; [`tools/rdna2/`](tools/rdna2/) — build, serve, benchmark, profile
-and test tools. `main` tracks upstream vLLM; this fork's work is on `rdna2/qwen38-flash-next`.
+and test tools. `main` is this fork's release line (fast-forwarded from the former working branch
+`rdna2/qwen38-flash-next` on 2026-09-06, which now only marks the same history); the upstream vLLM
+base is commit `6cddad414` (2026-08-29).
 
 ---
 

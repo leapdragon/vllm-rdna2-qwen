@@ -181,7 +181,7 @@ LDS staging of x is the next suspect).
 
 ## Host build against TheRock ROCm 7.14 (this fork, 2026-08-30 UTC)
 
-The same source (branch `rdna2/qwen38-flash-next`) built on the host, no container: PyTorch
+The same source (this fork's `main`, then the `rdna2/qwen38-flash-next` branch) built on the host, no container: PyTorch
 2.12.0+git6bbd260 from source for gfx1030, ROCm/triton 3.7.1 (f0b55c07), pytorch/vision 0.27.1,
 this fork's `_C`/`_rocm_C`/`_moe_C` against `/opt/rocm` = TheRock 7.14.60850. Served with
 `tools/rdna2/serve-qwen38-flash-next.sh` (MTP=3, int8 shadows, one-shot all-reduce).

@@ -12,7 +12,7 @@ Everything below was measured, not planned. Numbers are from inside the serving 
 
 > **Note (this fork).** This is the container-based procedure the numbers in `RESULTS.md` were
 > measured with (ROCm 7.2.3 inside the image, the same source tree and kernels as this fork's
-> `rdna2/qwen38-flash-next` branch). The host build against TheRock 7.14 in `README.md` is the
+> `main`). The host build against TheRock 7.14 in `README.md` is the
 > distribution path; if you want the exact validated environment, this is it. Patch numbers
 > refer to the campaign's patch series, which this fork's tree already contains.
 

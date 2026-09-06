@@ -6,7 +6,7 @@ V620 (Navi 21, gfx1030)** cards under vLLM at ~100 tokens/s single-stream decode
 does not know gfx1030, the Flash-Next model family (vLLM PR #53896) is unmerged, and the
 model's 51-billion-row n-gram embedding table does not fit on any consumer GPU.
 
-Every change is on the `rdna2/qwen38-flash-next` branch as a separate commit; the commit
+Every change is on `main` (the former `rdna2/qwen38-flash-next` branch, fast-forwarded on 2026-09-06) as a separate commit; the commit
 subjects carry the original patch numbers (`port: 000N …`, `T43 …`) so they can be matched to
 the experiment log in `RESULTS.md`. Nothing here is a config-only tweak: the numbers came
 from profiling inside the serving process and writing kernels for what the profile showed.
@@ -24,20 +24,20 @@ channels — the published base image is the durable artifact. See containers/RE
 
 The branch has three layers, and GitHub's compare view can show each:
 
-1. **Everything vs upstream vLLM** — [`main...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/main...rdna2/qwen38-flash-next):
+1. **Everything vs upstream vLLM** (base `6cddad414`, upstream main of 2026-08-29) — [`6cddad414...main`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/6cddad414...main):
    the Flash-Next model branch (vLLM PR #53896, not ours) *plus* this fork's work. Large.
-2. **Only this fork's work** — [`2a46f85b43...rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...rdna2/qwen38-flash-next):
+2. **Only this fork's work** — [`2a46f85b43...main`](https://github.com/leapdragon/vllm-rdna2-qwen/compare/2a46f85b43...main):
    `2a46f85b43` is the merge commit that brought the Flash-Next branch in; every commit after it
    is ours (the 22 ported patches, the env declarations, `docs/rdna2/`, `tools/rdna2/`).
    The **Commits** tab of that compare lists them with their original subjects
    (`port: 000N …`, `rdna2: …`, `PLE offload: …`, `T43 …`, `T44 …`, `T45/T46 …`); the
    **Files changed** tab is the whole diff.
 3. **One change at a time** — the commit list
-   [`commits/rdna2/qwen38-flash-next`](https://github.com/leapdragon/vllm-rdna2-qwen/commits/rdna2/qwen38-flash-next);
+   [`commits/main`](https://github.com/leapdragon/vllm-rdna2-qwen/commits/main);
    click a commit to see its diff. The sections above are in that order.
 
-Locally: `git log --first-parent 2a46f85b43..rdna2/qwen38-flash-next` and
-`git diff --stat 2a46f85b43 rdna2/qwen38-flash-next`.
+Locally: `git log --first-parent 2a46f85b43..main` and
+`git diff --stat 2a46f85b43 main`.
 
 Where our code lives (new or modified files, by area):
 

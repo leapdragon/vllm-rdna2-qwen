@@ -39,10 +39,10 @@ Do not put a pre-Vega (gfx8) card in the machine, even display-only (TROUBLESHOO
 ```bash
 git clone https://github.com/leapdragon/vllm-rdna2-qwen.git
 cd vllm-rdna2-qwen
-git checkout rdna2/qwen38-flash-next
+git checkout main                       # the default branch; the release line
 ```
 
-The branch is upstream vLLM main (post-0.28.0) + the Flash-Next model branch (vLLM PR #53896)
+`main` is upstream vLLM (post-0.28.0, base commit `6cddad414`) + the Flash-Next model branch (vLLM PR #53896)
 + this fork's commits. `main` tracks upstream.
 
 ## 3. Build PyTorch and Triton against TheRock 7.14
