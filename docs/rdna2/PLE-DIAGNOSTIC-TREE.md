@@ -62,7 +62,10 @@ error about max seq len vs KV cache size is this, not PLE.
 
 `Bound IPC address …; waiting for 4 GPU worker registration(s)` →
 `PLE quant table: …, 128 shards mmapped` → 4× `GPU worker N registered` →
-`PLE sidecar prefaulted into the page cache: 32.0 GB in ~30 s` →
+`Busy-loop started.` → `PLE doorbell: polling shared pages for 1 DP rank(s); ZMQ still accepted` →
+`PLE sidecar populated (page cache + page tables): 32.0 GB in ~2 s` (warm cache; a cold cache reads
+from disk at disk speed; the line reads `prefaulted into the page cache … in ~30 s` if the kernel refuses
+`MADV_POPULATE_READ` and the sequential read fallback ran) →
 compile (~12 min cold / ~1 s warm) → `GPU KV cache size: …` → startup complete.
 Zero lines matching `Duplicate PLE`, `PLE lookup for launch`, or `did not complete launch`.
 

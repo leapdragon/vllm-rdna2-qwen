@@ -34,6 +34,12 @@ from multiprocessing.connection import Connection
 from typing import Any, cast
 
 import time
+
+import numpy as np
+_HOPS = os.getenv("PLE_OFFLOAD_DEBUG_HOPS", "0") == "1"  # see connector.py: per-hop round-trip stamps (test hook)
+_DOORBELL = os.getenv("PLE_OFFLOAD_DOORBELL", "1") == "1"  # see connector.py: requests via the shared page
+_DB_SEQ, _DB_NTOK, _DB_NREQ = 4, 5, 6
+_DB_SPIN_S = 0.05  # keep spinning this long after the last request, then sleep-poll (idle CPU stays low)
 import msgspec
 import torch
 import torch.distributed as dist
@@ -415,10 +421,31 @@ class _PleQuantTable:
         self.quant_dir = quant_dir
         self.n_shards = n_shards
         # zero-copy numpy views of the same mmaps for the small-batch fused path
-        self._q_np = [t.numpy() for t in self._q]
-        self._s_np = [t.numpy() for t in self._s]
+        # plain ndarray views (an np.memmap subclass view costs microseconds per row index)
+        self._q_np = [t.numpy().view(np.ndarray) for t in self._q]
+        self._s_np = [t.numpy().view(np.ndarray) for t in self._s]
         logger.info("PLE quant table: %s, %d shards mmapped from %s",
                     self.layout, n_shards, quant_dir)
+
+    def populate_page_tables(self) -> bool:
+        """madvise(MADV_POPULATE_READ) every shard mapping: faults the whole table into the
+        page cache AND pre-maps it in this process, so a decode gather never takes a
+        first-touch minor fault (~3.8 us/page -> 0.5 us; 16 rows/token). ~1.6 s warm.
+        Returns False when the kernel refuses (pre-5.14): caller falls back to reading."""
+        import ctypes
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        except OSError:
+            return False
+        MADV_POPULATE_READ = 22
+        for arr in self._q_np + self._s_np:
+            base = arr.ctypes.data
+            off = base & 4095
+            rc = libc.madvise(ctypes.c_void_p(base - off), ctypes.c_size_t(arr.nbytes + off), MADV_POPULATE_READ)
+            if rc != 0:
+                logger.warning("PLE populate: madvise failed (errno %d); falling back to a read pass", ctypes.get_errno())
+                return False
+        return True
 
     def gather_rows_small(self, ids, out) -> None:
         """int4 rows for a small batch: per-row numpy indexing on the mmaps and one
@@ -490,6 +517,152 @@ _FUSED_MISMATCH = [0, 0]   # [mismatches, checks]
 
 
 def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinned, check):
+    """Decode fast path (2026-09-05 rewrite of _fused_decode_lookup_ref, bit-identical):
+    hashing constants cached on the layer, plain-ndarray row gather (pages pre-mapped by
+    populate_page_tables), and the float32->bf16 store done in numpy straight into the
+    pinned buffer (round-to-nearest-even, same as torch). 264 -> 114 us offline for one token.
+    Returns the pinned view [:num_tokens] or None when the batch is not a plain decode batch."""
+    import numpy as np
+    quant = getattr(layer.ngram_embedding, "_ple_quant", None)
+    if quant is None or "int4" not in quant.layout or ngram_context is None:
+        return None
+    qsl = query_start_loc.numpy()
+    num_reqs = qsl.shape[0] - 1
+    num_tokens = input_ids.shape[0]
+    if num_reqs == 1:
+        if int(qsl[1]) != 1:
+            return None                             # one request with >1 token: prefill
+    else:
+        if num_reqs <= 0 or num_reqs > 64 or int(qsl[-1]) != num_reqs:
+            return None
+        if not np.array_equal(qsl, np.arange(num_reqs + 1, dtype=qsl.dtype)):
+            return None                             # some request has >1 token: prefill
+    consts = getattr(layer, "_ple_np_consts", None)
+    if consts is None:
+        consts = (
+            int(layer.ngram_size), int(layer.heads_per_ngram), int(layer.eos_token_id),
+            layer.layer_multipliers.numpy().astype(np.int64),
+            layer.ngram_heads_vocab_sizes.numpy().astype(np.int64),
+            layer.ngram_heads_offsets.numpy().astype(np.int64),
+        )
+        layer._ple_np_consts = consts
+    ngram_size, hpn, eos, mult, sizes, offsets = consts
+    if num_reqs == 1:
+        # Single request (the common decode case): plain Python integers instead of ~15
+        # tiny numpy ops (74 -> 4 us). Same int64 wraparound (mod 2**64, reinterpret
+        # signed), same EOS segmentation, same floor-modulo as np.remainder.
+        py = getattr(layer, "_ple_py_consts", None)
+        if py is None:
+            py = ([int(m) for m in mult], [int(x) for x in sizes], [int(x) for x in offsets])
+            layer._ple_py_consts = py
+        pm, psz, pof = py
+        row = ngram_context[0].tolist() + [int(input_ids[0])]
+        a = len(row) - 1
+        last_eos = -1
+        for j in range(a - 1, -1, -1):
+            if row[j] == eos:
+                last_eos = j
+                break
+        pos_in_seg = a - last_eos - 1
+        mask = (1 << 64) - 1
+
+        def wrap(x):
+            x &= mask
+            return x - (1 << 64) if x >= (1 << 63) else x
+
+        shifted = [row[a]]
+        for sh in range(1, ngram_size):
+            src = a - sh
+            shifted.append(row[src] if (src >= 0 and pos_in_seg >= sh) else eos)
+        out_ids = []
+        mixed = wrap(shifted[0] * pm[0])
+        for n in range(2, ngram_size + 1):
+            mixed = wrap(mixed ^ wrap(shifted[n - 1] * pm[n - 1]))
+            start = (n - 2) * hpn
+            for h in range(hpn):
+                out_ids.append(mixed % psz[start + h] + pof[start + h])
+        ngram_ids = np.asarray(out_ids, dtype=np.int64)
+        rows = np.empty((ngram_ids.shape[0], layer.head_dim), dtype=np.float32)
+        quant.gather_rows_small(ngram_ids, rows)
+        f32 = rows.reshape(1, layer.embedding_dim)
+        if pinned.dtype == torch.bfloat16:
+            key = pinned.data_ptr()
+            views = getattr(layer, "_ple_out16_views", None)
+            if views is None:
+                views = layer._ple_out16_views = {}
+            out16_all = views.get(key)
+            if out16_all is None:
+                out16_all = views[key] = pinned.view(torch.int16).numpy().view(np.uint16)
+            u = f32.view(np.uint32)
+            out16_all[0] = ((u + (((u >> 16) & 1) + np.uint32(0x7FFF))) >> 16).astype(np.uint16)[0]
+            if num_tokens > 1:
+                out16_all[1:num_tokens] = 0
+            out = pinned[:num_tokens]
+        else:
+            out = pinned[:num_tokens]
+            out[:1].copy_(torch.from_numpy(f32))
+            if num_tokens > 1:
+                out[1:].zero_()
+        if check:
+            _fused_check(layer, input_ids, query_start_loc, ngram_context, out, 1)
+        return out
+    ctx = ngram_context[:num_reqs].numpy()                            # (R, ngram_size-1) int64
+    tok = input_ids[:num_reqs].numpy()                                # (R,)
+    L = ctx.shape[1] + 1
+    row = np.empty((num_reqs, L), dtype=np.int64)
+    row[:, :L - 1] = ctx
+    row[:, L - 1] = tok
+    a = L - 1
+    is_eos = row[:, :a] == eos
+    has = is_eos.any(axis=1)
+    last_eos = np.where(has, a - 1 - np.argmax(is_eos[:, ::-1], axis=1), -1)
+    pos_in_seg = a - last_eos - 1
+    shifted = [row[:, a]]
+    for sh in range(1, ngram_size):
+        src = a - sh
+        valid = (src >= 0) & (pos_in_seg >= sh)
+        vals = row[:, src] if src >= 0 else np.full(num_reqs, eos, dtype=np.int64)
+        shifted.append(np.where(valid, vals, eos))
+    with np.errstate(over="ignore"):
+        blocks = []
+        mixed = shifted[0] * mult[0]
+        for n in range(2, ngram_size + 1):
+            mixed = np.bitwise_xor(mixed, shifted[n - 1] * mult[n - 1])
+            start = (n - 2) * hpn
+            blocks.append(np.remainder(mixed[:, None], sizes[None, start:start + hpn]) + offsets[None, start:start + hpn])
+    ngram_ids = np.concatenate(blocks, axis=1).reshape(-1)             # (R*heads,)
+    rows = np.empty((ngram_ids.shape[0], layer.head_dim), dtype=np.float32)
+    quant.gather_rows_small(ngram_ids, rows)
+    out = pinned[:num_tokens]
+    f32 = rows.reshape(num_reqs, layer.embedding_dim)
+    if out.dtype == torch.bfloat16:
+        u = f32.view(np.uint32)
+        out16 = out[:num_reqs].view(torch.int16).numpy().view(np.uint16)
+        out16[:] = ((u + (((u >> 16) & 1) + np.uint32(0x7FFF))) >> 16).astype(np.uint16)
+    else:
+        out[:num_reqs].copy_(torch.from_numpy(f32))
+    if num_tokens > num_reqs:
+        out[num_reqs:].zero_()
+    if check:
+        _fused_check(layer, input_ids, query_start_loc, ngram_context, out, num_reqs)
+    return out
+
+
+def _fused_check(layer, input_ids, query_start_loc, ngram_context, out, num_reqs) -> None:
+    ref = layer.forward_impl(input_ids, input_ids, query_start_loc, ngram_context)
+    r, o = ref[:num_reqs].float(), out[:num_reqs].float()
+    diff = (r - o).abs().max().item()
+    scale = r.abs().max().item() + 1e-6
+    _FUSED_MISMATCH[1] += 1
+    if _FUSED_MISMATCH[1] <= 3 or diff > 1e-2 * scale:
+        logger.info("fused PLE check #%d: max abs diff %.3g (ref max %.3g, dtype ref %s / out %s)",
+                    _FUSED_MISMATCH[1], diff, scale, ref.dtype, out.dtype)
+    if diff > 1e-2 * scale:
+        _FUSED_MISMATCH[0] += 1
+        logger.error("fused PLE lookup MISMATCH (max abs diff %.4g vs ref max %.4g)", diff, scale)
+
+
+def _fused_decode_lookup_ref(layer, input_ids, query_start_loc, ngram_context, pinned, check):
     """Decode fast path: one token per request, int4 sidecar. Reproduces forward_impl's
     hashing (int64 wraparound, EOS segmentation) in numpy and gathers the rows with
     gather_rows_small, writing straight into the pinned buffer. Returns the pinned view
@@ -579,6 +752,10 @@ def _prefault_sidecar_async(layers) -> None:
     def run():
         t0 = time.perf_counter()
         total = 0
+        if quant.populate_page_tables():
+            logger.info("PLE sidecar populated (page cache + page tables): %.1f GB in %.0f s",
+                        sum(a.nbytes for a in quant._q_np + quant._s_np) / 1e9, time.perf_counter() - t0)
+            return
         for n in range(quant.n_shards):
             path = os.path.join(quant.quant_dir, f"shard_{n}.safetensors")
             try:
@@ -1103,8 +1280,43 @@ class PleOffloadRunner:
         logger.info("Busy-loop started.")
         poller = zmq.Poller()
         poller.register(pull_socket, zmq.POLLIN)
+        # Doorbell pages: one per DP rank, the TP-rank-0 worker's done page (its request
+        # thread writes num_tokens/num_reqs then seq into slots 5/6/4 after the D2H).
+        db_pages: dict[int, object] = {}
+        if _DOORBELL:
+            for dp_rank, per_layer in self._worker_targets.items():
+                for targets in per_layer.values():
+                    for t in targets:
+                        if t.tp_rank == 0 and t.done_seq_buf is not None:
+                            db_pages[dp_rank] = t.done_seq_buf.numpy()
+                    break
+            if len(db_pages) != len(self._worker_targets):
+                logger.warning("PLE doorbell: no TP-rank-0 page for every DP rank; ZMQ only.")
+                db_pages = {}
+            else:
+                logger.info("PLE doorbell: polling shared pages for %d DP rank(s); ZMQ still accepted.", len(db_pages))
+        db_seen = {dp_rank: 0 for dp_rank in db_pages}
+        db_items = list(db_pages.items())
+        last_active = time.perf_counter()
         while not shutdown_event.is_set():
-            if pull_socket not in dict(poller.poll(timeout=100)):
+            if db_items:
+                got = None
+                for dp_rank, page in db_items:
+                    s = int(page[_DB_SEQ])
+                    if s > db_seen[dp_rank]:
+                        db_seen[dp_rank] = s
+                        got = PleOffloadRequest(dp_rank=dp_rank, num_tokens=int(page[_DB_NTOK]), num_reqs=int(page[_DB_NREQ]))
+                        break  # protocol: at most one outstanding request per DP rank
+                if got is not None:
+                    self._handle_requests([got])
+                    last_active = time.perf_counter()
+                    continue
+                if time.perf_counter() - last_active < _DB_SPIN_S:
+                    continue  # hot window: spin so the next step's request is seen within ~1 us
+                if pull_socket not in dict(poller.poll(timeout=0)):
+                    time.sleep(200e-6)  # idle: cheap sleep-poll of both the pages and the socket
+                    continue
+            elif pull_socket not in dict(poller.poll(timeout=100)):
                 continue
 
             requests = []
@@ -1159,6 +1371,8 @@ class PleOffloadRunner:
 
     def _handle_one(self, request: PleOffloadRequest) -> None:
         t_recv = time.perf_counter()
+        t_recv_ns = time.perf_counter_ns() if _HOPS else 0
+        t_lookup_ns = 0
         requests_by_dp = {request.dp_rank: request}
 
         # Speculative placeholders are not vocabulary IDs. Normalize each DP
@@ -1210,6 +1424,8 @@ class PleOffloadRunner:
                 else:
                     self._n_fused += 1
                 self._t_lookup += time.perf_counter() - t_lk0
+                if _HOPS:
+                    t_lookup_ns = time.perf_counter_ns()
                 if self._debug_trace is not None:
                     import hashlib
                     ids = input_bufs.input_ids_buf[: request.num_tokens]
@@ -1231,6 +1447,14 @@ class PleOffloadRunner:
         # Publish completion with a plain store into every GPU worker's page (x86
         # stores are ordered after the row writes above); each GPU worker then
         # copies the rows to its own device buffer on its model stream.
+        if _HOPS:
+            t_pub_ns = time.perf_counter_ns()
+            for dp_rank in requests_by_dp:
+                for layer_name in self._layers:
+                    for target in self._worker_targets[dp_rank][layer_name]:
+                        if target.done_seq_buf is not None:
+                            page = target.done_seq_buf.view(torch.int64)
+                            page[10] = t_recv_ns; page[11] = t_lookup_ns; page[12] = t_pub_ns
         for dp_rank in requests_by_dp:
             seq = self._done_seq.get(dp_rank, 0) + 1
             self._done_seq[dp_rank] = seq

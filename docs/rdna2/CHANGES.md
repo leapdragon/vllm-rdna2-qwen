@@ -276,6 +276,54 @@ byte-identical, waiting generates no PCIe traffic, and a 5-minute soak (`soak_fa
 logged no `mpt2sas`/amdgpu events — this box audibly resets its tape drive under fabric
 stress, and twice that day cards dropped off the bus during generation.
 
+## 8c. PLE round-trip: doorbell, page-table populate, faster lookup — 2026-09-05
+
+Sized first (the "PLE offload host wait" log line is a host-thread wait overlapped with the
+previous forward, not a stall — see the research repo's 2026-09-05 notes): a
+`PLE_OFFLOAD_DEBUG_DELAY_MS` sweep gave a slope of 1.0 ms/step per ms of lookup latency (fully
+serial) and a decode profile put the exposure at ~1.0–1.4 ms of a 16.2 ms step, the gap that
+sits right before `__amd_rocclr_copyBuffer` (the result copy). Per-hop stamps
+(`PLE_OFFLOAD_DEBUG_HOPS=1`: both processes write `perf_counter_ns()` into spare int64 slots of
+the shared done page; medians/means/max logged every 500 decode launches) split the 1.42 ms:
+d2h→sent 303 µs, sent→recv 172, recv→lookup 623, lookup→publish 41, publish→seen 105,
+seen→enqueued 172. Changes, all bit-exact against the kept `_fused_decode_lookup_ref`
+(thousands of random batches offline; `PLE_OFFLOAD_FUSED_CHECK=1` in-server: 995/1000 fused,
+0 mismatches, max abs diff 0):
+
+1. **Doorbell instead of ZMQ on the hot path** (`PLE_OFFLOAD_DOORBELL=1`, default; `=0` restores
+   the ZMQ request). TP rank 0's *model thread* stages the D2H copies, sleep-polls the event until
+   just before the forward is expected to end (running mean − 1 ms), then writes
+   num_tokens/num_reqs/seq into int32 slots 5/6/4 of its done page. The sidecar spins on that
+   page for 50 ms after each request, then sleep-polls (200 µs) the page *and* the ZMQ socket, so
+   idle CPU stays low and ZMQ clients still work. The old request thread is bypassed: once the
+   model thread spun, the two threads fought for the GIL exactly when the D2H completed
+   (d2h→sent 0.3 → 1.5 ms, decode 55 t/s in the intermediate build). Spin loops call
+   `time.sleep(0)` every 64 iterations to yield the GIL.
+2. **Two-phase wait** in `_wait_lookup_done`: sleep-poll (100 µs) until the running mean of the
+   decode wait minus 1.5 ms, then spin (rank 0 on the doorbell path spins immediately). The old
+   20 µs sleep was ~70–100 µs real (the publish→seen hop).
+3. **`madvise(MADV_POPULATE_READ)` over every shard mapping** at worker start (1.6–2 s warm)
+   instead of the sequential read: the table was 100 % page-cache resident but each decode step
+   took ~30 first-touch minor faults (3.8 µs each → 0.5 µs). Falls back to the read pass if the
+   kernel refuses. Log line: `PLE sidecar populated (page cache + page tables): 32.0 GB in 2 s`.
+4. **Lookup**: plain-ndarray views (an `np.memmap` subclass index costs µs per row), hashing
+   constants cached on the layer, pure-Python hashing for the single-request case (74 → 4 µs),
+   the float32→bf16 store done in numpy (round-to-nearest-even, same as torch) straight into a
+   cached uint16 view of the pinned buffer. Offline one-token lookup 264 → 124 µs; in the sidecar
+   0.62 → 0.25 ms (the rest of the old figure was the core waking cold from the ZMQ poll).
+
+Result (170 W, MTP=0): hops median d2h→sent 34 µs, sent→recv 5, recv→lookup 181, lookup→publish
+23, publish→seen 73, seen→enqueued 117, **total 485 µs** (was 1,416 mean). **Decode 61.9 →
+64.0–64.1 t/s** over 256 tokens; prefill unchanged (1107/1070 @3.3k, 1178 @30k); validate PASS.
+Rejected: a RAM-contiguous copy of the table (gather 27 → 9 µs for an unevictable 32 GB).
+Left on the table: seen→enqueued (a zero-copy read of the pinned buffer would drop the per-step
+H2D copy) and the ~180 µs lookup — together ≤0.3 ms/step.
+
+**Trap:** a numpy view of a shared CPU tensor taken *before* the registration pickle dangles —
+pickling under torch's `file_system` strategy copies the storage into a new mapping and swaps
+the data pointer (torch views follow, numpy views do not) — all four workers SIGSEGV'd at the
+first step after graph capture. Take numpy views of shared pages only after registration.
+
 ## 8b. Vision (2026-08-30)
 
 The checkpoint ships a full Qwen3-VL-style vision tower (27 blocks, hidden 1152, patch 16,
