@@ -215,7 +215,8 @@ cython_debug/
 # Results
 *.csv
 # ...but the shipped TunableOp rows are a load-bearing build artifact, not a result
-!tunableop/tunableop_results*.csv
+!tunableop/rocblas-*/tunableop_results*.csv
+!tunableop/README.md
 
 # Python pickle files
 *.pkl

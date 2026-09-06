@@ -55,20 +55,41 @@ export NCCL_P2P_LEVEL="${P2P:-SYS}"
 export VLLM_ROCM_USE_AITER=0
 export TORCH_BLAS_PREFER_HIPBLASLT=0
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-# TunableOp: LOOKUP-ONLY in production; never autotune inside a serving process (T31).
-# The shipped rows in tunableop/ (551 fp16 GEMM shapes, gfx1030, TP=4) are worth
-# +6% prefill at 3.3k and +13% at 30k vs untuned, decode unchanged, validate PASS
-# (measured 2026-09-04, matched A/B at the 170 W cap).
-# Offline retune only: TUNEOP_TUNING=1, cards capped LOW and the workload paced --
-# a tuning run at 220 W caps tripped the 15 A sub-breaker (all four cards at max,
-# no idle between GEMM candidates), and tuning also makes prefill bimodal and
-# perturbs greedy output, so its numbers mean nothing.
+# TunableOp: LOOKUP-ONLY in production; never autotune inside a serving process.
+# Tuned rows are worth +6% prefill at 3.3k and +13% at 30k vs untuned on gfx1030 (2026-09-04),
+# decode unchanged. Offline retune only: TUNEOP_TUNING=1 with the cards capped LOW and the
+# workload paced -- tuning drives all four cards to full power with no idle between GEMM
+# candidates, makes prefill bimodal and perturbs greedy output, so its numbers mean nothing.
+#
+# Rows are specific to the rocBLAS BUILD, not its version string: solution ids come from the
+# Tensile library as built, and two builds with the same version string can offer different
+# solution sets (TheRock 7.14.0rc3 vs the 7.14.1 tarball: ~190 of 290 rows differ). A row naming
+# a solution the runtime lacks aborts the first GEMM with "Expected iter != ops_.end()". So rows
+# live under tunableop/rocblas-<sha256[:12] of librocblas.so>/; no directory for the running
+# build means lookup stays OFF (logged), and a TUNEOP_TUNING=1 boot writes into that build's
+# directory. TUNEOP_FILE= overrides the location outright.
 _SERVE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _REPO_ROOT="$(cd "$_SERVE_DIR/../.." && pwd)"
-export PYTORCH_TUNABLEOP_ENABLED="${PYTORCH_TUNABLEOP_ENABLED:-1}"
+_ROCBLAS_LIB="$(readlink -f "${ROCM_PATH:-/opt/rocm}/lib/librocblas.so.5" 2>/dev/null || true)"
+_ROCBLAS_ID="unknown"; [ -f "$_ROCBLAS_LIB" ] && _ROCBLAS_ID="$(sha256sum "$_ROCBLAS_LIB" | cut -c1-12)"
+_TUNEOP_DIR="$_REPO_ROOT/tunableop/rocblas-$_ROCBLAS_ID"
 export PYTORCH_TUNABLEOP_TUNING="${TUNEOP_TUNING:-0}"
 export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
-export PYTORCH_TUNABLEOP_FILENAME="${TUNEOP_FILE:-$_REPO_ROOT/tunableop/tunableop_results.csv}"
+if [ -n "${TUNEOP_FILE:-}" ]; then
+  export PYTORCH_TUNABLEOP_ENABLED="${PYTORCH_TUNABLEOP_ENABLED:-1}"
+  export PYTORCH_TUNABLEOP_FILENAME="$TUNEOP_FILE"
+elif [ "$PYTORCH_TUNABLEOP_TUNING" = 1 ]; then
+  mkdir -p "$_TUNEOP_DIR"
+  export PYTORCH_TUNABLEOP_ENABLED=1
+  export PYTORCH_TUNABLEOP_FILENAME="$_TUNEOP_DIR/tunableop_results.csv"
+  echo "TunableOp: TUNING boot -- rows for rocBLAS build $_ROCBLAS_ID will be written under $_TUNEOP_DIR"
+elif [ -f "$_TUNEOP_DIR/tunableop_results0.csv" ]; then
+  export PYTORCH_TUNABLEOP_ENABLED="${PYTORCH_TUNABLEOP_ENABLED:-1}"
+  export PYTORCH_TUNABLEOP_FILENAME="$_TUNEOP_DIR/tunableop_results.csv"
+else
+  export PYTORCH_TUNABLEOP_ENABLED=0
+  echo "TunableOp: no tuned rows for this rocBLAS build ($_ROCBLAS_ID, $_ROCBLAS_LIB) under $_REPO_ROOT/tunableop/ -- lookup disabled (dense GEMMs run untuned, ~6-13% slower prefill). Tune once with TUNEOP_TUNING=1; see docs/rdna2/CHANGES.md section 8d."
+fi
 
 # --- this fork's features ---------------------------------------------------------------
 # n-gram table served from the int4 sidecar by a CPU worker process (CHANGES.md #3)

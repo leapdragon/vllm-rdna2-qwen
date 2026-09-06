@@ -368,9 +368,15 @@ sized from in-server measurements, and every closed lever closed with data:
   `NCCL_NTHREADS` neutral, tree −3 %, `NCCL_BUFFSIZE` neutral. The collective log
   (`NCCL_DEBUG_SUBSYS=COLL`) shows every prefill collective is a per-layer hidden-state
   AllReduce (two per layer per chunk, ~10.5 MB), so EP-versus-TP cannot change the volume.
-- **TunableOp rows for the dense GEMM shapes ship in `tunableop/`** and the serve script
-  enables TunableOp **lookup-only** (`PYTORCH_TUNABLEOP_TUNING=0`; `TUNEOP_TUNING=1` for a
-  deliberate tuning boot). The top dense prefill kernel (`Cijk_… MT32x32x8`) went 734 → 259 ms
+- **TunableOp rows for the dense GEMM shapes ship in `tunableop/rocblas-<build>/`** and the serve
+  script enables TunableOp **lookup-only** (`PYTORCH_TUNABLEOP_TUNING=0`; `TUNEOP_TUNING=1` for a
+  deliberate tuning boot). The rows are specific to the **rocBLAS build**, not its version string:
+  solution ids come from the Tensile library as built, and the 7.14.1 container tarball's rocBLAS
+  (same `5.5.0.cd957402` string as the 7.14.0rc3 host install) offers a different solution set
+  for ~190 of the 290 rows — a row naming a solution the runtime lacks aborts the first GEMM with
+  `Expected iter != ops_.end()`. The serve script therefore keys the directory by
+  `sha256(librocblas.so)[:12]`, runs lookup-only when a directory matches, and otherwise disables
+  TunableOp with a log line (`tunableop/README.md`). The top dense prefill kernel (`Cijk_… MT32x32x8`) went 734 → 259 ms
   per 3.3k prefill on its own. Tuning mode must never run in production: it autotunes every
   never-seen GEMM shape mid-request (prefill M is prompt-length dependent), which makes prefill
   bimodal (771 vs 37 tok/s measured) and perturbs greedy output while it runs.

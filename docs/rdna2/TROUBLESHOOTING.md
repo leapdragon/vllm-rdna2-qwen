@@ -327,6 +327,14 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   spins in the model thread delayed the request thread's hand-off by the 5 ms switch interval
   (a hop went 0.3 → 1.5 ms, decode fell to 55 t/s). The doorbell path now does the whole hand-off
   on the model thread, and every spin loop yields with `time.sleep(0)` every 64 iterations.
+- **Every worker dies in `profile_run` with `Expected iter != ops_.end() to be true` at the first
+  GEMM.** A TunableOp results row names a rocBLAS solution this runtime does not offer. The
+  rows are specific to the rocBLAS *build* (the version string is identical between the TheRock
+  7.14.0rc3 host install and the 7.14.1 tarball, the solution sets are not). The serve script keys
+  rows by `sha256(librocblas.so)[:12]` under `tunableop/rocblas-<id>/` and disables lookup when
+  nothing matches; if you set `TUNEOP_FILE=` by hand, make sure the rows were tuned on the same
+  library build. `tools/rdna2/tunableop_rows_probe.py <csv>` runs every row as a matmul and lists
+  the rejected ones.
 - **`curl -X POST /stop_profile` may never return** although every rank has already written its
   trace (seen with 4 × 70 MB decode traces). Always pass `--max-time`; the traces on disk are
   complete once their sizes stop changing.

@@ -161,7 +161,8 @@ Roo need for `tool_choice: "auto"`; the model's template emits Qwen3-Coder-style
 `content` — note vLLM's chat endpoint still strips the template's `</think>` marker, so a client
 cannot split on it), `P2P=` (`NCCL_P2P_LEVEL`, default `SYS`: +8 % prefill on a 2+2 PCIe layout,
 CHANGES.md §8d), `TUNEOP_TUNING=1` (TunableOp *tuning* boot — never in production, CHANGES.md
-§8d; the shipped rows in `tunableop/` are used lookup-only by default), and the QSA re-tuning
+§8d; the shipped rows in `tunableop/rocblas-<build>/` are used lookup-only when their rocBLAS
+build matches yours, otherwise TunableOp is off and the serve log says so), and the QSA re-tuning
 overrides `VLLM_RDNA_QSA_*` (CHANGES.md §8d).
 
 ### Switching MTP and thinking defaults — plain vLLM arguments, no code changes
