@@ -345,7 +345,7 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   real prefill eager. Pass the sizes explicitly (CHANGES.md §8e).
 - **Large prompts fail or the server misbehaves, decode otherwise fine — try the V1 model runner.** This
   fork runs vLLM's V2 model runner by default on this model (the serve log says `Using V2 Model Runner`;
-  the serve script never sets the variable). One user running dense INT8 + the custom all-reduce on 4× V620
+  the serve script never sets the variable). CorbinD (gfx1030 club Discord), running dense INT8 + the custom all-reduce on 4× V620,
   reported (2026-09-06) that `VLLM_USE_V2_MODEL_RUNNER=0` "fixed all my problems" — large prompts included
   — with a stable 68 t/s decode. We have not reproduced the failure on the development host, so this is a
   documented workaround, not a default change. What the switch changes here: the runner's input
