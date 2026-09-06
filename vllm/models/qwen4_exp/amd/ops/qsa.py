@@ -583,6 +583,33 @@ def _compress_qsa_groups_kernel(
     )
 
 
+import os as _os
+import logging as _logging
+
+
+def _qsa_env_int(name: str, default):
+    v = _os.environ.get(name)
+    return default if v is None or v == "" else int(v)
+
+
+# gfx1030 tuning knobs. Defaults = 2026-09-05 sweep winners (sparse prefill BLOCK_N 64->32, warps 2->4;
+# MQA scoring BLOCK_N 32->128, warps 4->8): +3% @3.3k / +5% @30k prefill in-serve, decode unchanged.
+_QSA_MQA_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_MQA_BLOCK_N", 128)
+_QSA_MQA_WARPS = _qsa_env_int("VLLM_RDNA_QSA_MQA_WARPS", 8)
+_QSA_MQA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_MQA_STAGES", None)  # None -> Triton default (2 on AMD)
+_QSA_PREFILL_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_BLOCK_N", 32)  # prefill branch only (base_programs > 512)
+_QSA_PREFILL_SPLITS = _qsa_env_int("VLLM_RDNA_QSA_SPLITS", 1)
+_QSA_PREFILL_WARPS = _qsa_env_int("VLLM_RDNA_QSA_WARPS", 4)
+_QSA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_STAGES", None)  # None -> 1 on ROCm, 2 elsewhere
+_QSA_OVERRIDES = {k: v for k, v in _os.environ.items() if k.startswith("VLLM_RDNA_QSA_")}
+if _QSA_OVERRIDES:
+    _logging.getLogger(__name__).warning("QSA overrides active: %s", _QSA_OVERRIDES)
+_logging.getLogger(__name__).info(
+    "QSA launch params: mqa_bn=%s mqa_warps=%s mqa_stages=%s prefill_bn=%s prefill_splits=%s prefill_warps=%s",
+    _QSA_MQA_BLOCK_N, _QSA_MQA_WARPS, _QSA_MQA_STAGES, _QSA_PREFILL_BLOCK_N, _QSA_PREFILL_SPLITS, _QSA_PREFILL_WARPS,
+)
+
+
 def _validate_mqa(q: torch.Tensor) -> None:
     if q.ndim != 3 or q.shape[1] <= 0 or q.shape[2] <= 0:
         raise ValueError("QSA query must be [rows, heads, head_dim]")
@@ -632,7 +659,8 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
-    block_n = 32
+    block_n = _QSA_MQA_BLOCK_N
+    _qsa_mqa_extra = {} if _QSA_MQA_STAGES is None else {'num_stages': _QSA_MQA_STAGES}
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         k_cache,
@@ -663,7 +691,8 @@ def qsa_mqa_paged(
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
         COMPRESS_RATIO=compress_ratio,
-        num_warps=4,
+        num_warps=_QSA_MQA_WARPS,
+        **_qsa_mqa_extra,
     )
     return logits, visible_blocks
 
@@ -883,10 +912,10 @@ def qsa_sparse_paged_attention(
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
-        block_n, target_splits, partial_warps = 64, 1, 2
+        block_n, target_splits, partial_warps = _QSA_PREFILL_BLOCK_N, _QSA_PREFILL_SPLITS, _QSA_PREFILL_WARPS
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
-    partial_stages = 1 if current_platform.is_rocm() else 2
+    partial_stages = (1 if current_platform.is_rocm() else 2) if _QSA_STAGES is None else _QSA_STAGES
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
