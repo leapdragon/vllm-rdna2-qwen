@@ -8,10 +8,10 @@
 
 This is a fork of [vLLM](https://github.com/vllm-project/vllm) that serves the
 **Qwen3.8-Flash-Next** model (176 B parameters) on **four AMD Radeon PRO V620** cards
-(Navi 21 / gfx1030) at about **100 tokens per second**, built against a stock
+(Navi 21 / gfx1030) at about **64 tokens per second** prior to MTP, built against a stock
 **TheRock ROCm 7.14** install. Stock vLLM cannot do this: it does not support gfx1030, the
 model is not merged upstream yet, and the model's 51-billion-row n-gram table does not fit on
-the cards. Everything that makes it work is in this repository. You do not need Docker.
+the cards. Everything that makes it work is in this repository. You do not need Docker, but a container is provided.
 
 **What you get**: the patched vLLM source (kernels written for this chip, a P2P all-reduce,
 int8 shadows, fused decode kernels, the CPU offload for the n-gram table), the build and serve
@@ -29,6 +29,8 @@ scripts, the benchmark/validation tools, and the research write-ups explaining e
 - `git`, `cmake`, `ninja`, `gcc`, [`uv`](https://docs.astral.sh/uv/) (for a Python 3.12
   environment), and the Hugging Face CLI (`pip install -U huggingface_hub` gives you `hf`).
 - About 3 hours of unattended build time and ~105 GB of downloads.
+
+**The warranty** does not exist. This repo is maintained by Claude and targets one box (4x v620 X399 Threadripper). If it's useful to you, great. If it's not, you can have a refund of what you paid. ;-)
 
 **The steps** (each one is spelled out in [`docs/rdna2/README.md`](docs/rdna2/README.md)):
 
