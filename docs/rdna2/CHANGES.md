@@ -458,6 +458,12 @@ did not change the counters for this model. The lever is a scheduler change: end
 step of a prompt on a block boundary so the largest aligned prefix is checkpointed, leaving a
 recompute of < block_size tokens on re-send (~0.5 s → ~0.45 s with 256-token blocks). Not done.
 
+**User report, 2026-09-06 — `VLLM_USE_V2_MODEL_RUNNER=0`.** A user running dense INT8 + the custom all-reduce on
+4× V620 reported that switching to the V1 model runner resolved large-prompt failures they were seeing on the
+default V2 runner, with a stable 68 t/s decode. Not reproduced here; documented as a workaround in
+TROUBLESHOOTING.md §5b with what the switch changes in this fork (PLE staging path).
+
+## 9. What was measured but not adopted
 
 - YTILE=2 (two rows per wave) and LDS-staged activations for `gemv_f16_rdna2`: no gain.
 - A 4-deep unroll of the MoE int4 GEMV: no gain (not memory-level-parallelism bound).

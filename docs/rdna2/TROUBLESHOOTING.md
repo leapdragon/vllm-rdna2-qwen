@@ -343,6 +343,17 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   log's `Capturing CUDA graphs (PIECEWISE): 0/N` count: vLLM caps the default list at
   `min(max_num_seqs × 2, 512)` tokens, so a small `--max-num-seqs` (4 here → 8 tokens) leaves every
   real prefill eager. Pass the sizes explicitly (CHANGES.md §8e).
+- **Large prompts fail or the server misbehaves, decode otherwise fine — try the V1 model runner.** This
+  fork runs vLLM's V2 model runner by default on this model (the serve log says `Using V2 Model Runner`;
+  the serve script never sets the variable). One user running dense INT8 + the custom all-reduce on 4× V620
+  reported (2026-09-06) that `VLLM_USE_V2_MODEL_RUNNER=0` "fixed all my problems" — large prompts included
+  — with a stable 68 t/s decode. We have not reproduced the failure on the development host, so this is a
+  documented workaround, not a default change. What the switch changes here: the runner's input
+  staging (V1 keeps CPU mirrors of the batch inputs, V2 keeps them on the GPU), so the PLE offload uses its
+  older CPU-mirror + ZMQ request path on V1 instead of the doorbell path (§8c) — functional, a little more
+  per-step latency. Everything else (int8 shadows, all-reduce, MoE/QSA configs, TunableOp, graph capture
+  sizes) applies to both. If you hit large-prompt failures on V2, please report the exact error and
+  the prompt length; that is the missing data point.
 - **`curl -X POST /stop_profile` may never return** although every rank has already written its
   trace (seen with 4 × 70 MB decode traces). Always pass `--max-time`; the traces on disk are
   complete once their sizes stop changing.
