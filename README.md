@@ -1,4 +1,4 @@
-# WHAT'S HERE
+# WHAT'S IN THE BRANCH
 
 - vLLM fork for 4x Radeon Pro v620
 - Specifically targeting Qwen 3.8 Flash Next
