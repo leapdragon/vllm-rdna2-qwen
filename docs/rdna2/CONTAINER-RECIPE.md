@@ -207,6 +207,7 @@ our Python and served a stale graph for a whole boot). Each knob that is not opt
 | `MTP=3` | 2.4–3.1 accepted tokens per step; 1.9× |
 | `VLLM_ROCM_USE_AITER=0 TORCH_BLAS_PREFER_HIPBLASLT=0` | neither exists for gfx1030 |
 | `DENSE_INT8=1` (→ `VLLM_RDNA_DENSE_INT8=1`) | int8 weight-only shadows of every dense fp16 projection for decode; +1 GB/card (T45) |
+| `DENSE_INT8_ONLY=1` (→ `VLLM_RDNA_DENSE_INT8_ONLY=1`, default 0) | release the fp16 copies once the shadows exist: 20.3 → 17.05 GiB/card, KV pool ~2×; prefill dequantises the shadow into persistent scratch buffers. Own compile-cache root; `GPUUTIL` ≤ 0.93 (T45b, CHANGES §7) |
 | one-shot all-reduce on by default (`VLLM_RDNA_AR=0` disables) | RCCL costs 156 µs per 20 KB collective on 4 PCIe cards; ours 33 µs (T44) |
 | `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` | the FA-derived backends run their Triton path |
 
@@ -422,6 +423,14 @@ clear with `hipGetLastError()`.
 Per-output-channel symmetric int8 of every fp16 `weight` built in
 `process_weights_after_loading` (fp16 kept for prefill). Same wave-per-row kernel with 16
 weights per 16-byte load. Halves the streamed bytes: lm_head 1.27 → 0.64 ms.
+
+**Shadows only (T45b, 2026-09-06).** `VLLM_RDNA_DENSE_INT8_ONLY=1` releases the fp16 copy after the
+shadow is built (the parameter becomes a 0-element placeholder); prefill-shaped calls dequantise
+the shadow inside the runtime-dispatch ops into persistent per-shape scratch buffers. Weights per
+card 20.29 → 17.05 GiB, KV pool 300k → 540k tokens at 0.93; teacher-forced NLL +0.1 % (within
+noise), prefill and single-stream decode unchanged within noise, 12 streams −2 %. The compiled
+graph changes, so the mode needs its own `VLLM_CACHE_ROOT`; and at 0.96 the freed memory all became
+KV cache and a `prompt_logprobs` request OOMed — use ≤ 0.93 (RESULTS.md T45b).
 
 ### 8.3 The trace-time freeze (read this before adding any decode-only path)
 

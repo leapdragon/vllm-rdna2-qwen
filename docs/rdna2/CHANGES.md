@@ -44,7 +44,7 @@ Where our code lives (new or modified files, by area):
 | area | files |
 |---|---|
 | `csrc/rocm/` | `rdna_allreduce.cuh/.cu` (one-shot all-reduce), `rdna_fused_glue.cu` (fused hc / shared-expert kernels), `skinny_gemms_int4.cu` (int4 MoE GEMV, `gemv_f16_rdna2`, `gemv_i8_rdna2`), `ops.h`, `torch_bindings.cpp` |
-| `vllm/model_executor/layers/` | `rdna_ops.py` (runtime-dispatch custom ops), `rdna_dense_int8.py` (int8 shadows), `utils.py` (the GEMM route), `linear.py` / `vocab_parallel_embedding.py` (hooks), `fused_qk_norm_rope.py`, `fused_moe/experts/triton_moe.py` (MoE hook), `ple_offload_layer.py` |
+| `vllm/model_executor/layers/` | `rdna_ops.py` (runtime-dispatch custom ops), `rdna_dense_int8.py` (int8 shadows; shadows-only mode), `utils.py` (the GEMM route), `linear.py` / `vocab_parallel_embedding.py` (hooks), `fused_qk_norm_rope.py`, `fused_moe/experts/triton_moe.py` (MoE hook), `ple_offload_layer.py` |
 | `vllm/distributed/device_communicators/` | `rdna_all_reduce.py`, `cuda_communicator.py` (hook) |
 | `vllm/v1/ple_offload/` | the PLE offload worker/connector, `hip_driver.py` (HIP shim) |
 | `vllm/models/qwen4_exp/amd/` | `ple_layer.py` (offload + sidecar), `hyperconnection.py`, `qsa.py`, `indexer_qsa.py`, fp16 enablement |

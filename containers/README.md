@@ -55,7 +55,10 @@ docker run -d --name qwen38 --network=host \
   the server answers. Keep `/models` on an SSD — a spinning disk or network share under the sidecar
   produces the slow-lookup symptoms in the PLE diagnostic tree.
 - Knobs: `MTP` (3; `0` disables speculative decoding and frees ~150k tokens of KV),
-  `MAXLEN` (131072), `GPUUTIL` (0.90), `VISION` (0/1), `CHAT_KWARGS`
+  `MAXLEN` (131072), `GPUUTIL` (0.90), `DENSE_INT8_ONLY` (0; `1` releases the fp16 copies of the
+  int8-shadowed dense projections for ~3 GiB/card more KV — needs `GPUUTIL` ≤ 0.93 and a persistent
+  compile cache of its own; in the serve script from fork commit `77d25862e` on, so images built
+  before it ignore the knob), `VISION` (0/1), `CHAT_KWARGS`
   (`'{"preserve_thinking": true, "reasoning_effort": "medium"}'`), `TOOLS` (1), `PORT` (8000 —
   add `-e HEALTHCHECK_PORT=`), `EXTRA_ARGS`, `DRYRUN=1` (print the resolved command and exit).
   Semantics and the measured worth of each: README §6 and [CHANGES.md](../docs/rdna2/CHANGES.md).

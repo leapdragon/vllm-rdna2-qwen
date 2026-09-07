@@ -350,6 +350,24 @@ All from https://github.com/leapdragon/vllm-rdna2-qwen; each cost at least one 1
   16 ms decode step (with Python stack tracing on, more). Trust kernel durations (GPU-timestamped)
   and compute idle as the untraced step minus kernel time; do not read idle off the trace.
 
+### 5c. Trap found during the shadows-only work (2026-09-06)
+
+**Symptom:** with `DENSE_INT8_ONLY=1` the boot is healthy and the KV pool is much larger, then a
+`prompt_logprobs` request (or any request whose logits cover many prompt tokens) fails with
+`torch.OutOfMemoryError: ... 0 bytes is free` — once as a 400 for that request, once taking the
+engine down. Plain generation never trips it.
+
+**Cause:** vLLM sizes the KV pool from a profile run that never exercises full-vocabulary logits
+over a whole prompt (~1.5 GB transient at 1k tokens: fp16 logits gathered across TP plus the fp32
+log-softmax). Releasing the fp16 copies hands ~3.2 GiB/card to that pool, so at
+`--gpu-memory-utilization 0.96` the card runs with ~0.2 GiB of unbudgeted headroom. The first
+version of the dequant path made it worse by churning per-call N×K temporaries through the
+caching allocator, which fragmented it; persistent scratch buffers fixed that part.
+
+**Fix:** run the mode at `GPUUTIL` ≤ 0.93 (~2 GiB idle headroom; 540k tokens of pool at 180k
+context is still 1.8× the fp16 layout's). **Verify:** a `prompt_logprobs=1` completion over a
+~1k-token prompt succeeds twice in a row and the server log shows no `OutOfMemoryError`.
+
 ## 6. Meta-lessons (the generalizable part)
 
 - **Keep the KFD homogeneous.** Only put GPUs in the machine that your

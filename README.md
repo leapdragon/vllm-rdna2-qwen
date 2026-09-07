@@ -16,7 +16,8 @@ model is not merged upstream yet, and the model's 51-billion-row n-gram table do
 the cards. Everything that makes it work is in this repository. You do not need Docker, but a container is provided.
 
 **What you get**: the patched vLLM source (kernels written for this chip, a P2P all-reduce,
-int8 shadows, fused decode kernels, the CPU offload for the n-gram table), the build and serve
+int8 shadows of the dense projections — optionally as the only resident copy, for ~3 GiB/card more
+KV cache — fused decode kernels, the CPU offload for the n-gram table), the build and serve
 scripts, the benchmark/validation tools, and the research write-ups explaining every change.
 
 **What you need** (details in [`docs/rdna2/README.md`](docs/rdna2/README.md) §1):

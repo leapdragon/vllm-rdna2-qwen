@@ -50,7 +50,7 @@ weight index, so without the offload env the model has no table at all.
 600 s**), plus `ROCR_VISIBLE_DEVICES`, `HSA_NO_SCRATCH_RECLAIM=1`, `NCCL_P2P_LEVEL=PXB`,
 `VLLM_ROCM_USE_AITER=0`, `TORCH_BLAS_PREFER_HIPBLASLT=0`,
 `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`, `PYTORCH_TUNABLEOP_ENABLED=0`,
-`VLLM_RDNA_DENSE_INT8=1`, `VLLM_RDNA_AR=1`, and the required CLI
+`VLLM_RDNA_DENSE_INT8=1` (optionally `VLLM_RDNA_DENSE_INT8_ONLY=1`), `VLLM_RDNA_AR=1`, and the required CLI
 (`--dtype float16 -tp 4 --enable-expert-parallel …`).
 
 **KV-pool interaction you will hit with MTP:** the pool must hold one max-length request. At

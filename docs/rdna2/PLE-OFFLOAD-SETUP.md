@@ -85,6 +85,7 @@ configuration the model has no table at all. The script sets, and you must not l
 | `HSA_NO_SCRATCH_RECLAIM=1`, `NCCL_P2P_LEVEL=PXB` | | platform stability (see CHANGES §4) |
 | `VLLM_ROCM_USE_AITER=0`, `TORCH_BLAS_PREFER_HIPBLASLT=0`, `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`, `PYTORCH_TUNABLEOP_ENABLED=0` | | gfx1030 kernel routing |
 | `VLLM_RDNA_DENSE_INT8=1`, `VLLM_RDNA_AR=1` | | this fork's decode kernels / all-reduce |
+| `VLLM_RDNA_DENSE_INT8_ONLY=1` (optional, default 0) | `DENSE_INT8_ONLY=1` | int8 shadows only: ~3 GiB/card more KV pool; pair with `GPUUTIL` ≤ 0.93 and a separate `VLLM_CACHE_ROOT` (CHANGES §7) |
 
 Plus the CLI the script builds: `--dtype float16 --tensor-parallel-size 4
 --enable-expert-parallel --max-num-seqs 4 --max-num-batched-tokens 2048` and, per knobs,
@@ -92,7 +93,8 @@ Plus the CLI the script builds: `--dtype float16 --tensor-parallel-size 4
 
 **Context-size interaction you will hit with MTP:** the KV pool must hold at least one
 max-length request. On 32 GB cards at `GPUUTIL=0.90`, roughly: MTP=0 text-only ≈ 530k tokens
-of pool; vision costs ~130k; **MTP=3 costs ~150k more** (head weights + draft graphs). So
+of pool; vision costs ~130k; **MTP=3 costs ~150k more** (head weights + draft graphs);
+`DENSE_INT8_ONLY=1` gives ~240k back (3.2 GiB/card, measured 300k → 540k at 0.93 with 180k context). So
 `MTP=3` + vision does **not** fit `MAXLEN=196608` — use 131072 or 65536. If you see a startup
 error about max seq len vs KV cache size, this is it, not a PLE problem.
 
