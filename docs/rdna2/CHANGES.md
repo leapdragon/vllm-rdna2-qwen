@@ -188,6 +188,22 @@ decode GEMV only (fp16 kept for prefill). Halves the streamed bytes; +1 GB per c
 `VLLM_RDNA_DENSE_INT8=1`. Output validated with greedy checks; the MTP acceptance rate moves by
 about ±0.1 tokens/step.
 
+**Shadows only (`VLLM_RDNA_DENSE_INT8_ONLY=1`, 2026-09-06).** Releases the fp16 copy of every
+shadowed projection once its shadow exists (the parameter becomes a 0-element placeholder), so the
+int8 copy is the only resident one: weights per card 20.29 → 17.05 GiB, the KV pool roughly
+doubles. Prefill-shaped calls (M > 8) dequantise the shadow on the fly inside the runtime-dispatch
+ops (`rdna_dense_gemm`, `rdna_hc_mix`, `rdna_shared_expert`) into persistent per-shape fp16
+scratch buffers (`rdna_dense_int8.dequant` / `linear_released`, 8192-row blocks for the lm_head);
+the fakes take their shapes from the int8 tensor. Layers whose shadow is skipped keep their fp16
+weight. Measured against the fp16-prefill layout on 9,210 teacher-forced tokens: NLL/token +0.1 %
+(inside the sampling error), top-1 agreement −0.2 points (inside its error), mean per-token
+logprob shift 0.24 nats; prefill and single-stream decode unchanged within noise, 12 concurrent
+streams −2 % (the M > 8 path). Two operational notes: the compiled graph changes (0-element
+weights), so give this mode its own `VLLM_CACHE_ROOT` and expect one recompile; and re-derive
+`--gpu-memory-utilization` — at 0.96 the freed memory all became KV cache and an unprofiled
+`prompt_logprobs` transient (full-vocabulary logits, ~1.5 GB) ran the card out of memory, while
+0.93 keeps ~2 GiB of idle headroom. Serve script knob: `DENSE_INT8_ONLY=1`.
+
 ## 8. T46 — dispatch count (98–101 t/s)
 
 The decode step was ~2,700 kernels with ~4 µs of bubble between each — one third of the step.

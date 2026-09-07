@@ -39,11 +39,15 @@ def _rdna_dense_gemm(
         x2 = x.reshape(-1, x.size(-1)).contiguous()
         out = ops.gemv_i8_rdna2(x2, weight_i8, scale, bias)
         return out.reshape(*x.shape[:-1], weight_i8.shape[0])
+    from vllm.model_executor.layers.rdna_dense_int8 import is_released, linear_released
+
+    if is_released(weight):
+        return linear_released(x, weight_i8, scale, bias)
     return F.linear(x, weight, bias)
 
 
 def _rdna_dense_gemm_fake(x, weight, weight_i8, scale, bias):
-    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+    return x.new_empty((*x.shape[:-1], weight_i8.shape[0]))
 
 
 # ---------------------------------------------------------------- hyper-connection mix
@@ -71,7 +75,10 @@ def _rdna_hc_mix(
         return block_input, dai
     # prefill / fallback: the original op sequence
     from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
+    from vllm.model_executor.layers.rdna_dense_int8 import weight_for_gemm
 
+    w_down = weight_for_gemm(w_down, w_down_i8, s_down)
+    w_up = weight_for_gemm(w_up, w_up_i8, s_up)
     dai = F.linear(xn, w_down)
     lora = hc_silu(dai[:, :lora_rank].contiguous(), hc_count)
     gate = F.linear(lora, w_up)
@@ -81,9 +88,10 @@ def _rdna_hc_mix(
 
 def _rdna_hc_mix_fake(xn, w_down, w_down_i8, s_down, w_up, w_up_i8, s_up, lora_rank, hc_count):
     m = xn.shape[0]
+    n_down = w_down_i8.shape[0] if w_down_i8 is not None else w_down.shape[0]
     return (
         xn.new_empty((m, xn.shape[1] // hc_count)),
-        xn.new_empty((m, w_down.shape[0])),
+        xn.new_empty((m, n_down)),
     )
 
 
@@ -107,6 +115,10 @@ def _rdna_shared_expert(
         b, sb = (w2_i8, s2) if w2_i8 is not None else (w2, None)
         act = ops.rdna_se_gate_up_silu(x, a, sa)
         return ops.rdna_se_down_gated(act, b, sb, x, w_gate)
+    from vllm.model_executor.layers.rdna_dense_int8 import weight_for_gemm
+
+    w1 = weight_for_gemm(w1, w1_i8, s1)
+    w2 = weight_for_gemm(w2, w2_i8, s2)
     gu = F.linear(x, w1)
     half = gu.shape[-1] // 2
     act = F.silu(gu[..., :half]) * gu[..., half:]
@@ -115,7 +127,8 @@ def _rdna_shared_expert(
 
 
 def _rdna_shared_expert_fake(x, w1, w1_i8, s1, w2, w2_i8, s2, w_gate):
-    return x.new_empty((*x.shape[:-1], w2.shape[0]))
+    n_out = w2_i8.shape[0] if w2_i8 is not None else w2.shape[0]
+    return x.new_empty((*x.shape[:-1], n_out))
 
 
 direct_register_custom_op(

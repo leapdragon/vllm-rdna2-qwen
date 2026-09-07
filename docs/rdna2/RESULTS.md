@@ -147,6 +147,29 @@ switch has this problem; the fix is an opaque custom op with the choice inside
 (`rdna_ops.py: rdna_dense_gemm`). With that (boot 9b) fp16 GEMVs are 32/step (the <64-row
 layers) and int8 3.5 ms/step vs 10.9 fp16 before.
 
+### T45b — shadows only: release the fp16 copies (2026-09-06)
+
+`VLLM_RDNA_DENSE_INT8_ONLY=1` drops the fp16 originals after the shadows are built; prefill
+dequantises the shadow per call (persistent scratch buffers). Four V620s, MTP=0, 170 W caps,
+`--gpu-memory-utilization 0.93`:
+
+| | fp16 + shadows | shadows only |
+|---|---|---|
+| weights per card at load | 20.29 GiB | 17.05 GiB |
+| KV pool at 0.96 | 346,874 tokens | 610,046 tokens |
+| prefill @3.3k / @30k (tok/s) | 1038 / 1127 (09-05) | 1082 / 1180 |
+| decode, single stream (t/s) | 63.7–64.1 | 63.1–63.2 |
+| decode, 12 streams aggregate (t/s) | 129.9 | 127.3 |
+| teacher-forced NLL/token (9,210 tokens) | 2.1137 | 2.1160 (+0.1 %, SE 0.005) |
+| top-1 agreement with the prompt token | 57.70 % | 57.52 % (SE 0.5) |
+| mean \|Δ logprob\| per token | — | 0.24 nats (rms 0.48; 5.3 % of tokens > 1 nat) |
+
+The same server captured twice reproduces exactly, so the drift is entirely the int8 side layers
+in prefill; greedy validation passes. At 0.96 the freed memory all went to KV and a
+`prompt_logprobs` request (unprofiled ~1.5 GB transient) OOMed — once a failed request, once
+the engine — hence 0.93 and the scratch buffers (the first version used per-call temporaries,
+which fragmented the caching allocator).
+
 ## T46 — dispatch-count fusion: 82 → 98–101 t/s (2026-08-29)
 
 Decode-only budget (boot 5): 41 ms/step, kernel-sum 26 ms, **2,711 kernels/step**, GPU busy

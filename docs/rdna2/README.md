@@ -136,7 +136,8 @@ Optional knobs: `GPUUTIL=` (default 0.90), `MAXLEN=` (default 131072; the model 
 KV pool held ~197k tokens at 0.86), `MTP=4` (+2 % on long generations) or `MTP=0` (no draft head:
 the `mtp.*` weights are never loaded and no draft graphs are captured, ~2.5 GiB/card back to the KV
 pool — worth it when your workload's acceptance rate is low, e.g. below ~20 %), `DENSE_INT8=0` (fp16
-dense projections; −15 %), `GPUS=1,2,3,4` (ROCR device ids), `PORT=`, `PROFILE=1` (enables `/start_profile`),
+dense projections; −15 %), `DENSE_INT8_ONLY=1` (int8 shadows only: releases the fp16 copies, ~3 GiB/card
+more KV cache at no measurable quality cost; needs its own compile cache and `GPUUTIL` ≤ 0.93 — CHANGES.md #7), `GPUS=1,2,3,4` (ROCR device ids), `PORT=`, `PROFILE=1` (enables `/start_profile`),
 `VISION=1` (loads the model's 0.9 GB Qwen3-VL-style vision tower on every rank and accepts
 images on the chat API — up to `MM_LIMIT` per prompt, default `'{"image": 4, "video": 0}'`;
 images are resized to `MM_PROCESSOR_KWARGS`, default `'{"max_pixels": 1638400}'` ≈ 1280×1280.

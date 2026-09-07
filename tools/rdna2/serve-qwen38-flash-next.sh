@@ -8,7 +8,9 @@
 #     tools/rdna2/serve-qwen38-flash-next.sh
 #
 # Knobs (env): GPUS (ROCR device ids, default 1,2,3,4), PORT (8000), MTP (3), GPUUTIL (0.90),
-#   DENSE_INT8 (1), EAGER (unset), PROFILE (unset), TRACES (dir for torch-profiler traces),
+#   DENSE_INT8 (1), DENSE_INT8_ONLY (0; 1 = release the fp16 copies of the shadowed projections,
+#   ~3 GiB/card -> KV; own VLLM_CACHE_ROOT + GPUUTIL <= 0.93, see CHANGES.md #7), EAGER (unset),
+#   PROFILE (unset), TRACES (dir for torch-profiler traces),
 #   COMPILE_CACHE_OFF (1), P2P (SYS; NCCL_P2P_LEVEL, +8% prefill), CG_SIZES (piecewise CUDA-graph
 #   capture sizes, default '1 2 4 8 16 32 64 128 256'; empty = vLLM default), MAXLEN (131072; the model allows 262144 and the KV pool
 #   at GPUUTIL 0.86 held ~177-197k tokens, i.e. 1.35-1.5 concurrent 128k requests), EXTRA_ARGS,
@@ -99,6 +101,10 @@ export VLLM_PLE_QUANT_DIR="$PLE_INT4"
 export VLLM_PLE_OFFLOAD_READY_TIMEOUT=3600
 # int8 shadows of the dense fp16 projections for decode (CHANGES.md #7)
 export VLLM_RDNA_DENSE_INT8="${DENSE_INT8:-1}"
+# DENSE_INT8_ONLY=1: release the fp16 copies of the shadowed dense projections after loading
+# (~2 GB/rank back to the KV pool; prefill dequantises the int8 shadow per call). New torch.compile
+# graph (0-element weight placeholders): first boot recompiles -- use a separate VLLM_CACHE_ROOT.
+export VLLM_RDNA_DENSE_INT8_ONLY="${DENSE_INT8_ONLY:-0}"
 # one-shot P2P all-reduce (CHANGES.md #6); VLLM_RDNA_AR=0 falls back to RCCL
 export VLLM_RDNA_AR="${VLLM_RDNA_AR:-1}"
 # torch.compile cache key does not cover this fork's Python; keep it off (CHANGES.md #8)
