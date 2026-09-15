@@ -180,6 +180,19 @@ P2P path cannot pass. If you see `rdna_ar: disabled -- boot self-test failed` on
 board, update to a tree with this change before concluding anything about your fabric. Motivation and what the knobs do NOT touch:
 the one-shot path only carries decode-size messages (≤ 64 KB); prefill collectives are RCCL.
 
+**Wedge handling (T44b, 2026-09-07).** Two boards reported the same picture: after a while one
+GPU, or three, sits at 99 % and generation stops until the engine's 300 s execute timeout. That
+is a collective whose peer flag never arrived: the kernel's spin was bounded (~2 s) and set a
+sticky flag, but nothing read the flag after the boot self-test, so every later collective also
+spun to its cap and returned without writing its output. Now the first abort records phase, peer
+and sequence number in a host-mapped word (`rdna_ar_timeout_info`), the model runner reads it
+once per step with a plain load, and on the first hit the process logs `rdna_ar: WEDGED -- rank
+r timed out after ~N ms at collective #s: peer rank j's flag never arrived`, writes
+`$VLLM_CACHE_ROOT/rdna_ar_wedged`, and fails the step. Graph-captured collectives cannot be
+re-routed in a live process, so the fallback is the next boot, which sees the marker and starts
+on RCCL with a warning naming it; delete the marker to retry P2P, `VLLM_RDNA_AR=0` forces RCCL.
+`VLLM_RDNA_AR_SPIN_CAP` (polls per wait, default 2,000,000 ≈ 2 s) tunes the bound.
+
 ## 7. T45 — int8 shadows of the dense projections
 
 `gemv_i8_rdna2` + `vllm/model_executor/layers/rdna_dense_int8.py`: per-output-channel symmetric

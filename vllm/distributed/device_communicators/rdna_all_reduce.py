@@ -23,9 +23,21 @@ fewer, paced push streams into the receiving GPU's root complex, at a few us per
 collective (T44: 20 KB at 16/4 blocks = 33/36 us). Peer order is always rank-staggered.
 VLLM_RDNA_AR_MAX_KB (default 512) bounds the fast path; larger tensors and
 other dtypes take the stock path.
+
+T44b (2026-09-07) -- wedge handling. A collective that hits its spin cap aborts without
+writing its output; before, nothing read the sticky flag after boot, so a fabric that drops
+or stalls a peer's posted write showed as GPUs pinned at 99 % and generation stopped until
+the 300 s engine timeout (two boards reported it). Now the kernel records phase/peer/sequence
+in a host-mapped word, `rdna_ar_check()` reads it once per engine step (plain load, no sync),
+and on the first abort the process logs the diagnosis, writes a marker under VLLM_CACHE_ROOT
+and fails the step. Graph-captured collectives cannot be re-routed in a live process, so the
+honest fallback is the NEXT boot, which sees the marker and starts on RCCL (delete the marker
+to retry P2P; VLLM_RDNA_AR=0 forces RCCL regardless). VLLM_RDNA_AR_SPIN_CAP sets the polls
+per wait before abort (default 2,000,000, ~2 s).
 """
 
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -36,6 +48,44 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _instances = 0
+_MARKER_NAME = "rdna_ar_wedged"
+
+
+def marker_path() -> str:
+    from vllm import envs
+
+    return os.path.join(envs.VLLM_CACHE_ROOT, _MARKER_NAME)
+
+
+def describe_abort(code: int, rank: int) -> str:
+    """Decode the kernel's abort record (layout in rdna_allreduce.cuh) into one sentence."""
+    phase = (code >> 8) & 0xF
+    peer = (code >> 12) & 0xF
+    ms = (code >> 16) & 0xFFFF
+    seq = (code >> 32) & 0xFFFFFFFF
+    if phase == 1:
+        what = "its own blocks never reached the grid barrier (a launch on this GPU stalled)"
+    else:
+        what = (f"peer rank {peer}'s flag never arrived (the posted P2P write from GPU {peer} "
+                "was lost or stalled on this fabric)")
+    return f"rank {rank} timed out after ~{ms} ms of spinning at collective #{seq}: {what}"
+
+
+_active: "RdnaOneShotAllReduce | None | bool" = False  # False = not looked up yet
+
+
+def rdna_ar_check() -> None:
+    """Per-step wedge check for the TP group's instance; a no-op unless the fast path is active."""
+    global _active
+    if _active is False:
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            _active = getattr(get_tp_group().device_communicator, "rdna_ar_comm", None)
+        except Exception:  # noqa: BLE001 -- no TP group (single rank / not initialised)
+            _active = None
+    if _active is not None and not _active.disabled:
+        _active.check()
 
 
 class RdnaOneShotAllReduce:
@@ -51,6 +101,21 @@ class RdnaOneShotAllReduce:
         max_kb = int(os.getenv("VLLM_RDNA_AR_MAX_KB", "64"))  # decode messages; prefill chunks are faster on RCCL
         self.max_bytes = max_kb * 1024
         if not (2 <= self.world_size <= 8):
+            return
+        # T44b: a previous run on this machine wedged -- stay on RCCL until the marker is removed.
+        marker = marker_path()
+        if os.path.exists(marker):
+            try:
+                why = open(marker).read().strip().replace("\n", " ")[:400]
+            except OSError:
+                why = "unreadable marker"
+            logger.warning(
+                "rdna_ar: disabled -- a previous run wedged on this machine (%s). Using RCCL for "
+                "the small collectives. Delete %s to try the one-shot path again (a slow or "
+                "ACS-redirected GPU P2P path is the usual cause), or set VLLM_RDNA_AR=0 to keep "
+                "RCCL without this warning.",
+                why, marker,
+            )
             return
         dev_idx = device.index if device.index is not None else torch.cuda.current_device()
         gathered: list = [None] * self.world_size
@@ -150,8 +215,10 @@ class RdnaOneShotAllReduce:
                         out = self._ops.rdna_ar_all_reduce(self.handle, inp)
                         torch.cuda.synchronize(device)
                         dt = time.perf_counter() - t0
-                        if self._ops.rdna_ar_timed_out(self.handle):
-                            return f"spin-cap timeout in self-test trial {trial} rep {rep} ({dt * 1e3:.0f} ms)"
+                        code = int(self._ops.rdna_ar_timeout_info(self.handle))
+                        if code:
+                            return (f"spin-cap timeout in self-test trial {trial} rep {rep} ({dt * 1e3:.0f} ms): "
+                                    f"{describe_abort(code, self.rank)}")
                         if not bool((out == expect).all()):
                             got = out.float().mean().item()
                             return f"wrong result in self-test trial {trial} rep {rep}: mean {got:.2f}, expected {expect:.1f}"
@@ -173,3 +240,36 @@ class RdnaOneShotAllReduce:
 
     def timed_out(self) -> bool:
         return (not self.disabled) and self._ops.rdna_ar_timed_out(self.handle)
+
+    def _write_marker(self, msg: str) -> str | None:
+        path = marker_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} world={self.world_size} {msg}\n")
+            return path
+        except OSError as e:
+            logger.warning("rdna_ar: could not write the wedge marker %s: %s", path, e)
+            return None
+
+    def check(self) -> None:
+        """Once per engine step (T44b). A collective that hit its spin cap returned WITHOUT
+        writing its output, so the current step is already wrong and every later collective
+        would spin to its cap too. Diagnose, leave the marker for the next boot, fail now."""
+        if self.disabled:
+            return
+        code = int(self._ops.rdna_ar_timeout_info(self.handle))
+        if code == 0:
+            return
+        self.disabled = True
+        msg = describe_abort(code, self.rank)
+        path = self._write_marker(msg)
+        logger.error(
+            "rdna_ar: WEDGED -- %s. The one-shot all-reduce is disabled for this process; "
+            "graph-captured steps cannot be re-routed live, so the engine stops here instead "
+            "of grinding to the execute timeout. The next boot starts on RCCL automatically "
+            "(marker: %s); VLLM_RDNA_AR=0 forces RCCL; delete the marker to retry P2P after "
+            "checking ACS / IOMMU / slot topology (docs/rdna2/TROUBLESHOOTING.md).",
+            msg, path or "not written",
+        )
+        raise RuntimeError(f"rdna_ar wedged: {msg} (see the log line above)")

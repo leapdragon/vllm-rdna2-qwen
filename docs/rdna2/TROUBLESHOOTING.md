@@ -368,6 +368,29 @@ caching allocator, which fragmented it; persistent scratch buffers fixed that pa
 context is still 1.8× the fp16 layout's). **Verify:** a `prompt_logprobs=1` completion over a
 ~1k-token prompt succeeds twice in a row and the server log shows no `OutOfMemoryError`.
 
+### 5d. One GPU (or three) pinned at 99 %, generation and prefill stop (2026-09-07)
+
+**Symptom:** serving works, then at some point one card sits at 99 % busy while the others idle,
+or three sit at 99 % while one idles; nothing progresses; the engine dies at its 300 s execute
+timeout. Reported from two boards, never seen on ours.
+
+**Cause:** the one-shot all-reduce is push-based; each rank waits for every peer's flag. One GPU
+spinning means a peer's posted write to it never landed; three spinning means one rank never
+entered the collective. Slow or redirected GPU peer-to-peer (ACS on, IOMMU in translation
+mode, a card behind the chipset or on another socket, a riser) is the usual reason; the boot
+self-test can pass because it probes outside graph replay.
+
+**What the log says now (T44b):** `rdna_ar: WEDGED -- rank r timed out after ~N ms at
+collective #s: peer rank j's flag never arrived …`, then the engine stops immediately and the
+next boot logs `rdna_ar: disabled -- a previous run wedged on this machine` and runs on RCCL.
+Older builds show only the stall.
+
+**Fix, in order:** run with `VLLM_RDNA_AR=0` (a few percent of decode); disable ACS in the
+BIOS and put the IOMMU in passthrough (`iommu=pt`); move the cards onto one root complex at
+full width; under RCCL, `NCCL_P2P_LEVEL=SYS` then `NCCL_P2P_DISABLE=1`. **Verify:** after the
+fix, delete `$VLLM_CACHE_ROOT/rdna_ar_wedged`, boot, and confirm `rdna_ar: one-shot all-reduce
+active` with self-test timings well under 50 ms, then the workload that used to wedge.
+
 ## 6. Meta-lessons (the generalizable part)
 
 - **Keep the KFD homogeneous.** Only put GPUs in the machine that your

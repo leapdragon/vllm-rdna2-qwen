@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.distributed.device_communicators.rdna_all_reduce import rdna_ar_check
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -1551,6 +1552,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         context_len: int = 0,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # T44b (gfx1030): a one-shot all-reduce that hit its spin cap in the previous step has
+        # already returned garbage; read its host-mapped record (no sync) and fail loudly now.
+        rdna_ar_check()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()

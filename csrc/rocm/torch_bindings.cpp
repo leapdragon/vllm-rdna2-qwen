@@ -72,6 +72,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("rdna_ar_all_reduce", torch::kCUDA, &rdna_ar_all_reduce);
   // no tensor arguments -> no dispatch key; register as catch-all
   rocm_ops.def("rdna_ar_timed_out(int handle) -> bool", &rdna_ar_timed_out);
+  rocm_ops.def("rdna_ar_timeout_info(int handle) -> int", &rdna_ar_timeout_info);
   rocm_ops.def("rdna_ar_fast_calls(int handle) -> int", &rdna_ar_fast_calls);
 
   // Custom gemm op for skinny matrix-matrix multiplication

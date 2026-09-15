@@ -105,7 +105,9 @@ export VLLM_RDNA_DENSE_INT8="${DENSE_INT8:-1}"
 # (~2 GB/rank back to the KV pool; prefill dequantises the int8 shadow per call). New torch.compile
 # graph (0-element weight placeholders): first boot recompiles -- use a separate VLLM_CACHE_ROOT.
 export VLLM_RDNA_DENSE_INT8_ONLY="${DENSE_INT8_ONLY:-0}"
-# one-shot P2P all-reduce (CHANGES.md #6); VLLM_RDNA_AR=0 falls back to RCCL
+# one-shot P2P all-reduce (CHANGES.md #6); VLLM_RDNA_AR=0 falls back to RCCL. A wedge (spin-cap
+# abort) now fails the step with a diagnosis and leaves $VLLM_CACHE_ROOT/rdna_ar_wedged, after which
+# boots use RCCL until the marker is deleted (T44b). VLLM_RDNA_AR_SPIN_CAP tunes the bound.
 export VLLM_RDNA_AR="${VLLM_RDNA_AR:-1}"
 # torch.compile cache key does not cover this fork's Python; keep it off (CHANGES.md #8)
 export VLLM_DISABLE_COMPILE_CACHE="${COMPILE_CACHE_OFF:-1}"

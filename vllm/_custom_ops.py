@@ -2232,6 +2232,11 @@ def rdna_ar_timed_out(handle: int) -> bool:
     return torch.ops._rocm_C.rdna_ar_timed_out(handle)
 
 
+def rdna_ar_timeout_info(handle: int) -> int:
+    """T44b: 64-bit abort code of the first spin-cap timeout (0 = none); see rdna_allreduce.cuh."""
+    return torch.ops._rocm_C.rdna_ar_timeout_info(handle)
+
+
 def rdna_gemv_act(x, w, scale, act_cols: int, act_scale: float) -> torch.Tensor:
     return torch.ops._rocm_C.rdna_gemv_act(x, w, scale, act_cols, act_scale)
 

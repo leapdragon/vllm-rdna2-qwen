@@ -3,7 +3,8 @@
 //
 //   rdna_ar_init(rank, world, device_ids, max_bytes, shm_name) -> uint8[64] IPC handle
 //   rdna_ar_connect(handles uint8[world,64])                    (opens every peer's staging)
-//   rdna_ar_can(t) -> bool, rdna_ar_all_reduce(t) -> Tensor, rdna_ar_timed_out() -> bool
+//   rdna_ar_can(t) -> bool, rdna_ar_all_reduce(t) -> Tensor, rdna_ar_timed_out() -> bool,
+//   rdna_ar_timeout_info() -> int64 abort code (T44b; 0 = none)
 //
 // Why not vLLM's own custom all-reduce: its barrier spins on coarse-grained device memory,
 // which a peer's write never makes visible on this platform (T18); and it is gated to
@@ -38,7 +39,10 @@ struct RdnaArState {
   bool opened[RDNA_AR_MAX_WORLD] = {};
   unsigned int* arrive = nullptr;
   int* seqbuf = nullptr;
-  unsigned* timeout = nullptr;
+  unsigned* timeout = nullptr;   // device: sticky abort claim (atomicCAS in the kernel)
+  unsigned long long* report = nullptr;       // device pointer of the host-mapped abort record
+  unsigned long long* report_host = nullptr;  // host side of the same 64 bytes (plain loads)
+  unsigned long long spin_cap = RDNA_AR_SPIN_CAP;  // VLLM_RDNA_AR_SPIN_CAP (polls per wait)
   int64_t fast_calls = 0;
   int blocks_cap = 0;            // VLLM_RDNA_AR_BLOCKS: cap on blocks per launch (0 = auto)
   int pace = 0;                  // VLLM_RDNA_AR_PACE: s_sleep units between strided pushes
@@ -96,6 +100,16 @@ at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_id
   RDNA_AR_CHK(hipMemset(g.seqbuf, 0, 4));
   RDNA_AR_CHK(hipMalloc((void**)&g.timeout, 4));
   RDNA_AR_CHK(hipMemset(g.timeout, 0, 4));
+  // T44b: the abort record lives in fine-grained host memory. The kernel writes it with one
+  // posted store (no PCIe atomics, which not every board supports); the Python side reads it
+  // with a plain load once per engine step, so a wedge is caught without a device sync.
+  RDNA_AR_CHK(hipHostMalloc((void**)&g.report_host, 64, hipHostMallocMapped | hipHostMallocCoherent));
+  memset(g.report_host, 0, 64);
+  RDNA_AR_CHK(hipHostGetDevicePointer((void**)&g.report, g.report_host, 0));
+  if (const char* e = getenv("VLLM_RDNA_AR_SPIN_CAP")) {
+    const long long v = atoll(e);
+    if (v > 0) g.spin_cap = (unsigned long long)v;
+  }
   // (shm_name is kept in the signature for the Python side; the host-coherent flag page it
   // named is no longer used -- flags live in device memory, see rdna_allreduce.cuh)
   (void)shm_name;
@@ -156,24 +170,27 @@ at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in) {
     rdna_ar_oneshot<__half><<<nblocks, threads, 0, stream>>>(
         reinterpret_cast<const __half*>(in.const_data_ptr()),
         reinterpret_cast<__half*>(out.mutable_data_ptr()), g.peers, g.arrive,
-        g.seqbuf, g.timeout, g.rank, g.world, n, max_elems, nblocks, g.pace);
+        g.seqbuf, g.timeout, g.report, g.rank, g.world, n, max_elems, nblocks, g.pace, g.spin_cap);
   } else {
     const long long max_elems = g.max_bytes / 4;
     rdna_ar_oneshot<float><<<nblocks, threads, 0, stream>>>(
         reinterpret_cast<const float*>(in.const_data_ptr()),
         reinterpret_cast<float*>(out.mutable_data_ptr()), g.peers, g.arrive,
-        g.seqbuf, g.timeout, g.rank, g.world, n, max_elems, nblocks, g.pace);
+        g.seqbuf, g.timeout, g.report, g.rank, g.world, n, max_elems, nblocks, g.pace, g.spin_cap);
   }
   g.fast_calls++;
   return out;
 }
 
-bool rdna_ar_timed_out(int64_t handle) {
-  const RdnaArState& g = inst(handle);
-  if (!g.ready) return false;
-  unsigned t = 0;
-  RDNA_AR_CHK(hipMemcpy(&t, g.timeout, 4, hipMemcpyDeviceToHost));
-  return t != 0;
+// T44b: both read the host-mapped record -- no device copy, no stream sync, safe to call
+// every step from the model thread. The code's layout is documented in rdna_allreduce.cuh.
+static inline unsigned long long rdna_ar_report(const RdnaArState& g) {
+  if (!g.ready || g.report_host == nullptr) return 0ull;
+  return *reinterpret_cast<volatile unsigned long long*>(g.report_host);
 }
+
+bool rdna_ar_timed_out(int64_t handle) { return rdna_ar_report(inst(handle)) != 0ull; }
+
+int64_t rdna_ar_timeout_info(int64_t handle) { return (int64_t)rdna_ar_report(inst(handle)); }
 
 int64_t rdna_ar_fast_calls(int64_t handle) { return inst(handle).fast_calls; }
