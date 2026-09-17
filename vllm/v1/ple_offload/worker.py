@@ -422,8 +422,15 @@ class _PleQuantTable:
         self.n_shards = n_shards
         # zero-copy numpy views of the same mmaps for the small-batch fused path
         # plain ndarray views (an np.memmap subclass view costs microseconds per row index)
-        self._q_np = [t.numpy().view(np.ndarray) for t in self._q]
+        self.is_fp8 = ("e4m3" in self.layout) and ("e2m1" not in self.layout)
+        # fp8 rows: numpy has no float8, so view the e4m3 bytes as uint8 and decode through a
+        # 256-entry LUT in gather_rows_small (int4 rows are uint8 nibbles already)
+        self._q_np = [(t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t).numpy().view(np.ndarray)
+                      for t in self._q]
         self._s_np = [t.numpy().view(np.ndarray) for t in self._s]
+        self._lut_np = None
+        if self.is_fp8:
+            self._lut_np = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float().numpy()
         logger.info("PLE quant table: %s, %d shards mmapped from %s",
                     self.layout, n_shards, quant_dir)
 
@@ -450,14 +457,27 @@ class _PleQuantTable:
     def gather_rows_small(self, ids, out) -> None:
         """int4 rows for a small batch: per-row numpy indexing on the mmaps and one
         vectorised dequant (0.05 ms for 16 rows vs 1.6 ms through gather_into).
-        ids: numpy int64 (n,), out: numpy float32 (n, width). int4 layout only."""
+        ids: numpy int64 (n,), out: numpy float32 (n, width). int4 and fp8 per-row layouts."""
         import numpy as np
 
         n = ids.shape[0]
+        rps = self.ROWS_PER_SHARD
+        if self.is_fp8:
+            # fp8 per-row layout (T-PLE8, 2026-09-16): rows are 160 e4m3 bytes + one fp32 scale
+            raw = np.empty((n, self.width), dtype=np.uint8)
+            scl = np.empty((n,), dtype=np.float32)
+            q_np, s_np = self._q_np, self._s_np
+            for k in range(n):
+                i = int(ids[k])
+                sh = i // rps
+                l = i - sh * rps
+                raw[k] = q_np[sh][l]
+                scl[k] = s_np[sh][l]
+            out[:] = self._lut_np[raw] * scl[:, None]
+            return
         packed = np.empty((n, self.width // 2), dtype=np.uint8)
         g_per_row = self._s_np[0].shape[1]
         scales = np.empty((n, g_per_row), dtype=np.float16)
-        rps = self.ROWS_PER_SHARD
         q_np, s_np = self._q_np, self._s_np
         for k in range(n):
             i = int(ids[k])
@@ -524,7 +544,7 @@ def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinne
     Returns the pinned view [:num_tokens] or None when the batch is not a plain decode batch."""
     import numpy as np
     quant = getattr(layer.ngram_embedding, "_ple_quant", None)
-    if quant is None or "int4" not in quant.layout or ngram_context is None:
+    if quant is None or ngram_context is None or not ("int4" in quant.layout or getattr(quant, "is_fp8", False)):
         return None
     qsl = query_start_loc.numpy()
     num_reqs = qsl.shape[0] - 1
@@ -670,7 +690,7 @@ def _fused_decode_lookup_ref(layer, input_ids, query_start_loc, ngram_context, p
     import numpy as np
 
     quant = getattr(layer.ngram_embedding, "_ple_quant", None)
-    if quant is None or "int4" not in quant.layout or ngram_context is None:
+    if quant is None or ngram_context is None or not ("int4" in quant.layout or getattr(quant, "is_fp8", False)):
         return None
     qsl = query_start_loc.numpy()
     num_reqs = qsl.shape[0] - 1
