@@ -43,6 +43,22 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+# Live-context prefill bound for QSA scoring. Ported from opengfx1030/vllm-rdna PR #15 (f3dd65fa; e286a17596 on rdna_extra/v0.29.0), GeorgeMA-Strong.
+# Filled unconditionally; only read when VLLM_QSA_LIVE_BOUND=1 (amd/indexer_qsa.py).
+_QSA_PREFILL_QUERY_THRESHOLD = 4
+
+
+def _qsa_prefill_query_threshold(builder: QSAMetadataBuilder) -> int:
+    """Return a conservative query length bound for speculative decode."""
+    threshold = _QSA_PREFILL_QUERY_THRESHOLD
+    vllm_config = getattr(builder, "vllm_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", None)
+    if num_speculative_tokens is not None:
+        multiplier = 2 if getattr(speculative_config, "parallel_drafting", False) else 1
+        threshold = max(threshold, 1 + multiplier * int(num_speculative_tokens))
+    return threshold
+
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
     """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
@@ -562,6 +578,9 @@ class QSAForwardMetadata(AttentionMetadata):
     num_actual_tokens: int
     storage_block_size: int
     compress_ratio: int
+    # The indexer uses these CPU-derived values to bound prefill scoring.
+    num_prefills: int
+    max_seq_len: int
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -653,6 +672,15 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            # Common metadata always carries max_query_len/max_seq_len at
+            # runtime; keep lightweight test doubles and older callers
+            # unbounded rather than failing metadata construction.
+            num_prefills=int(
+                int(getattr(common_attn_metadata, "max_seq_len", 0)) > 0
+                and int(getattr(common_attn_metadata, "max_query_len", 0))
+                > _qsa_prefill_query_threshold(self)
+            ),
+            max_seq_len=int(getattr(common_attn_metadata, "max_seq_len", 0)),
         )
 
 

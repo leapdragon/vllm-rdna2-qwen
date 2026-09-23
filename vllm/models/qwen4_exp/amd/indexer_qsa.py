@@ -13,6 +13,12 @@ from vllm.platforms import current_platform
 from torch import nn
 
 from vllm.config import VllmConfig
+
+# VLLM_QSA_LIVE_BOUND=1: bound prefill QSA scoring to the live context instead of the
+# page-table capacity (max_model_len). Ported from opengfx1030/vllm-rdna PR #15 (f3dd65fa; e286a17596 on rdna_extra/v0.29.0), GeorgeMA-Strong. Default off.
+import os as _os
+
+_QSA_LIVE_BOUND = _os.environ.get("VLLM_QSA_LIVE_BOUND", "0") == "1"
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -306,6 +312,11 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
+            max_seq_len=(
+                metadata.max_seq_len
+                if _QSA_LIVE_BOUND and metadata.num_prefills
+                else None
+            ),
         )
 
     def forward(
