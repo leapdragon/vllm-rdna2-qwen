@@ -692,6 +692,19 @@ def invoke_fused_moe_wna16_triton_kernel(
     assert B_zp is None or B_zp.ndim == 3
     assert block_shape is not None and block_shape[0] == 0
 
+    # gfx1030: int8 activations x int4 weights on v_dot4 for prefill-sized batches
+    # (VLLM_RDNA_MOE_W4A8=1; ~2x on the MoE GEMMs, 2026-09-24). Hooked here, not in the
+    # dispatcher, because the modular TritonExperts path calls this function directly.
+    from vllm.model_executor.layers.fused_moe import rdna_w4a8_moe
+
+    if use_int4_w4a16 and rdna_w4a8_moe.can_use(A, B_zp, True, block_shape[1], config):
+        rdna_w4a8_moe.invoke(
+            A, B, C, B_scale, topk_weights, sorted_token_ids, expert_ids,
+            num_tokens_post_padded, mul_routed_weight, top_k, config,
+            compute_type, block_shape[1],
+        )
+        return
+
     M = A.size(0)
     num_tokens = M * top_k
 

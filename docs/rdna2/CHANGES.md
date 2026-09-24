@@ -517,3 +517,29 @@ the gain at typical acceptance — choose by measured acceptance, not by default
 (§8d); the all-reduces are per-layer hidden-state exchanges over PCIe that no RCCL knob improves
 at this topology; `compile_sizes` static shapes are blocked by the positions-buffer stride
 (§8d); short-prompt TTFT is host-dispatch-bound (§8d).
+
+## 10. W4A8 MoE prefill kernel (2026-09-24)
+
+`vllm/model_executor/layers/fused_moe/rdna_w4a8_moe.py`, opt-in with `VLLM_RDNA_MOE_W4A8=1`, hooked at the
+top of `invoke_fused_moe_wna16_triton_kernel` (the modular `TritonExperts` path calls it directly). A prefill
+profile put the int4 MoE Triton kernel at 28 % of prefill and ~4 TFLOPS, about 11 % of the V620's measured
+fp16 dot rate: the kernel converts every int4 weight to fp16 in the inner loop (shift, mask, int→fp32,
+subtract, scale, fp32→fp16). The W4A8 kernel quantises activations per token to int8 once per GEMM,
+unpacks weights to int8 with integer ops only, accumulates `tl.dot(int8, int8) → int32` (lowered to
+`v_dot4_i32_i8`) over each 128-wide quantisation group, applies the group scale once per output element
+and the token scale at the store. Symmetric int4 only; decode-shaped configs (BLOCK_SIZE_M < 32) keep the
+stock path, so decode is unchanged.
+
+Tiles matter more than usual on RDNA2: any K block ≥ 64 hits the 256-VGPR cap and spills 190–390 registers
+(up to 5× slower). Swept best at Flash-Next per-rank shapes: 64×128×16, 8 warps, 2 stages — 2.0–2.45× over
+W4A16 from M = 256 to 2048, exact against a torch reference of the same maths (2e-4). BLOCK_SIZE_M is taken
+from the caller because the token sort was aligned to it.
+
+In-server (4× V620, TP=4/EP=4, 120 W caps): prefill 908 → 1,160 t/s @3.3k, 957 → 1,217 @14k, 962 → 1,232
+@26k (+27–28 %, more than the MoE share alone predicts — halving MoE time also shrinks the all-reduce wait
+behind the slowest rank); decode 62.8–62.9 t/s unchanged; validate PASS; teacher-forced NLL/token vs W4A16
+−0.1 % general / −0.2 % identifier-heavy (within noise), deterministic run to run.
+
+Side finding: the MoE kernel's time is nearly flat in chunk size (per-rank ~40 tokens per expert per 2048
+chunk, so every expert fills one 64-row block regardless) — the 2048-token prefill chunk was tuned before
+this kernel and is worth re-sweeping.
