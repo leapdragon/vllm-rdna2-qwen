@@ -543,3 +543,29 @@ behind the slowest rank); decode 62.8–62.9 t/s unchanged; validate PASS; teach
 Side finding: the MoE kernel's time is nearly flat in chunk size (per-rank ~40 tokens per expert per 2048
 chunk, so every expert fills one 64-row block regardless) — the 2048-token prefill chunk was tuned before
 this kernel and is worth re-sweeping.
+
+## 11. QSA indexer: score only the visible columns (2026-09-24)
+
+The sparse-attention indexer scored the page table's full capacity for every query row: the caller sized the
+logits as `page_table.shape[1] * k_cache.shape[1]` (≈ max_model_len / 4 = 65,536 columns at 262k) and never
+passed `num_columns`; the kernel has no early exit past the causal edge, so it ran the head loop on masked
+loads and wrote −inf for every capacity column (~0.5 GB of fp32 logits per layer per 2048-token chunk), and
+the logits workspace cap split each chunk into many launches. Its cost was therefore flat in context and
+proportional to `--max-model-len`, and it was the largest prefill kernel at long context (24 %).
+
+`QSAForwardMetadata` now carries the batch's host-side `max_seq_len` (from vLLM's common metadata, no device
+sync), and `qsa_select_paged_tokens` scores `ceil(max_seq_len / compress_ratio)` columns rounded up to the
+tile. Only eager batches of at least `VLLM_RDNA_QSA_BOUND_MIN_TOKENS` rows (default 512) outside graph
+capture are bounded: graph-replayed batches (decode, piecewise prefill ≤ 256 tokens) keep full capacity,
+because a column count captured into a graph would truncate candidates for later, longer sequences.
+
+Exact by construction — the dropped columns were always −inf and never selected. Harness: selected indices
+identical on every row at 7k / 30k / 65k context; per layer per chunk 33.5 → 1.2 ms @7k, 35.6 → 5.5 ms @30k,
+37.8 → 12.7 ms @65k. In-server (W4A8 on, 120 W): prefill 1217 → 1566 t/s @14k, 1232 → 1582 @26k, 1213 → 1528
+@58k, 1207 → 1469 @88k (+22–29 %); 3.3k 1160 → 1200–1425 (noisy); decode unchanged (62.5–63.0); validate PASS;
+teacher-forced logprobs bit-identical to the unbounded server.
+
+A blocked `tl.dot` variant of the scoring kernel (`_qsa_mqa_paged_dot_kernel`, one program per 16 rows x 32
+keys, key tile reused across heads and rows, fp16 dot2) ships OPT-IN (`VLLM_RDNA_QSA_DOT=1`): once columns
+are bounded the kernel is gather- and mask-bound rather than compute-bound, and the best swept tile is
+0.84–1.08× the per-row kernel from 7k to 88k context. Single-request batches only.

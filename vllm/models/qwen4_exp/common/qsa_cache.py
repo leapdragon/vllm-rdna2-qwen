@@ -562,6 +562,7 @@ class QSAForwardMetadata(AttentionMetadata):
     num_actual_tokens: int
     storage_block_size: int
     compress_ratio: int
+    max_seq_len: int = 0  # host-side, for bounding the indexer's scored columns (2026-09-24)
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -653,6 +654,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            max_seq_len=int(common_attn_metadata.max_seq_len),
         )
 
 

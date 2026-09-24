@@ -17,6 +17,103 @@ _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
 @triton.jit
+def _qsa_mqa_paged_dot_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    visible_blocks_ptr,
+    logits_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_cache_block,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_table_req,
+    stride_table_page,
+    stride_logits_row,
+    num_rows,
+    num_columns,
+    num_pages,
+    num_requests,
+    score_divisor,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+) -> None:
+    """Blocked variant of _qsa_mqa_paged_kernel (gfx1030, 2026-09-24) for a batch that is ONE request.
+
+    One program scores BLOCK_M query rows x BLOCK_N compressed keys: the key tile is gathered
+    once and reused across all heads and rows, and each head's scores come from one
+    `tl.dot(q[BLOCK_M, D], k[D, BLOCK_N])` (fp16 inputs -> v_dot2, fp32 accumulate) instead
+    of the per-row `tl.sum(k * q)` that never reaches the dot units. Tiles entirely past the
+    block's causal edge skip the gather and compute and only write -inf. Output layout and
+    values match the per-row kernel (same relu-sum over heads, same masking)."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_ok = rows < num_rows
+    request = tl.load(token_to_req_ptr + rows, mask=row_ok, other=-1)
+    req_ok = row_ok & (request >= 0) & (request < num_requests)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    query_position = tl.load(query_positions_ptr + rows, mask=row_ok, other=0)
+    sequence_length = tl.load(sequence_lengths_ptr + safe_request, mask=req_ok, other=0)
+    visible = tl.minimum((query_position + 1) // COMPRESS_RATIO, sequence_length // COMPRESS_RATIO)
+    visible = tl.where(req_ok, visible, 0)
+    if pid_n == 0:
+        tl.store(visible_blocks_ptr + rows, visible, mask=row_ok)
+    columns = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    out_ptrs = logits_ptr + rows[:, None] * stride_logits_row + columns[None, :]
+    out_mask = row_ok[:, None] & (columns[None, :] < num_columns)
+    max_visible = tl.max(visible, axis=0)
+    if pid_n * BLOCK_N >= max_visible:
+        tl.store(out_ptrs, tl.full((BLOCK_M, BLOCK_N), -float("inf"), tl.float32), mask=out_mask)
+        return
+    # single-request batch: every valid row uses the same page table row
+    req0 = tl.max(tl.where(req_ok, safe_request, 0), axis=0)
+    logical_page = columns // PAGE_SIZE
+    page_offset = columns % PAGE_SIZE
+    col_ok = (columns < num_columns) & (columns < max_visible) & (logical_page < PAGE_TABLE_WIDTH)
+    safe_logical_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
+    physical_page = tl.load(
+        page_table_ptr + req0 * stride_table_req + safe_logical_page * stride_table_page,
+        mask=col_ok,
+        other=-1,
+    )
+    col_ok &= (physical_page >= 0) & (physical_page < num_pages)
+    safe_physical_page = tl.maximum(physical_page, 0).to(tl.int64)
+    dims = tl.arange(0, BLOCK_D)
+    keys = tl.load(
+        k_cache_ptr
+        + safe_physical_page[:, None] * stride_cache_block
+        + page_offset[:, None] * stride_cache_token
+        + dims[None, :] * stride_cache_dim,
+        mask=col_ok[:, None] & (dims[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float16)
+    keys_t = tl.trans(keys)
+    score = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for head in tl.static_range(0, NUM_HEADS):
+        query = tl.load(
+            q_ptr + rows[:, None] * stride_q_row + head * stride_q_head + dims[None, :] * stride_q_dim,
+            mask=row_ok[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+        ).to(tl.float16)
+        score += tl.maximum(tl.dot(query, keys_t, out_dtype=tl.float32), 0.0)
+    score = score / score_divisor
+    valid = req_ok[:, None] & col_ok[None, :] & (columns[None, :] < visible[:, None])
+    tl.store(out_ptrs, tl.where(valid, score, -float("inf")), mask=out_mask)
+
+
+@triton.jit
 def _qsa_mqa_paged_kernel(
     q_ptr,
     k_cache_ptr,
@@ -597,6 +694,17 @@ def _qsa_env_int(name: str, default):
 _QSA_MQA_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_MQA_BLOCK_N", 128)
 _QSA_MQA_WARPS = _qsa_env_int("VLLM_RDNA_QSA_MQA_WARPS", 8)
 _QSA_MQA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_MQA_STAGES", None)  # None -> Triton default (2 on AMD)
+# 2026-09-24: bounded columns + blocked tl.dot scoring (CHANGES.md #11). BOUND_MIN_TOKENS keeps graph-replayed
+# batches (decode, piecewise prefill <= 256 tokens) on full capacity: a column count captured into a graph would
+# truncate candidates on later, longer sequences. DOT=0 restores the per-row kernel.
+_QSA_BOUND_MIN_TOKENS = _qsa_env_int("VLLM_RDNA_QSA_BOUND_MIN_TOKENS", 512)
+# Blocked tl.dot scoring is OPT-IN: once columns are bounded the kernel is gather/mask-bound, not compute-bound,
+# and the best swept tile (16x32, 8 warps) is 0.84-1.08x the per-row kernel from 7k to 88k context (2026-09-24).
+_QSA_DOT = _qsa_env_int("VLLM_RDNA_QSA_DOT", 0)
+_QSA_DOT_BLOCK_M = _qsa_env_int("VLLM_RDNA_QSA_DOT_BLOCK_M", 16)
+_QSA_DOT_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_DOT_BLOCK_N", 32)
+_QSA_DOT_WARPS = _qsa_env_int("VLLM_RDNA_QSA_DOT_WARPS", 8)
+_QSA_DOT_STAGES = _qsa_env_int("VLLM_RDNA_QSA_DOT_STAGES", 1)
 _QSA_PREFILL_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_BLOCK_N", 32)  # prefill branch only (base_programs > 512)
 _QSA_PREFILL_SPLITS = _qsa_env_int("VLLM_RDNA_QSA_SPLITS", 1)
 _QSA_PREFILL_WARPS = _qsa_env_int("VLLM_RDNA_QSA_WARPS", 4)
@@ -658,6 +766,28 @@ def qsa_mqa_paged(
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
+        return logits, visible_blocks
+    if _QSA_DOT and page_table.shape[0] == 1 and q.shape[2] <= 256:
+        bm, bn = _QSA_DOT_BLOCK_M, _QSA_DOT_BLOCK_N
+        _qsa_mqa_paged_dot_kernel[(triton.cdiv(q.shape[0], bm), triton.cdiv(columns, bn))](
+            q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
+            visible_blocks, logits,
+            q.stride(0), q.stride(1), q.stride(2),
+            k_cache.stride(0), k_cache.stride(1), k_cache.stride(3),   # cache is [pages, page, 1, dim]
+            page_table.stride(0), page_table.stride(1),
+            logits.stride(0),
+            q.shape[0], columns, k_cache.shape[0], page_table.shape[0], float(score_divisor),
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            BLOCK_D=triton.next_power_of_2(q.shape[2]),
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=_QSA_DOT_WARPS,
+            num_stages=_QSA_DOT_STAGES,
+        )
         return logits, visible_blocks
     block_n = _QSA_MQA_BLOCK_N
     _qsa_mqa_extra = {} if _QSA_MQA_STAGES is None else {'num_stages': _QSA_MQA_STAGES}
@@ -765,8 +895,15 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score, select, and expand QSA indices without host synchronization.
+
+    ``max_seq_len`` (host int from the batch metadata) bounds the scored columns to the
+    compressed keys that can actually be visible, instead of the page table's full capacity
+    (max_model_len / compress_ratio). Applied only to eager batches of at least
+    VLLM_RDNA_QSA_BOUND_MIN_TOKENS rows outside graph capture, so a captured graph never
+    bakes in a column count."""
 
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
@@ -778,6 +915,17 @@ def qsa_select_paged_tokens(
         return out
 
     columns = page_table.shape[1] * k_cache.shape[1]
+    num_columns = None
+    if (
+        max_seq_len
+        and rows >= _QSA_BOUND_MIN_TOKENS
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        tile = max(_QSA_MQA_BLOCK_N, _QSA_DOT_BLOCK_N)
+        visible_max = -(-max_seq_len // compress_ratio)          # ceil
+        needed = -(-visible_max // tile) * tile                  # round up to the tile
+        if needed < columns:
+            columns = num_columns = needed
     block_topk = token_topk // compress_ratio
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
@@ -798,6 +946,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            num_columns=num_columns,
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (

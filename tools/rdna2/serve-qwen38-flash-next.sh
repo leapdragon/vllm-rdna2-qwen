@@ -105,6 +105,8 @@ export VLLM_RDNA_DENSE_INT8="${DENSE_INT8:-1}"
 # (~2 GB/rank back to the KV pool; prefill dequantises the int8 shadow per call). New torch.compile
 # graph (0-element weight placeholders): first boot recompiles -- use a separate VLLM_CACHE_ROOT.
 export VLLM_RDNA_DENSE_INT8_ONLY="${DENSE_INT8_ONLY:-0}"
+# QSA indexer scores only visible columns on eager prefill batches (CHANGES.md #11; VLLM_RDNA_QSA_BOUND_MIN_TOKENS,
+# default 512; VLLM_RDNA_QSA_DOT=1 opts into the blocked tl.dot scoring kernel, ~parity).
 # VLLM_RDNA_MOE_W4A8=1 (default off): W4A8 MoE prefill kernel -- int8 activations x int4 experts on
 # v_dot4, ~2x on the MoE GEMMs, prefill +27 % (CHANGES.md #10). Tiles: VLLM_RDNA_MOE_W4A8_{BN,BK,WARPS,STAGES}.
 # one-shot P2P all-reduce (CHANGES.md #6); VLLM_RDNA_AR=0 falls back to RCCL. A wedge (spin-cap
