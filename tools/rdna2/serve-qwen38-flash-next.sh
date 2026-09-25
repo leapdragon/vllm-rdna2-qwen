@@ -34,7 +34,13 @@
 set -euo pipefail
 
 : "${MODEL:?set MODEL to the AWQ-W4A16 backbone directory (shards 2-5 + model_mtp.safetensors)}"
-: "${PLE_INT4:?set PLE_INT4 to the ples_int4 sidecar directory (128 shards + META.json)}"
+# n-gram table: a quantised sidecar dir (PLE_INT4=<dir with META.json>: int4 or fp8) -- the default -- OR the
+# unquantised bf16 table from checkpoint shard 1 via the disk path (PLE_DISK_DIR=<writable dir for the 95 GiB
+# raw table file>; MODEL must then be a directory whose index lists shard 1). First bf16 boot copies the table
+# out of shard 1 into PLE_DISK_DIR; later boots map that file.
+if [ -z "${PLE_DISK_DIR:-}" ]; then
+  : "${PLE_INT4:?set PLE_INT4 to the ples_int4 sidecar directory (128 shards + META.json)}"
+fi
 GPUS="${GPUS:-1,2,3,4}"
 PORT="${PORT:-8000}"
 MTP="${MTP:-3}"
@@ -97,7 +103,11 @@ fi
 # --- this fork's features ---------------------------------------------------------------
 # n-gram table served from the int4 sidecar by a CPU worker process (CHANGES.md #3)
 export VLLM_PLE_CPU_OFFLOAD=1
-export VLLM_PLE_QUANT_DIR="$PLE_INT4"
+if [ -n "${PLE_DISK_DIR:-}" ]; then
+  export VLLM_PLE_DISK_OFFLOAD_DIR="$PLE_DISK_DIR"; unset VLLM_PLE_QUANT_DIR
+else
+  export VLLM_PLE_QUANT_DIR="$PLE_INT4"
+fi
 export VLLM_PLE_OFFLOAD_READY_TIMEOUT=3600
 # int8 shadows of the dense fp16 projections for decode (CHANGES.md #7)
 export VLLM_RDNA_DENSE_INT8="${DENSE_INT8:-1}"
