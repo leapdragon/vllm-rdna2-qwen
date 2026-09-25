@@ -569,3 +569,41 @@ A blocked `tl.dot` variant of the scoring kernel (`_qsa_mqa_paged_dot_kernel`, o
 keys, key tile reused across heads and rows, fp16 dot2) ships OPT-IN (`VLLM_RDNA_QSA_DOT=1`): once columns
 are bounded the kernel is gather- and mask-bound rather than compute-bound, and the best swept tile is
 0.84–1.08× the per-row kernel from 7k to 88k context. Single-request batches only.
+
+## 12. Cached-turn TTFT: keep the linear-attention state at the prompt's last full block (2026-09-25)
+
+In `align` mode the GDN (linear-attention) state is cacheable per 784-token Mamba block, and a block holds
+a usable state only if some prefill step *ended exactly* at that block's end. Upstream enforces this by
+block-aligning chunk ends, but in `scheduler.block_size` units, which on this model is the 4-token
+attention granularity. Steps are therefore sized by the 2048-token budget and land on a 784-token boundary
+only by chance. Two blocks matter for reuse:
+
+* **the prompt's last full block**, which is what the next conversational turn resumes from;
+* with `--prefix-cache-retention-interval`, **one block per segment**.
+
+Both were mostly lost. After an 81k-token cold prompt the linear-attention groups held states only up to
+37,632 tokens. The full-attention groups hit 80,752 tokens, but a hybrid hit is the minimum over groups,
+so the first follow-up turn recomputed 43.5k tokens (31 s to the first token). Later turns were fast
+because the follow-up's own prefill happened to cache the boundary.
+
+`_mamba_block_aligned_split` now adds a stop at the end of each retained block: the last full block of
+the prompt, and every retained segment block inside the chunk. This costs one extra, shorter step per
+retained block, with no measurable change in cold prefill time. Knob: `VLLM_RDNA_MAMBA_RETENTION_STOPS`
+(default 1). It is a no-op when the scheduler block size already equals the Mamba block size.
+
+A stop placed *inside* the block is a trap. It gets the block allocated and marked cached, but the block
+then holds the state a few tokens short of its end, and a resumed turn silently drifts.
+
+Measured with `turn_probe.py` (cold prompt, then three follow-up turns, greedy):
+
+| history | first follow-up before | first follow-up after |
+|---|---|---|
+| 3k | 2,352 hit, 0.96 s | 2,352 hit, 0.77–0.87 s |
+| 27k | 25,088–26,656 hit, 0.46–1.9 s | 26,656 hit, 0.59–0.66 s |
+| 81k | 37,632 hit, 43.5k recomputed, 31 s | 80,752 hit, 434 recomputed, 0.98–1.09 s |
+
+Every retained block of a 344-block run was cached; none were lost. Correctness was checked by comparing a
+cache-resumed follow-up against the same request with a `cache_salt`, which forces a full recompute. Two
+recomputes already diverge after 2–4 greedy tokens on this server, so that is the noise floor. Resumed and
+recomputed answers match for all 48 tokens at 34k and 84k, and first-token log-probabilities agree within
+0.02–0.2 nats.

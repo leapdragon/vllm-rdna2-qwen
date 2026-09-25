@@ -71,6 +71,10 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+import os as _os
+_RETENTION_STOPS = _os.getenv("VLLM_RDNA_MAMBA_RETENTION_STOPS", "1") == "1"
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -326,6 +330,13 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        # gfx1030 fork: the Mamba state-block size (784 on Flash-Next) can differ from the scheduler's
+        # block_size (the attention / hash granularity, 4 here); retention stops are placed in it.
+        self._mamba_state_block_size = max(
+            (g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
+             if isinstance(g.kv_cache_spec, MambaSpec)),
+            default=self.cache_config.block_size,
+        )
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
             # TODO: support spec decoding
@@ -438,6 +449,33 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
+        # gfx1030 fork, 2026-09-25 (VLLM_RDNA_MAMBA_RETENTION_STOPS, default on): the retained Mamba
+        # state blocks -- the prompt's last full block (what a follow-up turn resumes from) and, with
+        # prefix_cache_retention_interval, one block per segment -- hold a cacheable state only if a
+        # step ends exactly at the block's end. Steps here are sized by the token budget at the
+        # 4-token attention granularity, not the 784-token Mamba block, so that was left to chance:
+        # an 81k cold prompt kept states only up to 37,632 tokens and the next turn re-prefilled
+        # 43.5k tokens (31 s TTFT). Add a stop at the end of each such block.
+        retention_stops: tuple[int, ...] = ()
+        if _RETENTION_STOPS and self.need_mamba_block_aligned_split:
+            # Units: Mamba blocks. A step's final state is written to the block holding its last
+            # token, so a step ending exactly at (p + 1) * mbs leaves p holding the exact state the
+            # cache entry promises (upstream's invariant, which it enforces in `block_size` units --
+            # 4 tokens here -- and so never at the 784-token Mamba boundary).
+            mbs = self._mamba_state_block_size
+            last_full_block = request.num_prompt_tokens // mbs - 1
+            targets = []
+            if last_full_block >= 1:
+                targets.append(last_full_block)
+            ri = getattr(self.cache_config, "prefix_cache_retention_interval", None)
+            if ri and ri > mbs and ri % mbs == 0:
+                per = ri // mbs
+                t = (start // mbs + 1 + per - 1) // per * per - 1   # first retained block after start's
+                while t < last_full_block and t * mbs < end:
+                    targets.append(t)
+                    t += per
+            if block_size < mbs:        # equal sizes: upstream's aligned chunk ends already suffice
+                retention_stops = tuple((t + 1) * mbs for t in targets)
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit
@@ -460,7 +498,7 @@ class Scheduler(SchedulerInterface):
             start + (request.shared_prefix_boundary - start) // block_size * block_size
             if start < request.shared_prefix_boundary < end
             else 0,
-        )
+        ) + retention_stops
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
