@@ -150,6 +150,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 except Exception as e:  # noqa: BLE001
                     logger.warning("rdna_ar: init failed (%s); using stock all-reduce", e)
                     self.rdna_ar_comm = None
+        # gfx1030: int8-compressed two-shot all-reduce for eager prefill-sized calls (VLLM_RDNA_AR_Q8=1)
+        self.rdna_q8_comm = None
+        if self.world_size > 1 and self.pynccl_comm is not None and current_platform.is_rocm():
+            from vllm.distributed.device_communicators import rdna_q8_all_reduce
+
+            if rdna_q8_all_reduce.enabled():
+                self.rdna_q8_comm = rdna_q8_all_reduce.RdnaQ8AllReduce(
+                    self.pynccl_comm, self.rank_in_group, self.world_size
+                )
         if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
             # Initialize a custom quick all-reduce implementation for AMD.
             # Quick reduce is designed as a complement to custom allreduce
@@ -302,6 +311,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         rdna_ar_comm = self.rdna_ar_comm
         if rdna_ar_comm is not None and rdna_ar_comm.should_use(input_):
             return rdna_ar_comm.all_reduce(input_)
+        rdna_q8_comm = self.rdna_q8_comm
+        if rdna_q8_comm is not None and rdna_q8_comm.should_use(input_):
+            return rdna_q8_comm.all_reduce(input_)
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None

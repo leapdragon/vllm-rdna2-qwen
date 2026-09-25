@@ -31,6 +31,9 @@
 #   MM_ELIDE (1: when a conversation has accumulated more than the image limit, the OLDEST
 #   images are replaced with a text marker and the newest MM_LIMIT are kept -- agent platforms
 #   cannot rewrite past turns, so the strict HTTP 400 wedges them; 0: stock vLLM 400).
+# Prefill kernels, plain env passed through to vLLM (all default off; CHANGES.md #10, #13, #14):
+#   VLLM_RDNA_MOE_W4A8=1 (int8-activation MoE, +27 %), VLLM_RDNA_DENSE_W8A8=1 (int8 x int8 GEMMs for the
+#   GDN/QSA projections; needs DENSE_INT8=1), VLLM_RDNA_AR_Q8=1 (int8-compressed prefill all-reduce).
 set -euo pipefail
 
 : "${MODEL:?set MODEL to the AWQ-W4A16 backbone directory (shards 2-5 + model_mtp.safetensors)}"

@@ -607,3 +607,87 @@ cache-resumed follow-up against the same request with a `cache_salt`, which forc
 recomputes already diverge after 2–4 greedy tokens on this server, so that is the noise floor. Resumed and
 recomputed answers match for all 48 tokens at 34k and 84k, and first-token log-probabilities agree within
 0.02–0.2 nats.
+
+## 13. W8A8 prefill GEMMs for the dense projections (2026-09-25)
+
+With `DENSE_INT8_ONLY=1` the dense projections exist only as per-channel int8 shadows. Prefill used to
+expand each shadow to fp16 and run rocBLAS. `rdna_w8a8_dense.py` (`VLLM_RDNA_DENSE_W8A8=1`, default off)
+instead quantises the activations per token to int8 and runs `tl.dot(int8, int8) -> int32` (`v_dot4`),
+applying the token and channel scales in the epilogue. It is hooked into the prefill branch of
+`rdna_dense_gemm` and, opt-in, `rdna_hc_mix`. Any M works, so the prompt's tail chunk no longer falls
+back to an untuned rocBLAS tile for these shapes.
+
+**Measure under sustained load.** At the 120 W cap a V620 throttles after a few hundred milliseconds:
+rocBLAS ran a 2048×4096×2560 GEMM in 2.05 ms on its first burst and 3.0 ms once settled. Short
+benchmarks mix the two regimes; the harness warms for 0.6 s and measures for 1 s.
+
+Per-rank GEMM at M = 2048, sustained (`bench/w8a8-dense/harness.py`), including activation quantisation:
+
+| shape (N×K) | rocBLAS | W8A8 | |
+|---|---|---|---|
+| GDN in_proj_qkvz 4096×2560 | 3.27 ms | 1.81 ms | 1.81× |
+| QSA qkv 3584×2560 | 3.02 ms | 1.68 ms | 1.79× |
+| GDN out / QSA o 2560×1536 | 1.38 ms | 0.76 ms | 1.83× |
+| hyper-connection up 10240×320 | 1.13 ms | 0.89 ms | 1.27× |
+| hyper-connection down 336×10240 | 1.34 ms | 1.11 ms | 1.21× |
+| router, shared expert, indexer | | | 0.89–0.96× (not used) |
+
+Tiles: 128×256×16, 8 warps, 2 stages for the three projections. Quality was gated with teacher-forced
+logprobs against the fp16-GEMM path; that baseline is bit-identical across boots, so every change seen
+is real.
+
+| variant (vs baseline, general / identifier-heavy texts) | mean \|Δlogprob\| | NLL | top-1 |
+|---|---|---|---|
+| projections (default set) | 0.21 / 0.16 | +0.14 % / +0.23 % | ±0 |
+| hc up projection alone | 0.36 / 0.28 | −1.1 % / −1.1 % | −0.4 pt |
+| hc down projection alone (per-branch activation scales) | 0.20 / 0.15 | ±0 | −0.3 pt |
+
+The hyper-connection up projection produces the branch gates. Quantising its input moves the outputs
+about twice as much as any change adopted so far, so it is opt-in (`VLLM_RDNA_DENSE_W8A8_SHAPES`). The
+down projection reads four residual branches side by side. It gets one activation scale per branch
+(`VLLM_RDNA_DENSE_W8A8_HC_GROUP`, default 2560), which fixed the precision loss on imbalanced branches in
+the harness, but in-server it gained nothing, so it is opt-in as well.
+
+In-server, 120 W, projections only: prefill +3.7–3.9 % from 14k to 88k and +5–7 % at 3.3k; decode
+unchanged; validate PASS.
+
+## 14. int8-compressed prefill all-reduce (2026-09-25)
+
+A 2048-token chunk all-reduces 10.5 MB of fp16 twice per layer, and those calls are PCIe-bound.
+`rdna_q8_all_reduce.py` (`VLLM_RDNA_AR_Q8=1`, default off) halves the bytes with a two-shot algorithm
+built from RCCL collectives on the existing pynccl communicator, so no peer-memory kernel is needed:
+
+1. Quantise each row in 64-element blocks to int8, with an fp16 scale per block.
+2. All-to-all the row shards, using grouped send/recv.
+3. Dequantise, sum in fp32, and requantise the reduced shard.
+4. All-gather, then dequantise.
+
+It takes eager, non-captured fp16 calls of at least 1 MB (`VLLM_RDNA_AR_Q8_MIN_KB`) whose last dim is
+in `VLLM_RDNA_AR_Q8_DIMS` (default 2560, the language model). The vision tower's 1152-wide all-reduces
+stay on RCCL because they are not quality-tested. vLLM's own quantised all-reduce, QuickReduce, is
+built for MI300: it uses wave64 and CDNA3 buffer-descriptor and cache-scope bits, so it does not run
+on gfx1030 without a port.
+
+4-GPU microbenchmark (`bench/int8-allreduce/ar_bench.py`):
+
+| M × 2560 | RCCL fp16 | int8 two-shot | |
+|---|---|---|---|
+| 2048 | 2.30 ms | 1.41–1.47 ms | 1.56–1.63× |
+| 1024 | 1.17 ms | 0.76 ms | 1.53× |
+| 512 | 0.60 ms | 0.44 ms | 1.38× |
+
+The relative error is 0.76–0.92 % on Gaussian data (block 32–128), against 3e-4 for RCCL. The size is
+set by rounding twice, so smaller blocks barely help. In-server the gain is smaller than the
+microbenchmark suggests, because part of the all-reduce time is waiting for the slowest rank: +1.8–4.6 %
+prefill alone. Teacher-forced drift: 0.20 / 0.15 nats, NLL +0.05 % / +0.26 %.
+
+**Together with §13** (projections), in-server at 120 W:
+
+| | 3.3k | 14k | 26k | 58k | 88k |
+|---|---|---|---|---|---|
+| baseline | 1,272–1,299 | 1,473 | 1,509 | 1,459 | 1,424 |
+| W8A8 projections + int8 all-reduce | 1,356–1,371 | 1,590 | 1,639 | 1,572 | 1,523 |
+| gain | +6 % | +7.9 % | +8.6 % | +7.7 % | +7.0 % |
+
+Decode is unchanged (62.4 t/s) and validate passes. Drift is 0.23 / 0.16 nats, NLL −0.06 % / +0.13 %,
+top-1 −0.15 / +0.01 pt, which is in the range of earlier adopted changes.

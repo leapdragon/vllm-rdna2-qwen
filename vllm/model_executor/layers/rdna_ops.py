@@ -39,8 +39,11 @@ def _rdna_dense_gemm(
         x2 = x.reshape(-1, x.size(-1)).contiguous()
         out = ops.gemv_i8_rdna2(x2, weight_i8, scale, bias)
         return out.reshape(*x.shape[:-1], weight_i8.shape[0])
+    from vllm.model_executor.layers import rdna_w8a8_dense as w8a8
     from vllm.model_executor.layers.rdna_dense_int8 import is_released, linear_released
 
+    if w8a8.can_use(x, weight_i8):
+        return w8a8.linear(x, weight_i8, scale, bias)
     if is_released(weight):
         return linear_released(x, weight_i8, scale, bias)
     return F.linear(x, weight, bias)
@@ -75,13 +78,18 @@ def _rdna_hc_mix(
         return block_input, dai
     # prefill / fallback: the original op sequence
     from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
+    from vllm.model_executor.layers import rdna_w8a8_dense as w8a8
     from vllm.model_executor.layers.rdna_dense_int8 import weight_for_gemm
 
-    w_down = weight_for_gemm(w_down, w_down_i8, s_down)
-    w_up = weight_for_gemm(w_up, w_up_i8, s_up)
-    dai = F.linear(xn, w_down)
+    if w8a8.can_use(xn, w_down_i8):
+        dai = w8a8.linear(xn, w_down_i8, s_down)
+    else:
+        dai = F.linear(xn, weight_for_gemm(w_down, w_down_i8, s_down))
     lora = hc_silu(dai[:, :lora_rank].contiguous(), hc_count)
-    gate = F.linear(lora, w_up)
+    if w8a8.can_use(lora, w_up_i8):
+        gate = w8a8.linear(lora, w_up_i8, s_up)
+    else:
+        gate = F.linear(lora, weight_for_gemm(w_up, w_up_i8, s_up))
     block_input = hc_gate_mix(xn, gate, hc_count)
     return block_input, dai
 
