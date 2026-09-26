@@ -752,3 +752,24 @@ un-hipified, and `attention.hip` and `skinny_gemms.hip` failed with `unknown typ
 all-reduce, int8 prefill all-reduce on). All three drops since 2026-09-25 had `VLLM_RDNA_AR_Q8=1`; none occurred
 in the weeks before it existed. Treat the int8 prefill all-reduce (§14) as suspect on multi-root-complex boards.
 Its all-to-all sends to every peer at once over P2P.
+
+## 17. Staggered exchange for the int8 all-reduce, `VLLM_RDNA_AR_Q8_STAGGER` (default on), 2026-09-26
+
+The int8 all-reduce (§14) exchanged its shards with one grouped all-to-all, so every card sent to and received
+from all three peers at once: twelve flows, three inbound per card. Every V620 bus drop on our board since
+2026-09-25 happened with that enabled (§16, stability note). The exchange now runs in W−1 rounds. In round k
+each card sends only to rank+k and receives only from rank−k, so each card has one inbound and one outbound
+transfer at a time, four flows per round. The bytes and the reduction order are unchanged.
+
+`tools/rdna2/q8_ar_test.py` drives the real module over vLLM's PyNcclCommunicator on 4× V620. The staggered
+result is **bit-identical** to the grouped one and identical across ranks at M = 2048, 1300 and 700 (×2560
+fp16), with rel. error 8.4e-3 vs the exact sum, as before. It is also slightly **faster**:
+
+| M × 2560 | RCCL fp16 | int8 grouped | int8 staggered |
+|---|---|---|---|
+| 2048 | 2.29 ms | 1.43 ms | 1.40 ms |
+| 1300 | 1.60 ms | 1.09 ms | 1.04 ms |
+| 700 | 0.95 ms | 1.00 ms | 0.87 ms |
+
+`VLLM_RDNA_AR_Q8_STAGGER=0` restores the grouped all-to-all. Whether staggering removes the bus drops is not yet
+known; it needs a heavy-load soak with `VLLM_RDNA_AR_Q8=1`.

@@ -100,9 +100,15 @@ class RdnaQ8AllReduce:
         # last dims allowed (default: the language model's hidden size; the vision tower's 1152-wide
         # all-reduces are not quality-tested with int8 transport)
         self.dims = {int(d) for d in os.getenv("VLLM_RDNA_AR_Q8_DIMS", "2560").split(",") if d}
+        # VLLM_RDNA_AR_Q8_STAGGER (default 1 since 2026-09-26; 0 = old grouped all-to-all): exchange the shards in W-1 rounds instead of one grouped
+        # all-to-all. Round k: send to rank+k, receive from rank-k -- every card has ONE outgoing and ONE
+        # incoming transfer at a time (W flows per round instead of W*(W-1) at once). Same bytes, same order
+        # of reduction: bit-identical results. Motivation: every V620 bus drop since 2026-09-25 had the grouped
+        # all-to-all enabled, which has each card receive from all three peers at once.
+        self.stagger = os.getenv("VLLM_RDNA_AR_Q8_STAGGER", "1") == "1"
         self._logged = False
-        logger.info("rdna_ar_q8: int8 two-shot prefill all-reduce enabled (group %d, >= %d KB)",
-                    _G, self.min_bytes // 1024)
+        logger.info("rdna_ar_q8: int8 two-shot prefill all-reduce enabled (group %d, >= %d KB, %s exchange)",
+                    _G, self.min_bytes // 1024, "staggered" if self.stagger else "grouped all-to-all")
 
     def should_use(self, inp: torch.Tensor) -> bool:
         return (inp.dtype == torch.float16 and inp.is_cuda and inp.dim() >= 2
@@ -127,12 +133,21 @@ class RdnaQ8AllReduce:
         kw = dict(NG=ng, NGP=ngp, G=_G, H=H, ROWB=rowb, num_warps=4)
         _quant_pack[(mp,)](x, send, m, x.stride(0), **kw)
         shard = rp * rowb
-        self.comm.group_start()
-        for p in range(W):
-            if p != self.rank:
-                self.comm.send(send[p * shard:(p + 1) * shard], p)
-                self.comm.recv(recv[p * shard:(p + 1) * shard], p)
-        self.comm.group_end()
+        if self.stagger:
+            for k in range(1, W):
+                dst = (self.rank + k) % W
+                src = (self.rank - k) % W
+                self.comm.group_start()
+                self.comm.send(send[dst * shard:(dst + 1) * shard], dst)
+                self.comm.recv(recv[src * shard:(src + 1) * shard], src)
+                self.comm.group_end()
+        else:
+            self.comm.group_start()
+            for p in range(W):
+                if p != self.rank:
+                    self.comm.send(send[p * shard:(p + 1) * shard], p)
+                    self.comm.recv(recv[p * shard:(p + 1) * shard], p)
+            self.comm.group_end()
         own = send[self.rank * shard:(self.rank + 1) * shard]
         _sum_requant[(rp,)](recv, own, red, rp, self.rank, W=W, **kw)
         self.comm.all_gather(gath, red)
