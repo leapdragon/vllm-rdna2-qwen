@@ -87,6 +87,25 @@ def dequant(weight_i8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return buf
 
 
+# gfx1030 fork, 2026-09-26 (VLLM_RDNA_GEMM_MBUCKET=<rows>, e.g. 128): pad the rows of prefill-shaped rocBLAS
+# GEMMs up to a multiple of <rows>. TunableOp rows are exact-M, and since the cached-turn fix (prefill steps end
+# at 784-token block boundaries) many steps have odd M; each then misses the tuned table and rocBLAS falls back to
+# its MT32x32x8 tile -- 3.3 % of a 14k prefill (2026-09-25 profile). With bucketing, M only takes 16 values, all
+# tunable offline. Only M > 256 (eager prefill): smaller batches run as captured CUDA graphs.
+_MBUCKET = int(os.getenv("VLLM_RDNA_GEMM_MBUCKET", "0"))
+
+
+def linear_bucketed(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    """F.linear with the row count padded to the M bucket (a no-op unless VLLM_RDNA_GEMM_MBUCKET is set)."""
+    m = x.numel() // x.size(-1) if x.numel() else 0
+    if _MBUCKET <= 0 or m <= 256 or m % _MBUCKET == 0:
+        return torch.nn.functional.linear(x, weight, bias)
+    x2 = x.reshape(m, x.size(-1))
+    mp = (m + _MBUCKET - 1) // _MBUCKET * _MBUCKET
+    xp = torch.nn.functional.pad(x2, (0, 0, 0, mp - m))
+    return torch.nn.functional.linear(xp, weight, bias)[:m].reshape(*x.shape[:-1], weight.shape[0])
+
+
 def linear_released(
     x: torch.Tensor,
     weight_i8: torch.Tensor,
@@ -102,7 +121,7 @@ def linear_released(
     """
     n = weight_i8.shape[0]
     if n <= block_rows:
-        return torch.nn.functional.linear(x, dequant(weight_i8, scale), bias)
+        return linear_bucketed(x, dequant(weight_i8, scale), bias)
     out = x.new_empty((*x.shape[:-1], n))
     for i in range(0, n, block_rows):
         j = min(i + block_rows, n)

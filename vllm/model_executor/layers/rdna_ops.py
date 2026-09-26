@@ -40,13 +40,13 @@ def _rdna_dense_gemm(
         out = ops.gemv_i8_rdna2(x2, weight_i8, scale, bias)
         return out.reshape(*x.shape[:-1], weight_i8.shape[0])
     from vllm.model_executor.layers import rdna_w8a8_dense as w8a8
-    from vllm.model_executor.layers.rdna_dense_int8 import is_released, linear_released
+    from vllm.model_executor.layers.rdna_dense_int8 import is_released, linear_bucketed, linear_released
 
     if w8a8.can_use(x, weight_i8):
         return w8a8.linear(x, weight_i8, scale, bias)
     if is_released(weight):
         return linear_released(x, weight_i8, scale, bias)
-    return F.linear(x, weight, bias)
+    return linear_bucketed(x, weight, bias)
 
 
 def _rdna_dense_gemm_fake(x, weight, weight_i8, scale, bias):
@@ -79,17 +79,17 @@ def _rdna_hc_mix(
     # prefill / fallback: the original op sequence
     from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
     from vllm.model_executor.layers import rdna_w8a8_dense as w8a8
-    from vllm.model_executor.layers.rdna_dense_int8 import weight_for_gemm
+    from vllm.model_executor.layers.rdna_dense_int8 import linear_bucketed, weight_for_gemm
 
     if w8a8.can_use(xn, w_down_i8):
         dai = w8a8.linear(xn, w_down_i8, s_down)
     else:
-        dai = F.linear(xn, weight_for_gemm(w_down, w_down_i8, s_down))
+        dai = linear_bucketed(xn, weight_for_gemm(w_down, w_down_i8, s_down))
     lora = hc_silu(dai[:, :lora_rank].contiguous(), hc_count)
     if w8a8.can_use(lora, w_up_i8):
         gate = w8a8.linear(lora, w_up_i8, s_up)
     else:
-        gate = F.linear(lora, weight_for_gemm(w_up, w_up_i8, s_up))
+        gate = linear_bucketed(lora, weight_for_gemm(w_up, w_up_i8, s_up))
     block_input = hc_gate_mix(xn, gate, hc_count)
     return block_input, dai
 
@@ -123,14 +123,14 @@ def _rdna_shared_expert(
         b, sb = (w2_i8, s2) if w2_i8 is not None else (w2, None)
         act = ops.rdna_se_gate_up_silu(x, a, sa)
         return ops.rdna_se_down_gated(act, b, sb, x, w_gate)
-    from vllm.model_executor.layers.rdna_dense_int8 import weight_for_gemm
+    from vllm.model_executor.layers.rdna_dense_int8 import linear_bucketed, weight_for_gemm
 
     w1 = weight_for_gemm(w1, w1_i8, s1)
     w2 = weight_for_gemm(w2, w2_i8, s2)
-    gu = F.linear(x, w1)
+    gu = linear_bucketed(x, w1)
     half = gu.shape[-1] // 2
     act = F.silu(gu[..., :half]) * gu[..., half:]
-    out = F.linear(act, w2)
+    out = linear_bucketed(act, w2)
     return torch.sigmoid(F.linear(x, w_gate.reshape(1, -1))) * out
 
 

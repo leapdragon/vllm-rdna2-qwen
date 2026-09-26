@@ -733,3 +733,22 @@ With the checkout reached through a symlink, the sources were hipified under the
 and the headers under the symlink path. Dependents then kept `#include "cuda_compat.h"`
 un-hipified, and `attention.hip` and `skinny_gemms.hip` failed with `unknown type name
 'cudaDeviceProp'`.
+
+## 16. Cheap prefill items, 2026-09-26: M-bucketed rocBLAS GEMMs, de-spilled QSA kernel, no own-shard copy
+
+- **M buckets (`VLLM_RDNA_GEMM_MBUCKET=128`, default off).** Since the cached-turn fix (§12), prefill steps end
+  at 784-token block boundaries, so many steps have odd M. TunableOp rows are exact-M, so those GEMMs fell back to
+  rocBLAS's MT32x32x8 tile: 3.3 % of a 14k prefill. The knob pads M > 256 up to a multiple of 128 for the GEMMs still
+  on rocBLAS (hyper-connection mixers, router, shared expert, indexer, and one 2560×2560). The new TunableOp rows for
+  M = 384 … 2048 are in `tunableop/rocblas-3b4878bc6c37/`.
+  In-server at 120 W vs off: prefill +4–6 % at 3.3k, +2.5 % at 14k, ±0 from 26k to 88k; decode unchanged.
+  Teacher-forced NLL −0.06 % / +0.16 %, within noise.
+- **De-spilled sparse attention (`VLLM_RDNA_QSA_DESPILL=1`, default off).** 1.17× on the kernel in the harness,
+  but **no end-to-end gain in-server** (14k 1,588 vs 1,591 t/s). Left off.
+- **int8 all-reduce reads its own shard in place,** so there is no copy per collective. Exact.
+- `tools/rdna2/trace_agg.py` classifies the fork's kernels: dense-int8-GEMM, rdna-allreduce, int8-quant, GDN pieces.
+
+**Stability note.** A V620 dropped off the bus during the de-spilled-only measurement boot (host-staged decode
+all-reduce, int8 prefill all-reduce on). All three drops since 2026-09-25 had `VLLM_RDNA_AR_Q8=1`; none occurred
+in the weeks before it existed. Treat the int8 prefill all-reduce (§14) as suspect on multi-root-complex boards.
+Its all-to-all sends to every peer at once over P2P.

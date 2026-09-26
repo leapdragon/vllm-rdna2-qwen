@@ -52,8 +52,9 @@ def _quant_pack(x_ptr, out_ptr, rows, stride_x, NG: tl.constexpr, NGP: tl.conste
 
 
 @triton.jit
-def _sum_requant(recv_ptr, out_ptr, rows_per, W: tl.constexpr, NG: tl.constexpr, NGP: tl.constexpr,
+def _sum_requant(recv_ptr, own_ptr, out_ptr, rows_per, rank, W: tl.constexpr, NG: tl.constexpr, NGP: tl.constexpr,
                  G: tl.constexpr, H: tl.constexpr, ROWB: tl.constexpr):
+    # own_ptr: our own shard, read straight from the send buffer (no copy into recv)
     r = tl.program_id(0)
     g = tl.arange(0, NGP)[:, None]
     c = tl.arange(0, G)[None, :]
@@ -61,7 +62,10 @@ def _sum_requant(recv_ptr, out_ptr, rows_per, W: tl.constexpr, NG: tl.constexpr,
     sg = tl.arange(0, NGP)
     acc = tl.zeros((NGP, G), dtype=tl.float32)
     for w in tl.static_range(W):
-        base = recv_ptr + (w * rows_per + r).to(tl.int64) * ROWB
+        if w == rank:
+            base = own_ptr + r.to(tl.int64) * ROWB
+        else:
+            base = recv_ptr + (w * rows_per + r).to(tl.int64) * ROWB
         q = tl.load(base + g * G + c, mask=gm, other=0).to(tl.int8, bitcast=True).to(tl.float32)
         s = tl.load((base + H).to(tl.pointer_type(tl.float16)) + sg, mask=sg < NG, other=0.0)
         acc += q * s.to(tl.float32)[:, None]
@@ -129,8 +133,8 @@ class RdnaQ8AllReduce:
                 self.comm.send(send[p * shard:(p + 1) * shard], p)
                 self.comm.recv(recv[p * shard:(p + 1) * shard], p)
         self.comm.group_end()
-        recv[self.rank * shard:(self.rank + 1) * shard].copy_(send[self.rank * shard:(self.rank + 1) * shard])
-        _sum_requant[(rp,)](recv, red, rp, W=W, **kw)
+        own = send[self.rank * shard:(self.rank + 1) * shard]
+        _sum_requant[(rp,)](recv, own, red, rp, self.rank, W=W, **kw)
         self.comm.all_gather(gath, red)
         _dequant[(mp,)](gath, y, **kw)
         if not self._logged:

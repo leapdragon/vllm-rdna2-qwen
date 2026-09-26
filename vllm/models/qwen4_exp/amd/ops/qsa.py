@@ -997,6 +997,83 @@ def qsa_select_paged_tokens(
     return out
 
 
+# gfx1030 fork, 2026-09-26 (VLLM_RDNA_QSA_DESPILL=1, prefill launches only): the same per-row sparse
+# attention and softmax as _qsa_sparse_paged_gqa_splitk_kernel (split=1 path), with the 256-wide head
+# dimension handled in four DC-wide slices -- four score partial dots and four [BLOCK_M x DC] output
+# accumulators -- so no 256-wide operand is live at once. Harness (bench/qsa-reuse/despill.py, real
+# selections, 2048 rows at 25k context): 11.8 vs 13.6 ms (1.15x) at BLOCK_N=32, 2 warps; identical output
+# to 5e-4 rel. The kernel is latency-bound on its index -> page table -> K/V gather chain, so the gain is
+# modest; larger (cross-row) tiles were measured slower (0.52x).
+_QSA_DESPILL = _os.getenv("VLLM_RDNA_QSA_DESPILL", "0") == "1"
+
+
+@triton.jit
+def _qsa_sparse_despill_kernel(
+    q_ptr, k_cache_ptr, v_cache_ptr, indices_ptr, block_table_ptr, token_to_req_ptr, output_ptr,
+    stride_q_row, stride_q_head, stride_k_block, stride_k_token, stride_k_head,
+    stride_v_block, stride_v_token, stride_v_head, stride_indices_row, stride_table_req,
+    stride_output_row, stride_output_head, num_cache_blocks, num_requests,
+    TOPK: tl.constexpr, PAGE_SIZE: tl.constexpr, PAGE_TABLE_WIDTH: tl.constexpr, GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, DC: tl.constexpr,
+):
+    row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    request = tl.load(token_to_req_ptr + row)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    hm = tl.arange(0, BLOCK_M)
+    dc = tl.arange(0, DC)
+    n = tl.arange(0, BLOCK_N)
+    hmask = hm < GROUP_SIZE
+    qb = q_ptr + row * stride_q_row + (kv_head * GROUP_SIZE + hm[:, None]) * stride_q_head
+    q0 = tl.load(qb + 0 * DC + dc[None, :], mask=hmask[:, None], other=0.0)
+    q1 = tl.load(qb + 1 * DC + dc[None, :], mask=hmask[:, None], other=0.0)
+    q2 = tl.load(qb + 2 * DC + dc[None, :], mask=hmask[:, None], other=0.0)
+    q3 = tl.load(qb + 3 * DC + dc[None, :], mask=hmask[:, None], other=0.0)
+    a0 = tl.zeros((BLOCK_M, DC), tl.float32)
+    a1 = tl.zeros((BLOCK_M, DC), tl.float32)
+    a2 = tl.zeros((BLOCK_M, DC), tl.float32)
+    a3 = tl.zeros((BLOCK_M, DC), tl.float32)
+    max_value = tl.full((BLOCK_M,), -1.0e20, tl.float32)
+    normalizer = tl.zeros((BLOCK_M,), tl.float32)
+    scale: tl.constexpr = (HEAD_DIM ** -0.5) * 1.4426950408889634
+    for tile in range(0, tl.cdiv(TOPK, BLOCK_N)):
+        cols = tile * BLOCK_N + n
+        tok = tl.load(indices_ptr + row * stride_indices_row + cols, mask=cols < TOPK, other=-1)
+        safe = tl.maximum(tok, 0)
+        page = safe // PAGE_SIZE
+        off = safe % PAGE_SIZE
+        valid = (request >= 0) & (request < num_requests) & (tok >= 0) & (page < PAGE_TABLE_WIDTH)
+        phys = tl.load(block_table_ptr + safe_request * stride_table_req + tl.minimum(page, PAGE_TABLE_WIDTH - 1),
+                       mask=valid, other=-1)
+        valid &= (phys >= 0) & (phys < num_cache_blocks)
+        sp = tl.maximum(phys, 0).to(tl.int64)
+        kb = k_cache_ptr + sp[None, :] * stride_k_block + off[None, :] * stride_k_token + kv_head * stride_k_head + dc[:, None]
+        s = tl.dot(q0, tl.load(kb + 0 * DC, mask=valid[None, :], other=0.0))
+        s = tl.dot(q1, tl.load(kb + 1 * DC, mask=valid[None, :], other=0.0), acc=s)
+        s = tl.dot(q2, tl.load(kb + 2 * DC, mask=valid[None, :], other=0.0), acc=s)
+        s = tl.dot(q3, tl.load(kb + 3 * DC, mask=valid[None, :], other=0.0), acc=s)
+        s = tl.where(valid[None, :], s * scale, -1.0e20)
+        next_max = tl.maximum(max_value, tl.max(s, axis=1))
+        alpha = tl.math.exp2(max_value - next_max)
+        pr = tl.where(valid[None, :], tl.math.exp2(s - next_max[:, None]), 0.0)
+        ph = pr.to(q0.dtype)
+        vb = v_cache_ptr + sp[:, None] * stride_v_block + off[:, None] * stride_v_token + kv_head * stride_v_head + dc[None, :]
+        a0 = tl.dot(ph, tl.load(vb + 0 * DC, mask=valid[:, None], other=0.0), acc=a0 * alpha[:, None])
+        a1 = tl.dot(ph, tl.load(vb + 1 * DC, mask=valid[:, None], other=0.0), acc=a1 * alpha[:, None])
+        a2 = tl.dot(ph, tl.load(vb + 2 * DC, mask=valid[:, None], other=0.0), acc=a2 * alpha[:, None])
+        a3 = tl.dot(ph, tl.load(vb + 3 * DC, mask=valid[:, None], other=0.0), acc=a3 * alpha[:, None])
+        normalizer = normalizer * alpha + tl.sum(pr, axis=1)
+        max_value = next_max
+    inv = tl.where(normalizer > 0, 1.0 / tl.maximum(normalizer, 1.0e-20), 0.0)
+    ob = output_ptr + row * stride_output_row + (kv_head * GROUP_SIZE + hm[:, None]) * stride_output_head + dc[None, :]
+    om = hmask[:, None]
+    ot = output_ptr.dtype.element_ty
+    tl.store(ob + 0 * DC, (a0 * inv[:, None]).to(ot), mask=om)
+    tl.store(ob + 1 * DC, (a1 * inv[:, None]).to(ot), mask=om)
+    tl.store(ob + 2 * DC, (a2 * inv[:, None]).to(ot), mask=om)
+    tl.store(ob + 3 * DC, (a3 * inv[:, None]).to(ot), mask=om)
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1061,6 +1138,17 @@ def qsa_sparse_paged_attention(
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
+        if _QSA_DESPILL and head_dim % 4 == 0 and block_m <= 8:
+            _qsa_sparse_despill_kernel[(q.shape[0], k_cache.shape[2])](
+                q, k_cache, v_cache, logical_indices, block_table, token_to_req, out,
+                q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+                v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), logical_indices.stride(0),
+                block_table.stride(0), out.stride(0), out.stride(1), k_cache.shape[0], block_table.shape[0],
+                TOPK=logical_indices.shape[1], PAGE_SIZE=k_cache.shape[1], PAGE_TABLE_WIDTH=block_table.shape[1],
+                GROUP_SIZE=group_size, HEAD_DIM=head_dim, BLOCK_M=block_m, BLOCK_N=32, DC=head_dim // 4,
+                num_warps=2, num_stages=1,
+            )
+            return out
         block_n, target_splits, partial_warps = _QSA_PREFILL_BLOCK_N, _QSA_PREFILL_SPLITS, _QSA_PREFILL_WARPS
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
