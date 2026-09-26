@@ -11,6 +11,13 @@ N = int(sys.argv[2]) if len(sys.argv) > 2 else 4 * 2560
 
 def worker(rank, q_handles, q_out, barrier):
     torch.cuda.set_device(rank)
+    if os.environ.get("RDNA_AR_TEST_SO"):
+        # test a freshly built library without installing it: it must be loaded BEFORE `import vllm`,
+        # which imports the installed copy (a second registration of the _rocm_C namespace aborts)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("vllm._rocm_C", os.environ["RDNA_AR_TEST_SO"])
+        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+        sys.modules["vllm._rocm_C"] = mod
     import vllm  # noqa: F401
     import vllm._rocm_C  # noqa: F401  (registers the ops)
     from vllm import _custom_ops as ops

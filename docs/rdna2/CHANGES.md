@@ -691,3 +691,45 @@ prefill alone. Teacher-forced drift: 0.20 / 0.15 nats, NLL +0.05 % / +0.26 %.
 
 Decode is unchanged (62.4 t/s) and validate passes. Drift is 0.23 / 0.16 nats, NLL −0.06 % / +0.13 %,
 top-1 −0.15 / +0.01 pt, which is in the range of earlier adopted changes.
+
+## 15. Host-staged one-shot all-reduce, `VLLM_RDNA_AR_MODE=host` (2026-09-25)
+
+The one-shot all-reduce (T44, §6) pushes each rank's contribution straight into its peers'
+uncached VRAM through their PCIe BARs. At ~95 collectives per decode step that is thousands of
+small posted writes per second into every card, and on a 2-die X399 board about half of them
+cross between the dies. Several users reported cards wedging or dropping with it until they set
+`VLLM_RDNA_AR=0`. On 2026-09-25 our own board lost two V620s off the bus twice under the same
+heavy multi-stream load; with `VLLM_RDNA_AR=0` the load ran clean, at −26 % single-stream decode
+(62 → 46 t/s).
+
+`VLLM_RDNA_AR_MODE=host` keeps the one-shot protocol but moves the payload to host memory:
+
+- **One shared pinned host buffer.** Rank 0 creates POSIX shared memory during the ordered
+  init, every rank maps it and registers it with its GPU (`hipHostRegister`, fine-grained). There
+  is no peer access, no IPC mapping and no GPU-to-GPU write of any kind.
+- **Tagged words instead of flags.** Each rank writes its slot as 8-byte words: 4 bytes of data
+  and the collective's sequence number (RCCL's "LL" idea). A reader accepts a word only when its
+  tag matches, so correctness does not depend on write ordering. Posted writes to different
+  destinations, or relaxed-ordered ones, can overtake each other; that ordering gap caused the
+  2026-08-30 stale-element noise.
+- **Cheap waiting.** One thread per block polls one word per peer, with backoff, before the bulk
+  reads. The bulk reads re-poll individually only if a word is still in flight.
+- **Unchanged guarantees.** There are two parities, a fixed-order fp32 reduction so results are
+  bit-identical across ranks, a sequence counter on the device for graph replay, and the T44b
+  bounded spins with abort record, wedge marker and RCCL on the next boot.
+
+The selection is made inside the extension (`rdna_ar_init` reads the variable), so the op
+signatures and the Python side are unchanged. Default is still `p2p`.
+
+`tools/rdna2/ar_ops_test.py` on 4× V620, fp16 4×2560 (20 KB), host mode: eager and graph replay
+correct on every rank, bit-identical across ranks, **32.1 µs per all-reduce eager, 33.3 µs in a
+CUDA graph**. The p2p kernel measures 31–33 µs and RCCL ~156 µs. The op test can load a freshly
+built library without installing it (`RDNA_AR_TEST_SO=build_rocm/_rocm_C.abi3.so`).
+
+Not yet done: a serving soak under the load that dropped the cards.
+
+Build note: `cmake/hipify.py` now resolves symlinks for the project, output and source paths.
+With the checkout reached through a symlink, the sources were hipified under the resolved path
+and the headers under the symlink path. Dependents then kept `#include "cuda_compat.h"`
+un-hipified, and `attention.hip` and `skinny_gemms.hip` failed with `unknown type name
+'cudaDeviceProp'`.

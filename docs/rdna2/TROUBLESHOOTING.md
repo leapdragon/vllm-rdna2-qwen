@@ -372,7 +372,10 @@ context is still 1.8× the fp16 layout's). **Verify:** a `prompt_logprobs=1` com
 
 **Symptom:** serving works, then at some point one card sits at 99 % busy while the others idle,
 or three sit at 99 % while one idles; nothing progresses; the engine dies at its 300 s execute
-timeout. Reported from two boards, never seen on ours.
+timeout. Reported from several boards. On ours (2026-09-25, 2-die X399, cards behind both CPU
+dies) the same workload twice took two V620s off the PCIe bus entirely: the root ports then
+showed the link down and no card present (`DLActive-`, `PresDet-`), with no completion
+timeouts latched. The same load ran clean with `VLLM_RDNA_AR=0`.
 
 **Cause:** the one-shot all-reduce is push-based; each rank waits for every peer's flag. One GPU
 spinning means a peer's posted write to it never landed; three spinning means one rank never
@@ -385,7 +388,11 @@ collective #s: peer rank j's flag never arrived …`, then the engine stops imme
 next boot logs `rdna_ar: disabled -- a previous run wedged on this machine` and runs on RCCL.
 Older builds show only the stall.
 
-**Fix, in order:** run with `VLLM_RDNA_AR=0` (a few percent of decode); disable ACS in the
+**Fix, in order:** set `VLLM_RDNA_AR_MODE=host` (keeps the fast path, but stages the payload
+through one shared pinned host buffer, so no GPU writes into another GPU at all; same speed in
+the 4-GPU op test, ~32 us per 20 KB; CHANGES #15 -- new on 2026-09-25, not yet soak-tested); or
+run with `VLLM_RDNA_AR=0` (RCCL for the small collectives: about -26 % single-stream decode on
+4x V620, 62 -> 46 t/s); disable ACS in the
 BIOS and put the IOMMU in passthrough (`iommu=pt`); move the cards onto one root complex at
 full width; under RCCL, `NCCL_P2P_LEVEL=SYS` then `NCCL_P2P_DISABLE=1`. **Verify:** after the
 fix, delete `$VLLM_CACHE_ROOT/rdna_ar_wedged`, boot, and confirm `rdna_ar: one-shot all-reduce

@@ -150,3 +150,139 @@ __global__ void rdna_ar_oneshot(const T* __restrict__ in, T* __restrict__ out,
     rdna_ar_from_f(out[i], v);
   }
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// Host-staged variant (VLLM_RDNA_AR_MODE=host, 2026-09-25). No GPU peer-to-peer traffic at all:
+// every rank writes its contribution into ITS slot of one shared, pinned host buffer and reads
+// the other ranks' slots from there. Motivation: on a 2-die X399 board (and on other users'
+// boards) the p2p kernel above -- thousands of small posted writes per second straight into the
+// peers' PCIe BAR windows -- is the one workload that knocks V620s off the bus; with RCCL instead
+// (VLLM_RDNA_AR=0) the same load runs clean, at -26 % decode.
+//
+// Correctness does not depend on write ordering (posted writes to different destinations, or
+// relaxed-ordered ones, can overtake each other -- the 2026-08-30 stale-element bug). Each 8-byte
+// word carries 4 bytes of data and the collective's sequence number (LL-style, like RCCL's LL
+// protocol): a reader accepts a word only when its tag matches, so a torn or stale word is never
+// reduced. Waiting is cheap on the fabric: one thread per block polls ONE word per peer with
+// backoff before the bulk reads; the bulk reads re-poll individually only if a word is still in
+// flight. Two parities keep a fast rank's next collective off the slot a slow rank still reads
+// (a rank can start collective s+2 only after every peer finished s, by stream order).
+//
+// Host layout, in 8-byte words: host[(parity * W + src) * slot_words + w],
+//   word w = { low 32 bits: data (2 x fp16 or 1 x fp32), high 32 bits: sequence number }.
+__device__ __forceinline__ unsigned long long rdna_ar_ll_load(const unsigned long long* p) {
+  return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ void rdna_ar_ll_store(unsigned long long* p, unsigned lo, int seq) {
+  const unsigned long long v = ((unsigned long long)(unsigned)seq << 32) | lo;
+  __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+template <typename T> struct RdnaLL;
+template <> struct RdnaLL<__half> {   // two halves per word
+  static constexpr int kPer = 2;
+  __device__ static unsigned pack(const __half* in, int i, int n) {
+    unsigned short a = __half_as_ushort(in[i]);
+    unsigned short b = (i + 1 < n) ? __half_as_ushort(in[i + 1]) : (unsigned short)0;
+    return (unsigned)a | ((unsigned)b << 16);
+  }
+  __device__ static void acc(float* v, unsigned lo) {
+    v[0] += __half2float(__ushort_as_half((unsigned short)(lo & 0xFFFFu)));
+    v[1] += __half2float(__ushort_as_half((unsigned short)(lo >> 16)));
+  }
+  __device__ static void own(float* v, const __half* in, int i, int n) {
+    v[0] += __half2float(in[i]);
+    if (i + 1 < n) v[1] += __half2float(in[i + 1]);
+  }
+  __device__ static void put(__half* out, int i, int n, const float* v) {
+    out[i] = __float2half(v[0]);
+    if (i + 1 < n) out[i + 1] = __float2half(v[1]);
+  }
+};
+template <> struct RdnaLL<float> {    // one float per word
+  static constexpr int kPer = 1;
+  __device__ static unsigned pack(const float* in, int i, int) { return __float_as_uint(in[i]); }
+  __device__ static void acc(float* v, unsigned lo) { v[0] += __uint_as_float(lo); }
+  __device__ static void own(float* v, const float* in, int i, int) { v[0] += in[i]; }
+  __device__ static void put(float* out, int i, int, const float* v) { out[i] = v[0]; }
+};
+
+template <typename T>
+__global__ void rdna_ar_host_ll(const T* __restrict__ in, T* __restrict__ out,
+                                unsigned long long* host,         // shared pinned host buffer
+                                unsigned int* arrive, int* seqbuf,
+                                unsigned* timeout, unsigned long long* report,
+                                int rank, int world, int n, long long slot_words,
+                                int nblocks, unsigned long long spin_cap) {
+  __shared__ int s_seq;
+  __shared__ int s_abort;
+  const int t = threadIdx.x, nt = blockDim.x, b = blockIdx.x;
+  if (t == 0) {
+    s_seq = __hip_atomic_load(seqbuf, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) + 1;
+    s_abort = 0;
+  }
+  __syncthreads();
+  const int seq = s_seq;
+  const int p = seq & 1;
+  constexpr int kPer = RdnaLL<T>::kPer;
+  const int nwords = (n + kPer - 1) / kPer;
+  const int gid = b * nt + t, gstride = nblocks * nt;
+
+  // 1. write our slot: posted writes to host memory, one tagged word per store
+  unsigned long long* mine = host + ((long long)p * world + rank) * slot_words;
+  for (int w = gid; w < nwords; w += gstride)
+    rdna_ar_ll_store(mine + w, RdnaLL<T>::pack(in, w * kPer, n), seq);
+
+  // 2. local grid barrier, only to advance the sequence counter after every block has read it
+  __syncthreads();
+  if (t == 0) {
+    atomicAdd(&arrive[p], 1u);
+    if (b == 0) {
+      unsigned long long s = 0;
+      while (__hip_atomic_load(&arrive[p], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) <
+             (unsigned)nblocks) {
+        RDNA_AR_POLL_PAUSE();
+        if (++s > spin_cap) { rdna_ar_abort(timeout, report, 1u, (unsigned)rank, seq, s); s_abort = 1; break; }
+      }
+      if (!s_abort) {
+        arrive[1 - p] = 0u;
+        __hip_atomic_store(seqbuf, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      }
+    }
+    // 3. cheap wait: poll ONE word per peer (this block's first word) until its tag is ours
+    const int w0 = b * nt < nwords ? b * nt : 0;
+    for (int j = 0; j < world && !s_abort; j++) {
+      if (j == rank) continue;
+      const unsigned long long* peer = host + ((long long)p * world + j) * slot_words;
+      unsigned long long s = 0;
+      while ((int)(rdna_ar_ll_load(peer + w0) >> 32) != seq) {
+        RDNA_AR_POLL_PAUSE();
+        if (++s > spin_cap) { rdna_ar_abort(timeout, report, 2u, (unsigned)j, seq, s); s_abort = 1; break; }
+      }
+    }
+  }
+  __syncthreads();
+  if (s_abort) return;
+
+  // 4. read every peer's word, re-polling only a word that is still in flight; reduce in the
+  //    fixed rank order 0 .. W-1 in fp32 so every rank produces bit-identical output
+  for (int w = gid; w < nwords; w += gstride) {
+    unsigned long long got[RDNA_AR_MAX_WORLD];
+    for (int j = 0; j < world; j++)
+      if (j != rank) got[j] = rdna_ar_ll_load(host + ((long long)p * world + j) * slot_words + w);
+    float v[kPer];
+    for (int k = 0; k < kPer; k++) v[k] = 0.f;
+    for (int j = 0; j < world; j++) {
+      if (j == rank) { RdnaLL<T>::own(v, in, w * kPer, n); continue; }
+      const unsigned long long* src = host + ((long long)p * world + j) * slot_words + w;
+      unsigned long long s = 0;
+      while ((int)(got[j] >> 32) != seq) {
+        RDNA_AR_POLL_PAUSE();
+        if (++s > spin_cap) { rdna_ar_abort(timeout, report, 2u, (unsigned)j, seq, s); return; }
+        got[j] = rdna_ar_ll_load(src);
+      }
+      RdnaLL<T>::acc(v, (unsigned)(got[j] & 0xFFFFFFFFull));
+    }
+    RdnaLL<T>::put(out, w * kPer, n, v);
+  }
+}

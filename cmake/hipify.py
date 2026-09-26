@@ -50,6 +50,13 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    # Resolve symlinks consistently (gfx1030 fork, 2026-09-25): with the checkout reached through a
+    # symlink, CMake passes project/output dirs by their symlink path while abspath() of the sources
+    # follows the process cwd (the resolved path). hipify then keys headers under one spelling and
+    # looks them up under the other: dependents keep including "cuda_compat.h" un-hipified.
+    args.project_dir = os.path.realpath(args.project_dir)
+    args.output_dir = os.path.realpath(args.output_dir)
+    args.sources = [os.path.realpath(s) for s in args.sources]
 
     # Limit include scope to project_dir only
     includes = [os.path.join(args.project_dir, "*")]

@@ -187,8 +187,9 @@ class RdnaOneShotAllReduce:
         dist.barrier(group=group)
         self.disabled = False
         logger.info(
-            "rdna_ar: one-shot all-reduce active (handle %d, rank %d/%d, devices %s, max %d KB; blocks cap %s, pace %s)",
-            self.handle, self.rank, self.world_size, gathered, max_kb, os.getenv("VLLM_RDNA_AR_BLOCKS", "auto"), os.getenv("VLLM_RDNA_AR_PACE", "0"))
+            "rdna_ar: one-shot all-reduce active (mode %s, handle %d, rank %d/%d, devices %s, max %d KB; blocks cap %s, pace %s)",
+            os.getenv("VLLM_RDNA_AR_MODE", "p2p"), self.handle, self.rank, self.world_size, gathered, max_kb,
+            os.getenv("VLLM_RDNA_AR_BLOCKS", "auto"), os.getenv("VLLM_RDNA_AR_PACE", "0"))
 
     def _self_test(self, device: torch.device) -> str | None:
         """Verified all-reduces on the fast path at three sizes; returns an error string or None.

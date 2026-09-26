@@ -46,6 +46,14 @@ struct RdnaArState {
   int64_t fast_calls = 0;
   int blocks_cap = 0;            // VLLM_RDNA_AR_BLOCKS: cap on blocks per launch (0 = auto)
   int pace = 0;                  // VLLM_RDNA_AR_PACE: s_sleep units between strided pushes
+  // VLLM_RDNA_AR_MODE=host (2026-09-25): payload through one shared pinned host buffer, no GPU
+  // peer-to-peer at all (see rdna_ar_host_ll in rdna_allreduce.cuh). Default "p2p" = the kernel above.
+  bool host_mode = false;
+  std::string shm_name;
+  void* host_map = nullptr;                  // our mapping of the shared buffer
+  size_t host_bytes = 0;
+  unsigned long long* host_dev = nullptr;    // the same buffer as seen by this GPU
+  long long slot_words = 0;                  // 8-byte LL words per (parity, source) slot
 };
 // One instance per process group (vLLM builds several GroupCoordinators over the same
 // ranks: world, TP, EP ...). Addressed by the handle rdna_ar_init returns.
@@ -71,6 +79,7 @@ at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_id
   // idles each wave between strided stores. See rdna_allreduce.cuh step 1.
   if (const char* e = std::getenv("VLLM_RDNA_AR_BLOCKS")) g.blocks_cap = std::max(0, std::atoi(e));
   if (const char* e = std::getenv("VLLM_RDNA_AR_PACE")) g.pace = std::max(0, std::min(127, std::atoi(e)));
+  if (const char* e = std::getenv("VLLM_RDNA_AR_MODE")) g.host_mode = (std::string(e) == "host");
   TORCH_CHECK(device_ids.numel() == world && device_ids.scalar_type() == at::kLong,
               "rdna_ar: device_ids must be int64[world]");
   g.rank = (int)rank;
@@ -79,7 +88,7 @@ at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_id
   const int64_t* dev = device_ids.data_ptr<int64_t>();
   int mydev = -1;
   RDNA_AR_CHK(hipGetDevice(&mydev));
-  for (int j = 0; j < world; j++) {
+  for (int j = 0; j < world && !g.host_mode; j++) {   // host mode needs no peer access
     if (j == rank || dev[j] == mydev) continue;
     hipError_t pe = hipDeviceEnablePeerAccess((int)dev[j], 0);
     TORCH_CHECK(pe == hipSuccess || pe == hipErrorPeerAccessAlreadyEnabled,
@@ -90,7 +99,8 @@ at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_id
   }
   // staging slots followed by one 4 KB flag page: peers write flags[rank] = seq into it
   // through the same IPC mapping (uncached, so a P2P write is visible to our polls)
-  const size_t stage_bytes = 2ull * world * (size_t)max_bytes;
+  // host mode keeps only a token device allocation (its IPC handle keeps the Python exchange unchanged)
+  const size_t stage_bytes = g.host_mode ? 0 : 2ull * world * (size_t)max_bytes;
   const size_t alloc_bytes = stage_bytes + RDNA_AR_FLAG_PAGE;
   RDNA_AR_CHK(hipExtMallocWithFlags(&g.stage, alloc_bytes, hipDeviceMallocUncached));
   RDNA_AR_CHK(hipMemset(g.stage, 0, alloc_bytes));
@@ -110,9 +120,24 @@ at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_id
     const long long v = atoll(e);
     if (v > 0) g.spin_cap = (unsigned long long)v;
   }
-  // (shm_name is kept in the signature for the Python side; the host-coherent flag page it
-  // named is no longer used -- flags live in device memory, see rdna_allreduce.cuh)
-  (void)shm_name;
+  // p2p mode: shm_name is unused (flags live in device memory, see rdna_allreduce.cuh).
+  // host mode: it names the shared LL buffer. Rank 0 runs first (ordered init) and creates it.
+  if (g.host_mode) {
+    g.shm_name = shm_name;
+    g.slot_words = (max_bytes + 3) / 4;                   // 4 data bytes per 8-byte word
+    g.host_bytes = 2ull * world * (size_t)g.slot_words * 8ull;
+    const int fd = rank == 0 ? shm_open(shm_name.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600)
+                             : shm_open(shm_name.c_str(), O_RDWR, 0600);
+    TORCH_CHECK(fd >= 0, "rdna_ar host mode: shm_open(", shm_name, ") failed");
+    if (rank == 0) TORCH_CHECK(ftruncate(fd, (off_t)g.host_bytes) == 0, "rdna_ar host mode: ftruncate failed");
+    g.host_map = mmap(nullptr, g.host_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    TORCH_CHECK(g.host_map != MAP_FAILED, "rdna_ar host mode: mmap failed");
+    if (rank == 0) memset(g.host_map, 0, g.host_bytes);   // tag 0 never matches a sequence (>= 1)
+    // default registration is fine-grained (coherent): GPU loads/stores go to host memory each time
+    RDNA_AR_CHK(hipHostRegister(g.host_map, g.host_bytes, hipHostRegisterMapped));
+    RDNA_AR_CHK(hipHostGetDevicePointer((void**)&g.host_dev, g.host_map, 0));
+  }
   for (int j = 0; j < RDNA_AR_MAX_WORLD; j++) { g.peers.stage[j] = nullptr; g.peers.flags[j] = nullptr; }
   g.peers.stage[rank] = g.stage;
   g.peers.flags[rank] = reinterpret_cast<int*>(static_cast<uint8_t*>(g.stage) + stage_bytes);
@@ -133,6 +158,12 @@ void rdna_ar_connect(int64_t handle, const at::Tensor& handles) {
                   handles.scalar_type() == at::kByte && handles.is_contiguous(),
               "rdna_ar: handles must be contiguous uint8[world, 64]");
   const uint8_t* p = handles.data_ptr<uint8_t>();
+  if (g.host_mode) {
+    // every rank has mapped the buffer during the ordered init; the name is no longer needed
+    if (g.rank == 0) shm_unlink(g.shm_name.c_str());
+    g.ready = true;
+    return;
+  }
   for (int j = 0; j < g.world; j++) {
     if (j == g.rank) continue;
     hipIpcMemHandle_t h;
@@ -165,6 +196,20 @@ at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in) {
   if (g.blocks_cap > 0 && nblocks > g.blocks_cap) nblocks = g.blocks_cap;
   const int threads = 256;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (g.host_mode) {
+    if (in.scalar_type() == at::kHalf)
+      rdna_ar_host_ll<__half><<<nblocks, threads, 0, stream>>>(
+          reinterpret_cast<const __half*>(in.const_data_ptr()),
+          reinterpret_cast<__half*>(out.mutable_data_ptr()), g.host_dev, g.arrive, g.seqbuf,
+          g.timeout, g.report, g.rank, g.world, n, g.slot_words, nblocks, g.spin_cap);
+    else
+      rdna_ar_host_ll<float><<<nblocks, threads, 0, stream>>>(
+          reinterpret_cast<const float*>(in.const_data_ptr()),
+          reinterpret_cast<float*>(out.mutable_data_ptr()), g.host_dev, g.arrive, g.seqbuf,
+          g.timeout, g.report, g.rank, g.world, n, g.slot_words, nblocks, g.spin_cap);
+    g.fast_calls++;
+    return out;
+  }
   if (in.scalar_type() == at::kHalf) {
     const long long max_elems = g.max_bytes / 2;
     rdna_ar_oneshot<__half><<<nblocks, threads, 0, stream>>>(
