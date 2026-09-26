@@ -58,6 +58,31 @@ from . import model
 from .indexer_qsa import QSAIndexer
 
 
+
+# gfx1030 fork, 2026-09-25 -- debug: dump the sparse selections to measure how much neighbouring query
+# rows share (sizing a cross-row reuse kernel). VLLM_RDNA_QSA_DUMP=<dir>; rank 0 only; for each layer the
+# 4th, 8th and 12th call with >= 1024 query rows. Synchronises (.cpu()), so never set it in production.
+import os as _os
+
+_QSA_DUMP_DIR = _os.getenv("VLLM_RDNA_QSA_DUMP")
+_qsa_dump_calls: dict = {}
+
+
+def _qsa_dump(layer, logical_indices, token_to_req) -> None:
+    import torch.distributed as _dist
+
+    if _dist.is_initialized() and _dist.get_rank() != 0:
+        return
+    name = getattr(layer, "layer_name", None) or str(id(layer))
+    n = _qsa_dump_calls.get(name, 0) + 1
+    _qsa_dump_calls[name] = n
+    if n not in (4, 8, 12):
+        return
+    _os.makedirs(_QSA_DUMP_DIR, exist_ok=True)
+    safe = name.replace(".", "_").replace("/", "_")
+    torch.save({"indices": logical_indices.cpu(), "token_to_req": token_to_req.cpu(), "layer": name, "call": n},
+               _os.path.join(_QSA_DUMP_DIR, f"{safe}_call{n:02d}.pt"))
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -166,6 +191,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
         from .ops.qsa import qsa_sparse_paged_attention
 
+        if _QSA_DUMP_DIR and num_tokens >= 1024:
+            _qsa_dump(layer, logical_indices, token_to_req)
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
