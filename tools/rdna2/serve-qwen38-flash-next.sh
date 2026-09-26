@@ -57,12 +57,20 @@ export ROCR_VISIBLE_DEVICES="$GPUS"
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 # T41 stability stack for flat TP=4 on PCIe (with the kernel line in docs/rdna2/README.md #1)
 export HSA_NO_SCRATCH_RECLAIM=1
-# RCCL P2P level. SYS (host-staged collectives) measured FASTER than PXB here: prefill
-# 738/735 t/s at 3.3k and 760 at 30k vs 682/679/703 on PXB (+8%), decode unchanged at
-# 61.5-61.9 t/s, validate PASS (2026-09-04, two independent boots, cap 220 W). Cross-die
-# P2P on this 2-die X399 traverses the weak inter-die fabric; host staging avoids it.
-# P2P=PXB restores the old behaviour.
+# RCCL P2P level. SYS allows DIRECT card-to-card transfers between all cards, including across the
+# two X399 dies: with NCCL_DEBUG=INFO every channel logs "via P2P/IPC" (2026-09-26; an earlier comment
+# here called SYS "host-staged" -- that was wrong). It measured faster than PXB: prefill 738/735 t/s
+# at 3.3k and 760 at 30k vs 682/679/703 (+8%), decode unchanged at 61.5-61.9 t/s, validate PASS
+# (2026-09-04, two boots, 220 W). P2P=PXB restores the old behaviour; NCCL_P2P_DISABLE=1 forces
+# host-memory staging (SHM) for everything.
 export NCCL_P2P_LEVEL="${P2P:-SYS}"
+# RCCL collectives that fall between the one-shot all-reduce (<= 64 KB) and the eager-only paths are
+# captured into CUDA graphs (prefill batches <= 256 tokens) on a communicator that is also used eagerly.
+# RCCL's default graphUsageMode 0 declares "no graphs" and logs, per captured collective, "Violating
+# graphUsageMode semantics can lead to hangs!" (3,767 times per boot, 2026-09-26). NCCL_GRAPH_MIXING_SUPPORT=1
+# sets graphUsageMode 2 (graph + eager on the same communicator): warning gone, results correct, and no
+# measurable cost (RCCL all-reduce 80 KB..1.25 MB: 58-306 us with or without it).
+export NCCL_GRAPH_MIXING_SUPPORT="${NCCL_GRAPH_MIXING_SUPPORT:-1}"
 # nothing from the CDNA world exists on gfx1030
 export VLLM_ROCM_USE_AITER=0
 export TORCH_BLAS_PREFER_HIPBLASLT=0

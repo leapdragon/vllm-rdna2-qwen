@@ -25,7 +25,7 @@ def worker(rank, q_handles, q_out, barrier):
     shm = "/rdna_ar_optest"
     for r in range(W):           # ordered init, like the communicator
         if r == rank:
-            packed = ops.rdna_ar_init(rank, W, dev_ids, 512 * 1024, shm).numpy().tobytes()
+            packed = ops.rdna_ar_init(rank, W, dev_ids, int(os.environ.get("RDNA_AR_TEST_MAXB", 512 * 1024)), shm).numpy().tobytes()
             hdl = int.from_bytes(packed[:8], "little"); h = packed[8:]
         barrier.wait()
     q_handles.put((rank, h))
@@ -65,7 +65,7 @@ def worker(rank, q_handles, q_out, barrier):
     # a second instance (second process group) in the same process must also work
     for r in range(W):
         if r == rank:
-            packed2 = ops.rdna_ar_init(rank, W, dev_ids, 64 * 1024, shm + "_b").numpy().tobytes()
+            packed2 = ops.rdna_ar_init(rank, W, dev_ids, int(os.environ.get("RDNA_AR_TEST_MAXB", 512 * 1024)), shm + "_b").numpy().tobytes()
             hdl2 = int.from_bytes(packed2[:8], "little"); h2 = packed2[8:]
         barrier.wait()
     q_handles.put((rank + 100, h2)); barrier.wait()
