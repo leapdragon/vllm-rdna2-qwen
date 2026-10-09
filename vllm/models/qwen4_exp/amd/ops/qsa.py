@@ -286,6 +286,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -300,6 +302,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    stride_scale_block,
+    stride_scale_token,
+    stride_scale_head,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -317,6 +322,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_INT8: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -389,7 +395,22 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if KV_INT8:
+            # gfx1030 fork (2026-10-09): int8 per-token-head cache. int8 -> fp16 is exact; the per-(token, head)
+            # fp32 scales apply to the scores (K) and to the probabilities before the PV dot (V), as in
+            # triton_unified_attention.
+            keys = keys.to(query.dtype)
+            values = values.to(query.dtype)
+            scale_offsets = (
+                safe_page * stride_scale_block
+                + page_offset * stride_scale_token
+                + kv_head * stride_scale_head
+            )
+            key_scale = tl.load(k_scale_ptr + scale_offsets, mask=valid, other=0.0)
+            value_scale = tl.load(v_scale_ptr + scale_offsets, mask=valid, other=0.0)
         scores = tl.dot(query, keys)
+        if KV_INT8:
+            scores *= key_scale[None, :]
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -398,8 +419,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
+        weighted = probabilities
+        if KV_INT8:
+            weighted = probabilities * value_scale[None, :]
         accumulator = tl.dot(
-            probabilities.to(values.dtype),
+            weighted.to(values.dtype),
             values,
             acc=accumulator * alpha[:, None],
         )
@@ -1082,8 +1106,11 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16/FP16 K/V caches, or int8 caches with per-(token, head) fp32
+    scales k_scale / v_scale of shape [num_blocks, page_size, num_kv_heads] (int8_per_token_head)."""
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
@@ -1101,7 +1128,14 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    kv_int8 = k_cache.dtype == torch.int8
+    if kv_int8:
+        assert v_cache.dtype == torch.int8 and k_scale is not None and v_scale is not None
+        assert k_scale.shape == v_scale.shape == k_cache.shape[:3]
+        assert k_scale.dtype == v_scale.dtype == torch.float32
+        assert k_scale.stride() == v_scale.stride()
+    else:
+        assert q.dtype == k_cache.dtype == v_cache.dtype
     # gfx1030 lacks native BF16; FP16 measured faster and ~7x more accurate
     # against an FP32 reference on this kernel, so both are permitted.
     assert q.dtype in (torch.bfloat16, torch.float16)
@@ -1138,7 +1172,7 @@ def qsa_sparse_paged_attention(
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
-        if _QSA_DESPILL and head_dim % 4 == 0 and block_m <= 8:
+        if _QSA_DESPILL and head_dim % 4 == 0 and block_m <= 8 and not kv_int8:
             _qsa_sparse_despill_kernel[(q.shape[0], k_cache.shape[2])](
                 q, k_cache, v_cache, logical_indices, block_table, token_to_req, out,
                 q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
@@ -1176,10 +1210,15 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    scale_k = k_scale if kv_int8 else q  # unused pointer when not int8
+    scale_v = v_scale if kv_int8 else q
+    scale_strides = k_scale.stride() if kv_int8 else (0, 0, 0)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
         v_cache,
+        scale_k,
+        scale_v,
         logical_indices,
         block_table,
         token_to_req,
@@ -1194,6 +1233,9 @@ def qsa_sparse_paged_attention(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        scale_strides[0],
+        scale_strides[1],
+        scale_strides[2],
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -1211,6 +1253,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_INT8=kv_int8,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

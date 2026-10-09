@@ -28,6 +28,14 @@ Per MoE layer at batch 1: 88 → 71 µs (v2) → 65 µs (v3). In the serving pro
 (v2) then +4.1 % (v3); 16 concurrent streams 134 → 266 tok/s aggregate. Greedy output identical to the
 previous kernels. Switches: `VLLM_RDNA_MOE_V2`, `VLLM_RDNA_MOE_V3` (ENVIRONMENT.md).
 
+**2026-10-09 — int8 KV cache for the QSA layers, and the first decode small-op pass.** `--kv-cache-dtype
+int8_per_token_head` now works for Qwen3.8-Flash-Next. The QSA sparse-attention kernel reads int8 K/V and applies the
+per-token scales to the scores and the probabilities; writes go through vLLM's per-token-head quantizing cache kernel.
+This gives 1.95× the KV tokens with no measured speed or retrieval cost (ENVIRONMENT.md). Separately, a kernel trace of a
+whole decode step taken inside the serving process (about 1450 launches) led to two changes: the MoE output is no
+longer copied after every MoE layer, and the hyper-connection down projection uses a split-K GEMV. Together they give
++1.3 % single-stream decode.
+
 ## How to see exactly what this fork changed (on GitHub)
 
 The branch has three layers, and GitHub's compare view can show each:
