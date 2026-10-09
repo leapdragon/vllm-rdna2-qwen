@@ -1004,6 +1004,211 @@ void moe_skinny_int4_decode(
 
 
 // ---------------------------------------------------------------------------
+// MoE decode v2 (2026-10-09): same contract as moe_skinny_int4_decode, built for the per-kernel latency floor.
+//  * No LDS for activations: v1 staged x in LDS from every block (including the ~75 % of blocks whose expert
+//    lives on another EP rank) and read it back at an 8-way bank-conflicting stride. Here each lane loads only
+//    the activations of its own K chunks straight from global memory; the block's waves share them through L1.
+//  * 16-byte weight loads (one uint4 = 32 consecutive K nibbles of a row), all issued before use.
+//  * exact natural-order dequant: per byte b, ((q>>8b)&0xF) | (((q>>8b)&0xF0)<<12) | 0x64006400 gives
+//    half2(1024+n_2b, 1024+n_2b+1); subtracting half2(1032) is exact -> (n - 8); v_dot2_f32_f16 with x pairs.
+//  * w2 flattens (local slot, chunk) pairs over the 32 lanes and can add a residual (the shared expert's
+//    output) in its epilogue, saving the separate add launch. Non-local blocks exit before any memory access.
+// Layout as v1: w13 [E, 2N, K/8] uint32 k-sequential nibbles, value (n - 8) * scale, scales [E, rows, K/G].
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float moe_v2_dot32(const uint4& q, const uint4* __restrict__ x4) {
+  // q: 32 nibbles (k0..k0+31); x4: 4 x uint4 = 32 fp16 activations k0..k0+31 (natural order)
+  const half2 bias = __halves2half2(__ushort_as_half(0x6408), __ushort_as_half(0x6408));  // 1032
+  const uint32_t* qq = reinterpret_cast<const uint32_t*>(&q);
+  float a = 0.f;
+#pragma unroll
+  for (int u = 0; u < 4; u++) {
+    const uint4 xv = x4[u];
+    const half2* xh = reinterpret_cast<const half2*>(&xv);
+#pragma unroll
+    for (int b = 0; b < 4; b++) {
+      const uint32_t t = qq[u] >> (8 * b);
+      const uint32_t v = (t & 0xFu) | ((t & 0xF0u) << 12) | 0x64006400u;
+      const half2 w = __hsub2(*reinterpret_cast<const half2*>(&v), bias);
+      a = __builtin_amdgcn_fdot2(w, xh[b], a, false);
+    }
+  }
+  return a;
+}
+
+template <int WAVES>
+__global__ void __launch_bounds__(WAVES * 32)
+moe_w13_silu_v2_(const half* __restrict__ input, const uint4* __restrict__ w13,
+                 const half* __restrict__ s13, const void* __restrict__ topk_ids,
+                 const bool ids_i64, const int32_t* __restrict__ expert_map,
+                 half* __restrict__ act, const int K, const int N, const int topk,
+                 const int group_size) {
+  const int m = blockIdx.z, s = blockIdx.y;
+  const int expert = moe_local_expert(topk_ids, ids_i64, expert_map, m * topk + s);
+  if (expert < 0) return;  // non-local under EP: w2 skips this slot, its act row is never read
+  const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int n = blockIdx.x * WAVES + wave;
+  if (n >= N) return;
+  const int C = K / 32, CG = group_size / 32, KG = K / group_size;
+  const uint64_t rg = (uint64_t)expert * 2 * N + n, ru = rg + N;
+  const uint4* wg = w13 + rg * C;
+  const uint4* wu = w13 + ru * C;
+  const half* sg = s13 + rg * KG;
+  const half* su = s13 + ru * KG;
+  const uint4* x4 = reinterpret_cast<const uint4*>(input + (uint64_t)m * K);
+  constexpr int MAXC = 4;  // chunks per lane: C <= 128 (K <= 4096)
+  uint4 qg[MAXC], qu[MAXC];
+#pragma unroll
+  for (int i = 0; i < MAXC; i++) {
+    const int c = lane + 32 * i;
+    if (c < C) { qg[i] = wg[c]; qu[i] = wu[c]; }
+  }
+  float accg = 0.f, accu = 0.f;
+#pragma unroll
+  for (int i = 0; i < MAXC; i++) {
+    const int c = lane + 32 * i;
+    if (c < C) {
+      const uint4* xc = x4 + c * 4;
+      const int g = c / CG;
+      accg += moe_v2_dot32(qg[i], xc) * __half2float(sg[g]);
+      accu += moe_v2_dot32(qu[i], xc) * __half2float(su[g]);
+    }
+  }
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) {
+    accg += __shfl_xor(accg, off);
+    accu += __shfl_xor(accu, off);
+  }
+  if (lane == 0)
+    act[((uint64_t)m * topk + s) * N + n] = __float2half(accg / (1.f + __expf(-accg)) * accu);
+}
+
+template <int WAVES>
+__global__ void __launch_bounds__(WAVES * 32)
+moe_w2_v2_(const half* __restrict__ act, const uint4* __restrict__ w2,
+           const half* __restrict__ s2, const void* __restrict__ topk_ids,
+           const bool ids_i64, const int32_t* __restrict__ expert_map,
+           const void* __restrict__ topk_w, const bool w_is_half,
+           const half* __restrict__ residual, half* __restrict__ out,
+           const int N, const int H, const int topk, const int group_size) {
+  const int m = blockIdx.z;
+  const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int h = blockIdx.x * WAVES + wave;
+  __shared__ int s_exp[32];
+  __shared__ int s_slot[32];
+  __shared__ float s_w[32];
+  __shared__ int s_nloc;
+  if (threadIdx.x < 32) {  // wave 0 compacts the local slots
+    int e = -1;
+    float w = 0.f;
+    if (threadIdx.x < topk) {
+      e = moe_local_expert(topk_ids, ids_i64, expert_map, m * topk + threadIdx.x);
+      if (e >= 0) w = moe_topk_w(topk_w, w_is_half, m * topk + threadIdx.x);
+    }
+    const uint64_t mask = __ballot(e >= 0);
+    if (e >= 0) {
+      const int pos = __popcll(mask & ((1ull << threadIdx.x) - 1));
+      s_exp[pos] = e; s_slot[pos] = threadIdx.x; s_w[pos] = w;
+    }
+    if (threadIdx.x == 0) s_nloc = __popcll(mask);
+  }
+  __syncthreads();
+  if (h >= H) return;
+  const int nloc = s_nloc;
+  const int C = N / 32, CG = group_size / 32, NG = N / group_size;
+  float acc = 0.f;
+  const int total = nloc * C;
+  for (int base = 0; base < total; base += 32 * 4) {
+    uint4 q[4];
+    int ls[4], cs[4];
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int t = base + lane + 32 * u;
+      ls[u] = -1;
+      if (t < total) {
+        const int l = t / C, c = t - l * C;
+        q[u] = w2[((uint64_t)s_exp[l] * H + h) * C + c];
+        ls[u] = l; cs[u] = c;
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      if (ls[u] >= 0) {
+        const int l = ls[u], c = cs[u], e = s_exp[l];
+        const uint4* a4 = reinterpret_cast<const uint4*>(act + ((uint64_t)m * topk + s_slot[l]) * N) + c * 4;
+        const float sc = __half2float(s2[((uint64_t)e * H + h) * NG + c / CG]);
+        acc += moe_v2_dot32(q[u], a4) * sc * s_w[l];
+      }
+    }
+  }
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) acc += __shfl_xor(acc, off);
+  if (lane == 0) {
+    const float r = residual ? __half2float(residual[(uint64_t)m * H + h]) : 0.f;
+    out[(uint64_t)m * H + h] = __float2half(acc + r);
+  }
+}
+
+void moe_skinny_int4_decode_v2(
+    const at::Tensor& input, const at::Tensor& w13, const at::Tensor& w13_scale,
+    const at::Tensor& w2, const at::Tensor& w2_scale, const at::Tensor& topk_weights,
+    const at::Tensor& topk_ids, at::Tensor& act_buf, at::Tensor& output,
+    const int64_t group_size, const std::optional<at::Tensor>& expert_map,
+    const std::optional<at::Tensor>& residual) {
+  const int M = input.size(0), K = input.size(1);
+  const int topk = topk_ids.size(1), N = act_buf.size(2);
+  TORCH_CHECK(M >= 1 && M <= 16, "moe_skinny_int4_decode_v2: M must be 1..16");
+  TORCH_CHECK(topk <= 32, "moe_skinny_int4_decode_v2: topk <= 32");
+  TORCH_CHECK(K % 32 == 0 && N % 32 == 0 && K <= 4096, "moe_skinny_int4_decode_v2: K, N % 32, K <= 4096");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(input.const_data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(act_buf.const_data_ptr()) % 16 == 0, "activations must be 16-byte aligned");
+  TORCH_CHECK(group_size % 32 == 0 && K % group_size == 0 && N % group_size == 0,
+              "moe_skinny_int4_decode_v2: group_size must be a multiple of 32 dividing K and N");
+  TORCH_CHECK(input.scalar_type() == at::kHalf && w13_scale.scalar_type() == at::kHalf &&
+                  w2_scale.scalar_type() == at::kHalf && act_buf.scalar_type() == at::kHalf &&
+                  output.scalar_type() == at::kHalf, "fp16 activations/scales only");
+  TORCH_CHECK(topk_ids.scalar_type() == at::kInt || topk_ids.scalar_type() == at::kLong,
+              "topk_ids must be int32 or int64");
+  TORCH_CHECK(topk_weights.scalar_type() == at::kFloat || topk_weights.scalar_type() == at::kHalf,
+              "topk_weights must be float32 or fp16");
+  TORCH_CHECK(topk_ids.is_contiguous() && topk_weights.is_contiguous() && input.is_contiguous() &&
+                  act_buf.is_contiguous() && output.is_contiguous(), "contiguous operands");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(w13.const_data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(w2.const_data_ptr()) % 16 == 0, "weights must be 16-byte aligned");
+  const int64_t elem = w13.element_size();
+  TORCH_CHECK(w13.numel() * elem == (int64_t)w13_scale.size(0) * 2 * N * K / 2, "w13 byte-size mismatch");
+  TORCH_CHECK(w2.numel() * elem == (int64_t)w2_scale.size(0) * K * N / 2, "w2 byte-size mismatch");
+  TORCH_CHECK(output.size(1) == K, "output width must equal hidden size");
+  const int32_t* emap = nullptr;
+  if (expert_map.has_value()) {
+    TORCH_CHECK(expert_map->scalar_type() == at::kInt && expert_map->is_contiguous(),
+                "expert_map must be contiguous int32");
+    emap = reinterpret_cast<const int32_t*>(expert_map->const_data_ptr());
+  }
+  const half* rp = nullptr;
+  if (residual.has_value()) {
+    TORCH_CHECK(residual->scalar_type() == at::kHalf && residual->is_contiguous() &&
+                    residual->size(0) == M && residual->size(1) == K, "residual must be contiguous fp16 [M, K]");
+    rp = reinterpret_cast<const half*>(residual->const_data_ptr());
+  }
+  const bool ids_i64 = topk_ids.scalar_type() == at::kLong;
+  const bool w_half = topk_weights.scalar_type() == at::kHalf;
+  constexpr int WAVES = 8;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  moe_w13_silu_v2_<WAVES><<<dim3((N + WAVES - 1) / WAVES, topk, M), WAVES * 32, 0, stream>>>(
+      reinterpret_cast<const half*>(input.const_data_ptr()),
+      reinterpret_cast<const uint4*>(w13.const_data_ptr()),
+      reinterpret_cast<const half*>(w13_scale.const_data_ptr()), topk_ids.const_data_ptr(), ids_i64,
+      emap, reinterpret_cast<half*>(act_buf.mutable_data_ptr()), K, N, topk, (int)group_size);
+  moe_w2_v2_<WAVES><<<dim3((K + WAVES - 1) / WAVES, 1, M), WAVES * 32, 0, stream>>>(
+      reinterpret_cast<const half*>(act_buf.const_data_ptr()),
+      reinterpret_cast<const uint4*>(w2.const_data_ptr()),
+      reinterpret_cast<const half*>(w2_scale.const_data_ptr()), topk_ids.const_data_ptr(), ids_i64,
+      emap, topk_weights.const_data_ptr(), w_half, rp,
+      reinterpret_cast<half*>(output.mutable_data_ptr()), N, K, topk, (int)group_size);
+}
+
+
+// ---------------------------------------------------------------------------
 // fp16 skinny GEMM for gfx1030 decode (M <= 8 tokens): y[M,N] = x[M,K].w[N,K]^T
 // (+ bias). Wave-per-output-row, lanes stride K with 16-byte loads, 4-deep
 // unroll for memory-level parallelism, v_dot2_f32_f16 accumulate, wave32
@@ -1084,7 +1289,7 @@ static void gemv_f16_rdna2_launch(const half* x, const half* w,
 at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
                           const std::optional<at::Tensor>& bias) {
   const int M = x.size(0), K = x.size(1), N = w.size(0);
-  TORCH_CHECK(M >= 1 && M <= 8, "gemv_f16_rdna2: M must be 1..8");
+  TORCH_CHECK(M >= 1 && M <= 16, "gemv_f16_rdna2: M must be 1..16");
   TORCH_CHECK(w.size(1) == K, "gemv_f16_rdna2: K mismatch");
   TORCH_CHECK(K % 8 == 0, "gemv_f16_rdna2: K % 8 == 0");
   TORCH_CHECK(x.scalar_type() == at::kHalf && w.scalar_type() == at::kHalf,
@@ -1104,15 +1309,26 @@ at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
   const half* xp = reinterpret_cast<const half*>(x.const_data_ptr());
   const half* wp = reinterpret_cast<const half*>(w.const_data_ptr());
   half* yp = reinterpret_cast<half*>(y.mutable_data_ptr());
-  switch (M) {
-    case 1: gemv_f16_rdna2_launch<1>(xp, wp, bp, yp, N, K, s); break;
-    case 2: gemv_f16_rdna2_launch<2>(xp, wp, bp, yp, N, K, s); break;
-    case 3: gemv_f16_rdna2_launch<3>(xp, wp, bp, yp, N, K, s); break;
-    case 4: gemv_f16_rdna2_launch<4>(xp, wp, bp, yp, N, K, s); break;
-    case 5: gemv_f16_rdna2_launch<5>(xp, wp, bp, yp, N, K, s); break;
-    case 6: gemv_f16_rdna2_launch<6>(xp, wp, bp, yp, N, K, s); break;
-    case 7: gemv_f16_rdna2_launch<7>(xp, wp, bp, yp, N, K, s); break;
-    default: gemv_f16_rdna2_launch<8>(xp, wp, bp, yp, N, K, s); break;
+  // M = 16 natively (CUDA graphs pad decode batches 9..16 to 16); 9..15 (eager) as an
+  // 8-row pass plus a pass over the remaining rows.
+  auto run = [&](int m, const half* xs, half* ys) {
+    switch (m) {
+      case 1: gemv_f16_rdna2_launch<1>(xs, wp, bp, ys, N, K, s); break;
+      case 2: gemv_f16_rdna2_launch<2>(xs, wp, bp, ys, N, K, s); break;
+      case 3: gemv_f16_rdna2_launch<3>(xs, wp, bp, ys, N, K, s); break;
+      case 4: gemv_f16_rdna2_launch<4>(xs, wp, bp, ys, N, K, s); break;
+      case 5: gemv_f16_rdna2_launch<5>(xs, wp, bp, ys, N, K, s); break;
+      case 6: gemv_f16_rdna2_launch<6>(xs, wp, bp, ys, N, K, s); break;
+      case 7: gemv_f16_rdna2_launch<7>(xs, wp, bp, ys, N, K, s); break;
+      case 16: gemv_f16_rdna2_launch<16>(xs, wp, bp, ys, N, K, s); break;
+      default: gemv_f16_rdna2_launch<8>(xs, wp, bp, ys, N, K, s); break;
+    }
+  };
+  if (M > 8 && M < 16) {
+    run(8, xp, yp);
+    run(M - 8, xp + (size_t)8 * K, yp + (size_t)8 * N);
+  } else {
+    run(M, xp, yp);
   }
   return y;
 }
@@ -1213,7 +1429,7 @@ static void gemv_i8_rdna2_launch(const half* x, const int8_t* w, const half* s,
 at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scale,
                          const std::optional<at::Tensor>& bias) {
   const int M = x.size(0), K = x.size(1), N = w.size(0);
-  TORCH_CHECK(M >= 1 && M <= 8, "gemv_i8_rdna2: M must be 1..8");
+  TORCH_CHECK(M >= 1 && M <= 16, "gemv_i8_rdna2: M must be 1..16");
   TORCH_CHECK(w.size(1) == K && K % 16 == 0, "gemv_i8_rdna2: K mismatch / K % 16");
   TORCH_CHECK(x.scalar_type() == at::kHalf && w.scalar_type() == at::kChar &&
                   scale.scalar_type() == at::kHalf && scale.numel() == N,
@@ -1233,15 +1449,25 @@ at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w, const at::Ten
   const int8_t* wp = reinterpret_cast<const int8_t*>(w.const_data_ptr());
   const half* sp = reinterpret_cast<const half*>(scale.const_data_ptr());
   half* yp = reinterpret_cast<half*>(y.mutable_data_ptr());
-  switch (M) {
-    case 1: gemv_i8_rdna2_launch<1>(xp, wp, sp, bp, yp, N, K, st); break;
-    case 2: gemv_i8_rdna2_launch<2>(xp, wp, sp, bp, yp, N, K, st); break;
-    case 3: gemv_i8_rdna2_launch<3>(xp, wp, sp, bp, yp, N, K, st); break;
-    case 4: gemv_i8_rdna2_launch<4>(xp, wp, sp, bp, yp, N, K, st); break;
-    case 5: gemv_i8_rdna2_launch<5>(xp, wp, sp, bp, yp, N, K, st); break;
-    case 6: gemv_i8_rdna2_launch<6>(xp, wp, sp, bp, yp, N, K, st); break;
-    case 7: gemv_i8_rdna2_launch<7>(xp, wp, sp, bp, yp, N, K, st); break;
-    default: gemv_i8_rdna2_launch<8>(xp, wp, sp, bp, yp, N, K, st); break;
+  // M = 16 natively (graph-padded decode batches 9..16); 9..15 as 8 + remainder.
+  auto run = [&](int m, const half* xs, half* ys) {
+    switch (m) {
+      case 1: gemv_i8_rdna2_launch<1>(xs, wp, sp, bp, ys, N, K, st); break;
+      case 2: gemv_i8_rdna2_launch<2>(xs, wp, sp, bp, ys, N, K, st); break;
+      case 3: gemv_i8_rdna2_launch<3>(xs, wp, sp, bp, ys, N, K, st); break;
+      case 4: gemv_i8_rdna2_launch<4>(xs, wp, sp, bp, ys, N, K, st); break;
+      case 5: gemv_i8_rdna2_launch<5>(xs, wp, sp, bp, ys, N, K, st); break;
+      case 6: gemv_i8_rdna2_launch<6>(xs, wp, sp, bp, ys, N, K, st); break;
+      case 7: gemv_i8_rdna2_launch<7>(xs, wp, sp, bp, ys, N, K, st); break;
+      case 16: gemv_i8_rdna2_launch<16>(xs, wp, sp, bp, ys, N, K, st); break;
+      default: gemv_i8_rdna2_launch<8>(xs, wp, sp, bp, ys, N, K, st); break;
+    }
+  };
+  if (M > 8 && M < 16) {
+    run(8, xp, yp);
+    run(M - 8, xp + (size_t)8 * K, yp + (size_t)8 * N);
+  } else {
+    run(M, xp, yp);
   }
   return y;
 }

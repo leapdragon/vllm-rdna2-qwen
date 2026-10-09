@@ -17,7 +17,14 @@ import torch.nn.functional as F
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
-_DECODE_MAX = 8
+_DECODE_MAX = 16  # gemv_i8/f16_rdna2 handle M <= 16 (2026-10-09)
+# The fused glue kernels (rdna_fused_glue.cu: rdna_gemv_act, rdna_hc_up_gate_mix, rdna_se_*) take M <= 8 and
+# M == 16 (graph-padded decode batches 9..16); other M take the unfused paths.
+_FUSED_DECODE_MAX = 8
+
+
+def _fused_ok(n: int) -> bool:
+    return 0 < n <= _FUSED_DECODE_MAX or n == 16
 
 
 def _ntok(x: torch.Tensor) -> int:
@@ -67,7 +74,7 @@ def _rdna_hc_mix(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns (block_input [M, H], down_and_injection [M, N_down])."""
     n = _ntok(xn)
-    if 0 < n <= _DECODE_MAX and xn.dtype == torch.float16 and xn.is_contiguous():
+    if _fused_ok(n) and xn.dtype == torch.float16 and xn.is_contiguous():
         from vllm import _custom_ops as ops
 
         wd, sd = (w_down_i8, s_down) if w_down_i8 is not None else (w_down, None)
@@ -116,7 +123,7 @@ def _rdna_shared_expert(
 ) -> torch.Tensor:
     """Per-rank partial of sigmoid(w_gate.x) * down(silu(gate)*up); caller reduces."""
     n = _ntok(x)
-    if 0 < n <= _DECODE_MAX and x.dtype == torch.float16 and x.dim() == 2 and x.is_contiguous():
+    if _fused_ok(n) and x.dtype == torch.float16 and x.dim() == 2 and x.is_contiguous():
         from vllm import _custom_ops as ops
 
         a, sa = (w1_i8, s1) if w1_i8 is not None else (w1, None)

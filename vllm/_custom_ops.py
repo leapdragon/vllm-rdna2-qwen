@@ -2268,6 +2268,9 @@ def gemv_f16_rdna2(
     return torch.ops._rocm_C.gemv_f16_rdna2(x, w, bias)
 
 
+_RDNA_MOE_V2 = __import__("os").environ.get("VLLM_RDNA_MOE_V2", "1") == "1"
+
+
 def moe_skinny_int4_decode(
     input: torch.Tensor,
     w13: torch.Tensor,
@@ -2280,6 +2283,7 @@ def moe_skinny_int4_decode(
     output: torch.Tensor,
     group_size: int,
     expert_map: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
 ) -> None:
     """Small-batch W4A16 MoE decode: gate_up+silu*mul then weighted down.
 
@@ -2287,10 +2291,27 @@ def moe_skinny_int4_decode(
     topk_ids int32/int64, topk_weights fp32/fp16; expert_map (int32, EP)
     is applied in-kernel (T46).
     """
+    # gfx1030 fork (2026-10-09): v2 kernels (16-byte weight loads, no LDS activation staging, EP-local slot
+    # compaction): 88 -> 71 us per MoE layer at M=1, -36 % at M=8/16 in bench/fused-moe. VLLM_RDNA_MOE_V2=0
+    # restores v1. v2 needs 16-byte aligned activations and group_size % 32 == 0; otherwise v1 runs.
+    if (
+        _RDNA_MOE_V2
+        and group_size % 32 == 0
+        and input.data_ptr() % 16 == 0
+        and act_buf.data_ptr() % 16 == 0
+        and hasattr(torch.ops._rocm_C, "moe_skinny_int4_decode_v2")
+    ):
+        torch.ops._rocm_C.moe_skinny_int4_decode_v2(
+            input, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids,
+            act_buf, output, group_size, expert_map, residual,
+        )
+        return
     torch.ops._rocm_C.moe_skinny_int4_decode(
         input, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids,
         act_buf, output, group_size, expert_map,
     )
+    if residual is not None:
+        output.add_(residual)
 
 
 def wvSplitK_int4_g(

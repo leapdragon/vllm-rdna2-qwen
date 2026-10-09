@@ -42,6 +42,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor w2, Tensor w2_scale, Tensor topk_weights, Tensor topk_ids, "
       "Tensor! act_buf, Tensor! output, int group_size, Tensor? expert_map) -> ()");
   rocm_ops.impl("moe_skinny_int4_decode", torch::kCUDA, &moe_skinny_int4_decode);
+  rocm_ops.def(
+      "moe_skinny_int4_decode_v2(Tensor input, Tensor w13, Tensor w13_scale, "
+      "Tensor w2, Tensor w2_scale, Tensor topk_weights, Tensor topk_ids, "
+      "Tensor! act_buf, Tensor! output, int group_size, Tensor? expert_map, Tensor? residual) -> ()");
+  rocm_ops.impl("moe_skinny_int4_decode_v2", torch::kCUDA, &moe_skinny_int4_decode_v2);
 
   // gfx1030 fp16 skinny GEMM for decode-sized M (T43)
   rocm_ops.def("gemv_f16_rdna2(Tensor x, Tensor w, Tensor? bias) -> Tensor");

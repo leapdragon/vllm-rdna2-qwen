@@ -82,6 +82,13 @@ at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w, const at::Ten
 at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
                           const std::optional<at::Tensor>& bias);
 
+void moe_skinny_int4_decode_v2(const at::Tensor& input, const at::Tensor& w13,
+                               const at::Tensor& w13_scale, const at::Tensor& w2,
+                               const at::Tensor& w2_scale, const at::Tensor& topk_weights,
+                               const at::Tensor& topk_ids, at::Tensor& act_buf, at::Tensor& output,
+                               const int64_t group_size, const std::optional<at::Tensor>& expert_map,
+                               const std::optional<at::Tensor>& residual);
+
 void moe_skinny_int4_decode(const at::Tensor& input, const at::Tensor& w13,
                             const at::Tensor& w13_scale, const at::Tensor& w2,
                             const at::Tensor& w2_scale,

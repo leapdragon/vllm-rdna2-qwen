@@ -169,7 +169,7 @@ def apply(layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None):
     if w8 is None or x.dtype != torch.float16:
         return None
     n = x.numel() // x.size(-1)
-    if not (0 < n <= 8):
+    if not (0 < n <= 16):
         return None
     if bias is not None and (bias.dtype != torch.float16 or not bias.is_contiguous()):
         return None

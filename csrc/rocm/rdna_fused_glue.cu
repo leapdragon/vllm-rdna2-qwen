@@ -1,4 +1,5 @@
-// T46 — fused decode glue for Qwen3.8-Flash-Next on gfx1030 (M <= 8 tokens).
+// T46 — fused decode glue for Qwen3.8-Flash-Next on gfx1030 (M <= 8 tokens, and M = 16: CUDA graphs
+// pad decode batches 9..16 to 16; 2026-10-09).
 //
 // The decode step is dispatch-bound (~2,900 kernels, ~4 us of bubble each). These kernels
 // fold the elementwise glue around the dense projections into the projection itself:
@@ -22,7 +23,7 @@
 
 namespace {
 
-constexpr int kMaxM = 8;
+constexpr int kMaxM = 16;
 
 // ---- one weight row (fp16 or int8) dotted with MT activation rows, lanes striding K ----
 struct RowF16 {
@@ -293,7 +294,7 @@ void dispatch(int M, int wv, bool i8, F&& f) {
   switch (M) {
     case 1: RDNA_WV(1) break; case 2: RDNA_WV(2) break; case 3: RDNA_WV(3) break;
     case 4: RDNA_WV(4) break; case 5: RDNA_WV(5) break; case 6: RDNA_WV(6) break;
-    case 7: RDNA_WV(7) break; default: RDNA_WV(8) break;
+    case 7: RDNA_WV(7) break; case 16: RDNA_WV(16) break; default: RDNA_WV(8) break;
   }
 #undef RDNA_WV
 }
@@ -352,8 +353,8 @@ at::Tensor rdna_gemv_act(const at::Tensor& x, const at::Tensor& w,
                          const std::optional<at::Tensor>& scale, int64_t act_cols,
                          double act_scale) {
   const int M = x.size(0), K = x.size(1), N = w.size(0);
-  TORCH_CHECK(M >= 1 && M <= kMaxM && x.scalar_type() == at::kHalf && x.is_contiguous(),
-              "rdna_gemv_act: x must be contiguous fp16 [1..8, K]");
+  TORCH_CHECK((M >= 1 && M <= 8 || M == 16) && x.scalar_type() == at::kHalf && x.is_contiguous(),
+              "rdna_gemv_act: x must be contiguous fp16 [1..8 or 16, K]");
   check_weight(w, scale, N, K, "rdna_gemv_act");
   const at::cuda::OptionalCUDAGuard guard(x.device());
   auto y = at::empty({M, N}, x.options());
@@ -372,8 +373,8 @@ at::Tensor rdna_hc_up_gate_mix(const at::Tensor& lora, const at::Tensor& w,
   TORCH_CHECK(hc_count == 4, "rdna_hc_up_gate_mix: hc_count 4 only");
   const int64_t HCH = w.size(0);
   const int H = (int)(HCH / hc_count);
-  TORCH_CHECK(M >= 1 && M <= kMaxM && lora.scalar_type() == at::kHalf && lora.is_contiguous(),
-              "rdna_hc_up_gate_mix: lora must be contiguous fp16 [1..8, R]");
+  TORCH_CHECK((M >= 1 && M <= 8 || M == 16) && lora.scalar_type() == at::kHalf && lora.is_contiguous(),
+              "rdna_hc_up_gate_mix: lora must be contiguous fp16 [1..8 or 16, R]");
   TORCH_CHECK(xn.scalar_type() == at::kHalf && xn.is_contiguous() && xn.size(0) == M &&
                   xn.size(1) == HCH, "rdna_hc_up_gate_mix: xn must be fp16 [M, HC*H]");
   check_weight(w, scale, HCH, R, "rdna_hc_up_gate_mix");
@@ -394,8 +395,8 @@ at::Tensor rdna_se_gate_up_silu(const at::Tensor& x, const at::Tensor& w,
   const int64_t N2 = w.size(0);
   TORCH_CHECK(N2 % 2 == 0, "rdna_se_gate_up_silu: weight rows must be 2*I");
   const int I = (int)(N2 / 2);
-  TORCH_CHECK(M >= 1 && M <= kMaxM && x.scalar_type() == at::kHalf && x.is_contiguous(),
-              "rdna_se_gate_up_silu: x must be contiguous fp16 [1..8, K]");
+  TORCH_CHECK((M >= 1 && M <= 8 || M == 16) && x.scalar_type() == at::kHalf && x.is_contiguous(),
+              "rdna_se_gate_up_silu: x must be contiguous fp16 [1..8 or 16, K]");
   check_weight(w, scale, N2, K, "rdna_se_gate_up_silu");
   const at::cuda::OptionalCUDAGuard guard(x.device());
   auto act = at::empty({M, I}, x.options());
@@ -411,8 +412,8 @@ at::Tensor rdna_se_down_gated(const at::Tensor& act, const at::Tensor& w,
                               const std::optional<at::Tensor>& scale, const at::Tensor& x,
                               const at::Tensor& w_gate) {
   const int M = act.size(0), I = act.size(1), H = w.size(0), Kx = x.size(1);
-  TORCH_CHECK(M >= 1 && M <= kMaxM && act.scalar_type() == at::kHalf && act.is_contiguous(),
-              "rdna_se_down_gated: act must be contiguous fp16 [1..8, I]");
+  TORCH_CHECK((M >= 1 && M <= 8 || M == 16) && act.scalar_type() == at::kHalf && act.is_contiguous(),
+              "rdna_se_down_gated: act must be contiguous fp16 [1..8 or 16, I]");
   TORCH_CHECK(x.scalar_type() == at::kHalf && x.is_contiguous() && x.size(0) == M &&
                   Kx % 8 == 0, "rdna_se_down_gated: x must be fp16 [M, Kx], Kx % 8 == 0");
   TORCH_CHECK(w_gate.scalar_type() == at::kHalf && w_gate.is_contiguous() &&

@@ -1648,7 +1648,7 @@ def fused_experts(
         and not apply_router_weight_on_input
         and activation == MoEActivation.SILU
         and hidden_states.dtype == torch.float16
-        and hidden_states.shape[0] <= 8
+        and hidden_states.shape[0] <= 16
         and global_num_experts in (-1, w1.shape[0])
     ):
         # gfx1030 decode path: wave-per-row skinny GEMV pair (~432 GB/s

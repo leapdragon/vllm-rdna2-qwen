@@ -280,7 +280,7 @@ def rocm_unquantized_gemm_impl(
         and on_gfx10x()
         and x.dtype == torch.float16
         and weight.dtype == torch.float16
-        and 0 < n <= 8
+        and 0 < n <= 16
         and k % 8 == 0
         and weight.is_contiguous()
         and (bias is None or bias.is_contiguous())
