@@ -264,6 +264,23 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             )
 
             if _rocm_moe_skinny_available():
+                from vllm.model_executor.layers import rdna_ops
+
+                # M <= 2 with a shared expert offered by the runner: routed +
+                # shared in one kernel pair (rdna_ops.try_moe_v3).
+                if rdna_ops.try_moe_v3(
+                    hidden_states,
+                    w1,
+                    self.quant_config.w1_scale,
+                    w2,
+                    self.quant_config.w2_scale,
+                    topk_weights,
+                    topk_ids,
+                    output,
+                    self.block_shape[1],
+                    expert_map,
+                ):
+                    return
                 # gfx1030 decode path: wave-per-row skinny GEMV pair. Writes
                 # the fully topk-combined result into `output`, matching the
                 # invoke+moe_sum tail below.
@@ -701,6 +718,23 @@ class TritonWNA16Experts(TritonExperts):
             )
 
             if _rocm_moe_skinny_available():
+                from vllm.model_executor.layers import rdna_ops
+
+                # M <= 2 with a shared expert offered by the runner: routed +
+                # shared in one kernel pair (rdna_ops.try_moe_v3).
+                if rdna_ops.try_moe_v3(
+                    hidden_states,
+                    w1,
+                    self.quant_config.w1_scale,
+                    w2,
+                    self.quant_config.w2_scale,
+                    topk_weights,
+                    topk_ids,
+                    output,
+                    self.block_shape[1],
+                    expert_map,
+                ):
+                    return
                 # gfx1030 decode path: wave-per-row skinny GEMV pair. Writes
                 # the fully topk-combined result into `output`, matching the
                 # invoke+moe_sum tail below.

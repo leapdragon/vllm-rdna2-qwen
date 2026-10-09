@@ -12,6 +12,8 @@ decision in a custom op makes it a runtime choice on the real batch size.
   rdna_shared_expert shared expert (gate_up+silu*mul, down*sigmoid(gate)): 2 kernels / torch
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -164,3 +166,85 @@ direct_register_custom_op(
     mutates_args=[],
     fake_impl=_rdna_shared_expert_fake,
 )
+
+
+# ---------------------------------------------------------------- MoE v3: shared expert inside the routed pair
+# gfx1030 fork (2026-10-09): at M <= 2 the shared expert (gate_up+silu, down * sigmoid(gate)) runs inside the
+# routed int4 kernel pair (moe_decode_v3): 4 launches per MoE layer instead of 6, 71 -> 61.5 us/layer at M=1 in
+# bench/fused-moe. At M >= 3 the extra grid slice no longer hides and v2 + the separate shared expert is as fast
+# or faster, so the window stops at 2. VLLM_RDNA_MOE_V3=0 disables it.
+#
+# The MoE runner owns the shared expert and the routed kernel never sees it, so the hand-off is a one-slot
+# mailbox: the runner posts the shared expert's weights before the routed call (moe_v3_offer), the int4 skinny
+# hook takes them if every kernel precondition holds (try_moe_v3), and the runner falls back to the normal
+# shared-expert call if nobody did (moe_v3_taken). Both sides run inside the opaque moe_forward op, so this is
+# plain eager Python at capture time. The shared output is a fresh tensor written by the w2 kernel, never a
+# persistent buffer: the compiled graph may reuse the op's outputs as scratch once the add has consumed them.
+_MOE_V3 = os.environ.get("VLLM_RDNA_MOE_V3", "1") == "1"
+_MOE_V3_MAX = 2
+_moe_v3_slot: list = [None]
+
+
+def _v3_shared_weights(mlp):
+    """(se1, se1_s, se2, se2_s, gate_w) for a Qwen2MoeMLP with int8 shadows, else None (cached on the module)."""
+    cached = getattr(mlp, "_rdna_v3_weights", False)
+    if cached is not False:
+        return cached
+    out = None
+    g, d, e = (getattr(mlp, n, None) for n in ("gate_up_proj", "down_proj", "expert_gate"))
+    if g is not None and d is not None and e is not None:
+        ts = (getattr(g, "weight_i8", None), getattr(g, "weight_i8_scale", None),
+              getattr(d, "weight_i8", None), getattr(d, "weight_i8_scale", None), e.weight)
+        if (all(t is not None for t in ts) and getattr(e, "bias", None) is None
+                and all(getattr(m, "bias", None) is None for m in (g, d))
+                and ts[0].dim() == 2 and ts[2].dim() == 2 and ts[4].dtype == torch.float16
+                and ts[0].size(0) == 2 * ts[2].size(1)):
+            out = (ts[0].contiguous(), ts[1].reshape(-1).contiguous(), ts[2].contiguous(),
+                   ts[3].reshape(-1).contiguous(), ts[4].reshape(-1).contiguous())
+    mlp._rdna_v3_weights = out
+    return out
+
+
+def moe_v3_offer(mlp, x: torch.Tensor) -> bool:
+    """Runner side: post the shared expert for the routed kernel to fuse. False = run it normally."""
+    if not _MOE_V3 or x.dtype != torch.float16 or x.dim() != 2 or not 0 < x.size(0) <= _MOE_V3_MAX:
+        return False
+    if not x.is_contiguous() or x.data_ptr() % 16:
+        return False
+    w = _v3_shared_weights(mlp)
+    if w is None:
+        return False
+    _moe_v3_slot[0] = (x, w)
+    return True
+
+
+def moe_v3_taken() -> torch.Tensor | None:
+    """Runner side, after the routed call: the shared expert's output if the routed kernel computed it, None if
+    the offer was not taken (the caller runs the shared expert)."""
+    slot, _moe_v3_slot[0] = _moe_v3_slot[0], None
+    return slot if isinstance(slot, torch.Tensor) else None
+
+
+def try_moe_v3(x, w13, s13, w2, s2, topk_weights, topk_ids, output, group_size, expert_map) -> bool:
+    """Routed-kernel side: run moe_decode_v3 (routed into `output`, shared into a tensor left in the slot for the
+    runner) if a shared expert was offered for this input and the kernel takes these tensors."""
+    offer = _moe_v3_slot[0]
+    if not isinstance(offer, tuple) or offer[0].data_ptr() != x.data_ptr() or offer[0].shape != x.shape:
+        return False
+    if (topk_ids.dtype != torch.int32 or topk_weights.dtype != torch.float32 or group_size % 32
+            or not output.is_contiguous() or output.dtype != torch.float16
+            or (expert_map is not None and expert_map.dtype != torch.int32)
+            or not hasattr(torch.ops._rocm_C, "moe_decode_v3")):
+        return False
+    se1, se1_s, se2, se2_s, seg = offer[1]
+    M, topk, inter = x.size(0), topk_ids.size(1), w13.size(1) // 2
+    act = torch.empty((M, topk, inter), dtype=torch.float16, device=x.device)
+    act_sh = torch.empty((M, se2.size(1)), dtype=torch.float16, device=x.device)
+    sgate = torch.empty((M,), dtype=torch.float32, device=x.device)
+    shared = torch.empty_like(output)
+    torch.ops._rocm_C.moe_decode_v3(
+        x, topk_weights.contiguous(), topk_ids.contiguous(), w13, s13, w2, s2, group_size, expert_map,
+        se1, se1_s, se2, se2_s, seg, act, act_sh, sgate, shared, output,
+    )
+    _moe_v3_slot[0] = shared
+    return True

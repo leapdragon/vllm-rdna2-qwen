@@ -1148,6 +1148,240 @@ moe_w2_v2_(const half* __restrict__ act, const uint4* __restrict__ w2,
   }
 }
 
+__device__ __forceinline__ half2 rdna_i8x2_to_h2(int lo, int hi) {
+  return __floats2half2_rn((float)lo, (float)hi);
+}
+
+// ---------------------------------------------------------------------------
+// MoE decode v3 (2026-10-09): one decode MoE layer = router GEMV (gemv_i8) + topk_softmax + these two launches.
+//  w13_v3: routed gate_up+silu as v2 (ids from topk_softmax), plus extra blocks in the y == topk slice that
+//    compute the shared expert's gate_up+silu (int8 rows) and its sigmoid(w_gate . x).
+//    (A first version computed the top-k inside every block: ~15 us of serialised wave reductions per CU at
+//    M=1, 2.6x slower at M=8/16 than the separate topk_softmax launch it replaced.)
+//  w2_v3: routed down projection over the EP-local slots, and (into a second output) the shared expert's down
+//    row scaled by the sigmoid gate, so the shared expert's two launches disappear. The shared + routed add
+//    stays with the caller: a persistent zero stand-in for the shared output was reused by inductor as the
+//    add's output buffer (garbage decode in-server, 10-09).
+// Same numerics as topk_softmax(renormalize) + rdna_se_* + v2 within fp32 summation order.
+// ---------------------------------------------------------------------------
+// int8 row (K values, per-row scale applied by the caller) dot fp16 x, lanes striding 16-element chunks
+__device__ __forceinline__ float moe_v3_i8dot(const int8_t* __restrict__ w, const half* __restrict__ x, int K,
+                                              int lane) {
+  const uint4* wr = reinterpret_cast<const uint4*>(w);
+  const uint4* xr = reinterpret_cast<const uint4*>(x);
+  float a = 0.f;
+  for (int i = lane; i < K / 16; i += 32) {
+    const uint4 wq = wr[i];
+    const int32_t* q = reinterpret_cast<const int32_t*>(&wq);
+    const uint4 xa = xr[2 * i], xb = xr[2 * i + 1];
+    const half2* x0 = reinterpret_cast<const half2*>(&xa);
+    const half2* x1 = reinterpret_cast<const half2*>(&xb);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int32_t v = q[j];
+      const half2 lo = rdna_i8x2_to_h2((int8_t)(v & 0xff), (int8_t)((v >> 8) & 0xff));
+      const half2 hi = rdna_i8x2_to_h2((int8_t)((v >> 16) & 0xff), (int8_t)((v >> 24) & 0xff));
+      const half2* xx = j < 2 ? x0 : x1;
+      a = __builtin_amdgcn_fdot2(lo, xx[(j & 1) * 2], a, false);
+      a = __builtin_amdgcn_fdot2(hi, xx[(j & 1) * 2 + 1], a, false);
+    }
+  }
+  return a;
+}
+
+template <int WAVES>
+__global__ void __launch_bounds__(WAVES * 32)
+moe_w13_v3_(const half* __restrict__ input, const int32_t* __restrict__ ids_in,
+            const int32_t* __restrict__ expert_map,
+            const uint4* __restrict__ w13, const half* __restrict__ s13, half* __restrict__ act,
+            const int8_t* __restrict__ se1, const half* __restrict__ se1_s, const half* __restrict__ seg,
+            half* __restrict__ act_sh, float* __restrict__ sgate, const int I_sh,
+            const int K, const int N, const int topk, const int group_size) {
+  const int m = blockIdx.z, s = blockIdx.y;
+  const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const half* xm = input + (uint64_t)m * K;
+  if (s == topk) {  // shared-expert slice
+    const int nb = (I_sh + WAVES - 1) / WAVES;
+    if ((int)blockIdx.x < nb) {
+      const int i = blockIdx.x * WAVES + wave;
+      if (i >= I_sh) return;
+      const float g = moe_v3_i8dot(se1 + (uint64_t)i * K, xm, K, lane);
+      const float u = moe_v3_i8dot(se1 + (uint64_t)(I_sh + i) * K, xm, K, lane);
+      float gs = g, us = u;
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) { gs += __shfl_xor(gs, off); us += __shfl_xor(us, off); }
+      if (lane == 0) {
+        const float gg = gs * __half2float(se1_s[i]), uu = us * __half2float(se1_s[I_sh + i]);
+        act_sh[(uint64_t)m * I_sh + i] = __float2half(gg / (1.f + __expf(-gg)) * uu);
+      }
+    } else if ((int)blockIdx.x == nb && wave == 0) {
+      const uint4* xr = reinterpret_cast<const uint4*>(xm);
+      const uint4* wr = reinterpret_cast<const uint4*>(seg);
+      float a = 0.f;
+      for (int c = lane; c < K / 8; c += 32) {
+        const uint4 xv = xr[c], wv = wr[c];
+        const half2* xh = reinterpret_cast<const half2*>(&xv);
+        const half2* wh = reinterpret_cast<const half2*>(&wv);
+#pragma unroll
+        for (int j = 0; j < 4; j++) a = __builtin_amdgcn_fdot2(wh[j], xh[j], a, false);
+      }
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) a += __shfl_xor(a, off);
+      if (lane == 0) sgate[m] = 1.f / (1.f + __expf(-a));
+    }
+    return;
+  }
+  // negative ids (vLLM's padding slots) are not mapped: same guard as v2's moe_local_expert
+  const int expert = moe_local_expert(ids_in, false, expert_map, m * topk + s);
+  if (expert < 0) return;
+  const int n = blockIdx.x * WAVES + wave;
+  if (n >= N) return;
+  const int C = K / 32, CG = group_size / 32, KG = K / group_size;
+  const uint64_t rg = (uint64_t)expert * 2 * N + n, ru = rg + N;
+  const uint4* wg = w13 + rg * C;
+  const uint4* wu = w13 + ru * C;
+  const half* sg = s13 + rg * KG;
+  const half* su = s13 + ru * KG;
+  const uint4* x4 = reinterpret_cast<const uint4*>(xm);
+  constexpr int MAXC = 4;
+  uint4 qg[MAXC], qu[MAXC];
+#pragma unroll
+  for (int i = 0; i < MAXC; i++) {
+    const int c = lane + 32 * i;
+    if (c < C) { qg[i] = wg[c]; qu[i] = wu[c]; }
+  }
+  float accg = 0.f, accu = 0.f;
+#pragma unroll
+  for (int i = 0; i < MAXC; i++) {
+    const int c = lane + 32 * i;
+    if (c < C) {
+      const uint4* xc = x4 + c * 4;
+      const int g = c / CG;
+      accg += moe_v2_dot32(qg[i], xc) * __half2float(sg[g]);
+      accu += moe_v2_dot32(qu[i], xc) * __half2float(su[g]);
+    }
+  }
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) { accg += __shfl_xor(accg, off); accu += __shfl_xor(accu, off); }
+  if (lane == 0)
+    act[((uint64_t)m * topk + s) * N + n] = __float2half(accg / (1.f + __expf(-accg)) * accu);
+}
+
+template <int WAVES>
+__global__ void __launch_bounds__(WAVES * 32)
+moe_w2_v3_(const half* __restrict__ act, const uint4* __restrict__ w2, const half* __restrict__ s2,
+           const int32_t* __restrict__ ids, const float* __restrict__ tw, const int32_t* __restrict__ expert_map,
+           const int8_t* __restrict__ se2, const half* __restrict__ se2_s, const half* __restrict__ act_sh,
+           const float* __restrict__ sgate, const int I_sh, half* __restrict__ sh_out, half* __restrict__ out,
+           const int N, const int H, const int topk, const int group_size) {
+  const int m = blockIdx.z;
+  const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int h = blockIdx.x * WAVES + wave;
+  __shared__ int s_exp[32];
+  __shared__ int s_slot[32];
+  __shared__ float s_w[32];
+  __shared__ int s_nloc;
+  if (threadIdx.x < 32) {
+    int e = -1; float w = 0.f;
+    if (threadIdx.x < topk) {
+      e = moe_local_expert(ids, false, expert_map, m * topk + threadIdx.x);
+      if (e >= 0) w = tw[(uint64_t)m * topk + threadIdx.x];
+    }
+    const uint64_t mask = __ballot(e >= 0);
+    if (e >= 0) {
+      const int pos = __popcll(mask & ((1ull << threadIdx.x) - 1));
+      s_exp[pos] = e; s_slot[pos] = threadIdx.x; s_w[pos] = w;
+    }
+    if (threadIdx.x == 0) s_nloc = __popcll(mask);
+  }
+  __syncthreads();
+  if (h >= H) return;
+  const int nloc = s_nloc;
+  const int C = N / 32, CG = group_size / 32, NG = N / group_size;
+  float acc = 0.f;
+  const int total = nloc * C;
+  for (int base = 0; base < total; base += 32 * 4) {
+    uint4 q[4]; int ls[4], cs[4];
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int t = base + lane + 32 * u;
+      ls[u] = -1;
+      if (t < total) {
+        const int l = t / C, c = t - l * C;
+        q[u] = w2[((uint64_t)s_exp[l] * H + h) * C + c];
+        ls[u] = l; cs[u] = c;
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      if (ls[u] >= 0) {
+        const int l = ls[u], c = cs[u], e = s_exp[l];
+        const uint4* a4 = reinterpret_cast<const uint4*>(act + ((uint64_t)m * topk + s_slot[l]) * N) + c * 4;
+        const float sc = __half2float(s2[((uint64_t)e * H + h) * NG + c / CG]);
+        acc += moe_v2_dot32(q[u], a4) * sc * s_w[l];
+      }
+    }
+  }
+  // shared expert down row h: int8 [H, I_sh] . act_sh[m], scaled by the row scale and the sigmoid gate
+  // into its own output: the caller's shared + routed add stays as before (fp16 + fp16, same as the composite)
+  float sh = moe_v3_i8dot(se2 + (uint64_t)h * I_sh, act_sh + (uint64_t)m * I_sh, I_sh, lane);
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) { acc += __shfl_xor(acc, off); sh += __shfl_xor(sh, off); }
+  if (lane == 0) {
+    out[(uint64_t)m * H + h] = __float2half(acc);
+    sh_out[(uint64_t)m * H + h] = __float2half(sh * __half2float(se2_s[h]) * sgate[m]);
+  }
+}
+
+void moe_decode_v3(const at::Tensor& input, const at::Tensor& topk_weights, const at::Tensor& topk_ids,
+                   const at::Tensor& w13, const at::Tensor& w13_scale, const at::Tensor& w2,
+                   const at::Tensor& w2_scale, const int64_t group_size,
+                   const std::optional<at::Tensor>& expert_map, const at::Tensor& se1, const at::Tensor& se1_s,
+                   const at::Tensor& se2, const at::Tensor& se2_s, const at::Tensor& seg,
+                   at::Tensor& act_buf, at::Tensor& act_sh, at::Tensor& sgate_buf, at::Tensor& shared_out,
+                   at::Tensor& output) {
+  const int M = input.size(0), K = input.size(1), N = act_buf.size(2);
+  const int I_sh = act_sh.size(1), topk = topk_ids.size(1);
+  TORCH_CHECK(M >= 1 && M <= 16 && topk >= 1 && topk <= 32, "moe_decode_v3: M 1..16, topk <= 32");
+  TORCH_CHECK(topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous() && topk_weights.scalar_type() == at::kFloat &&
+                  topk_weights.is_contiguous() && topk_ids.size(0) == M, "moe_decode_v3: topk_ids int32, topk_weights fp32 [M, topk]");
+  TORCH_CHECK(K % 32 == 0 && N % 32 == 0 && K <= 4096 && group_size % 32 == 0 && K % group_size == 0 &&
+                  N % group_size == 0, "moe_decode_v3: shape constraints");
+  TORCH_CHECK(se1.scalar_type() == at::kChar && se1.size(0) == 2 * I_sh && se1.size(1) == K && se1.is_contiguous() &&
+                  se2.scalar_type() == at::kChar && se2.size(0) == K && se2.size(1) == I_sh && se2.is_contiguous() &&
+                  I_sh % 16 == 0 && I_sh <= 512, "moe_decode_v3: shared expert int8 weights [2I, K], [K, I], I % 16");
+  TORCH_CHECK(se1_s.scalar_type() == at::kHalf && se1_s.numel() == 2 * I_sh && se2_s.scalar_type() == at::kHalf &&
+                  se2_s.numel() == K && seg.scalar_type() == at::kHalf && seg.numel() == K && seg.is_contiguous(),
+              "moe_decode_v3: shared expert scales / gate");
+  TORCH_CHECK(input.scalar_type() == at::kHalf && input.is_contiguous() && output.is_contiguous() &&
+                  act_buf.is_contiguous() && act_sh.is_contiguous() && sgate_buf.scalar_type() == at::kFloat &&
+                  shared_out.is_contiguous() && shared_out.scalar_type() == at::kHalf && shared_out.numel() == output.numel(),
+              "moe_decode_v3: buffers");
+  for (const at::Tensor* t : std::initializer_list<const at::Tensor*>{&input, &act_buf, &act_sh, &w13, &w2, &se1, &se2, &seg})
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t->const_data_ptr()) % 16 == 0, "moe_decode_v3: 16-byte alignment");
+  const int32_t* emap = nullptr;
+  if (expert_map.has_value()) {
+    TORCH_CHECK(expert_map->scalar_type() == at::kInt && expert_map->is_contiguous(), "expert_map int32");
+    emap = reinterpret_cast<const int32_t*>(expert_map->const_data_ptr());
+  }
+  constexpr int WAVES = 8;
+  const int gx = std::max((N + WAVES - 1) / WAVES, (I_sh + WAVES - 1) / WAVES + 1);
+  const cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  auto H = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.const_data_ptr()); };
+  moe_w13_v3_<WAVES><<<dim3(gx, topk + 1, M), WAVES * 32, 0, st>>>(
+      H(input), topk_ids.data_ptr<int32_t>(), emap, reinterpret_cast<const uint4*>(w13.const_data_ptr()),
+      H(w13_scale), reinterpret_cast<half*>(act_buf.mutable_data_ptr()),
+      reinterpret_cast<const int8_t*>(se1.const_data_ptr()), H(se1_s), H(seg),
+      reinterpret_cast<half*>(act_sh.mutable_data_ptr()), sgate_buf.data_ptr<float>(), I_sh, K, N, topk,
+      (int)group_size);
+  moe_w2_v3_<WAVES><<<dim3((K + WAVES - 1) / WAVES, 1, M), WAVES * 32, 0, st>>>(
+      H(act_buf), reinterpret_cast<const uint4*>(w2.const_data_ptr()), H(w2_scale), topk_ids.data_ptr<int32_t>(),
+      topk_weights.data_ptr<float>(), emap, reinterpret_cast<const int8_t*>(se2.const_data_ptr()), H(se2_s), H(act_sh),
+      sgate_buf.data_ptr<float>(), I_sh, reinterpret_cast<half*>(shared_out.mutable_data_ptr()),
+      reinterpret_cast<half*>(output.mutable_data_ptr()), N, K, topk,
+      (int)group_size);
+}
+
 void moe_skinny_int4_decode_v2(
     const at::Tensor& input, const at::Tensor& w13, const at::Tensor& w13_scale,
     const at::Tensor& w2, const at::Tensor& w2_scale, const at::Tensor& topk_weights,
@@ -1340,9 +1574,6 @@ at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
 // the streamed bytes of the fp16 dense projections (T45). Per-output-channel symmetric
 // fp16 scale. lm_head/rank [62080x2560]: 640 us vs 1270 us fp16 in the harness.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ half2 rdna_i8x2_to_h2(int lo, int hi) {
-  return __floats2half2_rn((float)lo, (float)hi);
-}
 
 template <int WAVES, int MT>
 __global__ void __launch_bounds__(WAVES * 32)

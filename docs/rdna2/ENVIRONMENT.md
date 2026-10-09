@@ -135,8 +135,10 @@ projections, router, shared expert, hyper-connection mixers, output head) ship i
 |---|---|---|
 | `VLLM_RDNA_FUSED_HC` | `1` | The hyper-connection mix (the model's four residual branches) runs as one fused kernel in decode instead of several small ones. |
 | `VLLM_RDNA_FUSED_SE` | `1` | The shared-expert MLP runs as one fused decode kernel. |
+| `VLLM_RDNA_MOE_V2` | `1` | The routed-expert decode kernels (batches up to 16) use the v2 pair: 16-byte weight loads, no shared-memory staging, only the experts held on this rank do work. `0` restores v1. |
+| `VLLM_RDNA_MOE_V3` | `1` | At decode batches of 1–2, the shared expert is computed inside the routed-expert kernel pair instead of as its own launches. Larger batches use v2 + the separate shared expert, which is as fast there. |
 
-Both cut the number of kernel launches per decode step, which was a major cost on this chip.
+All of these cut kernel launches or wasted work per decode step; launch overhead was a major cost on this chip.
 
 ---
 

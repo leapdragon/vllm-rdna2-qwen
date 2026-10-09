@@ -20,6 +20,14 @@ PLE-offload verification at build time). The entrypoint is the serve script; wei
 `/models`. TheRock publishes no gfx103X torch wheels, and the 7.14 line has moved off AMD's current
 channels — the published base image is the durable artifact. See containers/README.md.
 
+**2026-10-09 — MoE decode kernels v2/v3, decode batches up to 16.** The routed-expert decode pair was
+rewritten (v2: 16-byte weight loads, no shared-memory activation staging, EP-local slot compaction) and the
+small-batch kernels (int8/fp16 GEMV, the fused glue ops) now take batches up to 16, so a 9–16-request decode
+step no longer falls off to Triton/rocBLAS. At batch 1–2 the shared expert is folded into the routed pair (v3).
+Per MoE layer at batch 1: 88 → 71 µs (v2) → 65 µs (v3). In the serving process: single-stream decode +3.6 %
+(v2) then +4.1 % (v3); 16 concurrent streams 134 → 266 tok/s aggregate. Greedy output identical to the
+previous kernels. Switches: `VLLM_RDNA_MOE_V2`, `VLLM_RDNA_MOE_V3` (ENVIRONMENT.md).
+
 ## How to see exactly what this fork changed (on GitHub)
 
 The branch has three layers, and GitHub's compare view can show each:
