@@ -42,6 +42,7 @@ _DB_SEQ, _DB_NTOK, _DB_NREQ = 4, 5, 6  # int32 slots of the done page (slot 0 = 
 _HOP_D2H, _HOP_SENT, _HOP_RECV, _HOP_LOOKUP, _HOP_PUB, _HOP_SEEN, _HOP_ENQ = 8, 9, 10, 11, 12, 13, 14
 _HOP_NAMES = ("d2h->sent", "sent->recv", "recv->lookup", "lookup->publish", "publish->seen", "seen->enqueued", "TOTAL d2h->enqueued")
 from vllm.model_executor.layers.ple_offload_layer import (
+    PLE_GPU_FLAG,
     CpuGpuSemaphore,
     PleOffloadLayer,
 )
@@ -522,7 +523,8 @@ class PleOffloadConnector:
             layer._gpu_output_buffer[:num_tokens].copy_(
                 self._out_bufs[name][:num_tokens], non_blocking=True
             )
-            layer._sem.signal(stream)
+            if PLE_GPU_FLAG:
+                layer._sem.signal(stream)
         t2 = time.perf_counter()
         self._t_launch += t1 - t0
         self._t_wait += t2 - t1
@@ -658,7 +660,8 @@ class PleOffloadConnector:
         stream = torch.cuda.current_stream(self.device)
         for layer in self._layers.values():
             layer._gpu_output_buffer[:num_tokens].zero_()
-            layer._sem.signal(stream)
+            if PLE_GPU_FLAG:
+                layer._sem.signal(stream)
 
     def release_outputs(self) -> None:
         """Mark GPU output buffers reusable after the model consumes them."""

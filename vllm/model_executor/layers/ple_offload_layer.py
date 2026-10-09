@@ -22,6 +22,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
 
+import os
+
 import torch
 from torch import nn
 
@@ -76,6 +78,14 @@ def _cuda_check(result: Any, operation: str) -> Any:
     if error.value != 0:
         raise RuntimeError(f"{operation} failed: {error}")
     return result
+
+
+# gfx1030 fork (2026-10-09): the GPU-side flag protocol (WriteValue32 signal before the forward, WaitValue32 in the
+# layer, WriteValue32 reset after it) is redundant since the connector waits for the lookup on the host and
+# enqueues the H2D copy on the model stream ahead of the forward (2026-08-30); HIP graphs never recorded the wait
+# anyway. It cost two stream-write ops plus driver calls per step, and a pending WaitValue32 is the packet KFD
+# cannot preempt (a lost GPU on this machine). PLE_OFFLOAD_GPU_FLAG=1 restores it.
+PLE_GPU_FLAG = os.getenv("PLE_OFFLOAD_GPU_FLAG", "0") == "1"
 
 
 class CpuGpuSemaphore:
@@ -268,11 +278,12 @@ class PleOffloadLayer(nn.Module, ABC):
     ) -> torch.Tensor:
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
-            torch.ops.vllm.ple_offload_wait(
-                self._sem.flag_tensor,
-                self._gpu_output_buffer,
-                hidden_states,
-            )
+            if PLE_GPU_FLAG:
+                torch.ops.vllm.ple_offload_wait(
+                    self._sem.flag_tensor,
+                    self._gpu_output_buffer,
+                    hidden_states,
+                )
             return self._gpu_output_buffer[: input_ids.shape[0]]
         return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
 
@@ -281,5 +292,5 @@ class PleOffloadLayer(nn.Module, ABC):
         stream: torch.cuda.Stream | None = None,
     ) -> None:
         """Mark the cross-process output buffer reusable on ``stream``."""
-        if self._is_cpu_offloaded:
+        if self._is_cpu_offloaded and PLE_GPU_FLAG:
             self._sem.reset(stream)
