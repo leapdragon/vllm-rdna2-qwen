@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -32,6 +33,20 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+
+# gfx1030 fork (2026-10-09): where the prompt's partial-tail prefix-cache entry is registered (fine-grained
+# hits, --prefix-match-unit). Upstream used the prompt's last match boundary, but a chat follow-up turn never
+# reuses the end of the previous prompt: the generation prompt (with thinking off, the empty think block
+# "<think>\n\n</think>\n\n", 4 tokens on Qwen) is re-rendered as the reply. Whenever prompt_len % unit was
+# below that, the entry sat past the divergence and the follow-up fell back a turn. Back off first.
+# VLLM_RDNA_PROMPT_TAIL_BACKOFF=0 restores upstream.
+_PROMPT_TAIL_BACKOFF = max(0, int(os.getenv("VLLM_RDNA_PROMPT_TAIL_BACKOFF", "4")))
+
+
+def prompt_tail_boundary(num_prompt_tokens: int, hash_block_size: int) -> int:
+    """Token count at which the prompt's partial-tail entry is registered (0 = none)."""
+    return max(num_prompt_tokens - _PROMPT_TAIL_BACKOFF, 0) // hash_block_size * hash_block_size
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -807,7 +822,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         block are intentionally skipped.
         """
         hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+        boundary_tokens = prompt_tail_boundary(request.num_prompt_tokens, hash_block_size)
         if boundary_tokens == 0 or boundary_tokens > num_tokens:
             return
         if boundary_tokens % self.block_size == 0:
@@ -1864,9 +1879,9 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         if num_tokens % hash_block_size != 0:
             return None
-        latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // hash_block_size
-        ) * hash_block_size
+        latest_prompt_hash_boundary = prompt_tail_boundary(
+            request.num_prompt_tokens, hash_block_size
+        )
         if num_tokens != latest_prompt_hash_boundary:
             return None
 

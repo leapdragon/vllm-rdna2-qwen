@@ -72,6 +72,8 @@ logger = init_logger(__name__)
 
 
 import os as _os
+
+from vllm.v1.core.single_type_kv_cache_manager import prompt_tail_boundary
 _RETENTION_STOPS = _os.getenv("VLLM_RDNA_MAMBA_RETENTION_STOPS", "1") == "1"
 _TAIL_STOP = _os.getenv("VLLM_RDNA_MAMBA_TAIL_STOP", "1") == "1"
 
@@ -489,12 +491,14 @@ class Scheduler(SchedulerInterface):
                 and self.hash_block_size < mbs
                 and self.kv_cache_manager.coordinator.enable_partial_hash_hits
             ):
-                tail = request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+                # the same boundary the Mamba manager registers (backed off past the generation prompt, see
+                # prompt_tail_boundary)
+                tail = prompt_tail_boundary(request.num_prompt_tokens, self.hash_block_size)
                 if tail == request.num_prompt_tokens:
-                    # a prompt ending exactly on a match boundary: the final prompt step ends there but registers
-                    # nothing (its state is mid-handoff to decode); keep the boundary one unit earlier instead
+                    # a prompt ending exactly on a match boundary (backoff 0): the final prompt step ends there but
+                    # registers nothing (its state is mid-handoff to decode); keep the boundary one unit earlier
                     tail -= self.hash_block_size
-                if tail % mbs != 0 and start < tail < request.num_prompt_tokens:
+                if tail > 0 and tail % mbs != 0 and start < tail < request.num_prompt_tokens:
                     retention_stops = retention_stops + (tail,)
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
