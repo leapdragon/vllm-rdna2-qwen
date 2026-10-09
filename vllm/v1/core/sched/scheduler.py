@@ -73,6 +73,7 @@ logger = init_logger(__name__)
 
 import os as _os
 _RETENTION_STOPS = _os.getenv("VLLM_RDNA_MAMBA_RETENTION_STOPS", "1") == "1"
+_TAIL_STOP = _os.getenv("VLLM_RDNA_MAMBA_TAIL_STOP", "1") == "1"
 
 
 class Scheduler(SchedulerInterface):
@@ -476,6 +477,25 @@ class Scheduler(SchedulerInterface):
                     t += per
             if block_size < mbs:        # equal sizes: upstream's aligned chunk ends already suffice
                 retention_stops = tuple((t + 1) * mbs for t in targets)
+            # gfx1030 fork, 2026-10-09 (turn-boundary state): with --prefix-match-unit finer than the Mamba
+            # block, the Mamba manager registers a partial-tail entry -- the state at the prompt's last
+            # prefix-match boundary, inside its block -- iff a step ends exactly there, so a follow-up turn can
+            # resume within one match unit of the previous prompt's end instead of at its last full block
+            # (<= 783 tokens recomputed per turn at a 784 block, <= 1567 with int8 KV). Upstream adds that stop
+            # only when it lies past `last_cache_position`, computed in the 4-token scheduler unit here, so it
+            # never fired. VLLM_RDNA_MAMBA_TAIL_STOP=0 disables.
+            if (
+                _TAIL_STOP
+                and self.hash_block_size < mbs
+                and self.kv_cache_manager.coordinator.enable_partial_hash_hits
+            ):
+                tail = request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+                if tail == request.num_prompt_tokens:
+                    # a prompt ending exactly on a match boundary: the final prompt step ends there but registers
+                    # nothing (its state is mid-handoff to decode); keep the boundary one unit earlier instead
+                    tail -= self.hash_block_size
+                if tail % mbs != 0 and start < tail < request.num_prompt_tokens:
+                    retention_stops = retention_stops + (tail,)
         tail_boundary = (
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit
