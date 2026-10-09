@@ -36,6 +36,14 @@ whole decode step taken inside the serving process (about 1450 launches) led to 
 longer copied after every MoE layer, and the hyper-connection down projection uses a split-K GEMV. Together they give
 +1.3 % single-stream decode.
 
+**2026-10-09 — follow-up turns resume at the previous prompt's end.** On this hybrid model a follow-up turn
+could only resume at the previous prompt's last full 784-token block, so it recomputed up to 783 tokens of
+history (1567 with int8 KV) before its own message. Upstream's fine-grained prefix hits (`--prefix-match-unit`)
+save a "partial tail" state inside a block, but the scheduler never ended a step there on this model. The fork
+adds that stop and places the tail 4 tokens before the prompt end, past the generation prompt that the next turn
+re-renders. With `--prefix-match-unit 16`, follow-ups recompute ~50–90 tokens. Resumed output matches a full
+recompute to within run-to-run noise.
+
 ## How to see exactly what this fork changed (on GitHub)
 
 The branch has three layers, and GitHub's compare view can show each:

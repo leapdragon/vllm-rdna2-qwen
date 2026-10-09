@@ -145,7 +145,15 @@ K/V cache as int8 with one fp32 scale per token and head (absmax/127). This abou
 capacity at unchanged decode and prefill speed: on 4 × V620 at `GPUUTIL=0.93`, 482k → 939k tokens. Needle retrieval
 at 32k/64k was unchanged (10/10), and greedy output stays within near-tie noise of the fp16 cache. The QSA indexer
 caches stay fp16; they are about 3 % of the per-token bytes. gfx1030 has no fp8 hardware, so use int8 rather than
-the fp8 cache types. Changing the flag changes the compile cache key, so expect one cold boot. Trade-off: the hybrid model's shared block size is set so an attention page holds at least one Mamba state, so
+the fp8 cache types. Changing the flag changes the compile cache key, so expect one cold boot.
+
+**Turn-boundary prefix hits (`--prefix-match-unit 16`).** Recommended for chat and agent use. Prefix-cache keys
+are then computed every 16 tokens instead of every 784-token block. Together with the scheduler tail stop above,
+each prompt saves its linear-attention state just before its generation prompt. A follow-up turn then
+recomputes only its new message plus a few template tokens: about 50–90 tokens. Before, it was up to one
+block, ≤ 783 tokens, or ≤ 1567 with int8 KV. On 4 × V620 that took follow-up TTFT from 0.3–1.5 s to 0.4–0.6 s,
+with no decode cost. The value must divide 784 and be a multiple of 4, the QSA indexer's compression ratio;
+it does not change the compile key. Trade-off: the hybrid model's shared block size is set so an attention page holds at least one Mamba state, so
 halving the bytes per token doubles the block (784 → 1568 tokens). Prefix-cache hits on follow-up turns are then 2×
 coarser, and up to ~1.5k tokens of a cached conversation are recomputed per turn instead of ~0.8k.
 
@@ -171,6 +179,8 @@ Any `VLLM_RDNA_QSA_*` override is logged as a warning at startup.
 | Variable | Default | Meaning |
 |---|---|---|
 | `VLLM_RDNA_MAMBA_RETENTION_STOPS` | `1` | End prefill steps exactly at the ends of the linear-attention state blocks (784 tokens) that the prefix cache retains. The saved state is only exact when a step ends on a block boundary. Without this, a follow-up turn on a long conversation could re-prefill tens of thousands of tokens (e.g. 31 s instead of seconds to first token). |
+| `VLLM_RDNA_MAMBA_TAIL_STOP` | `1` | With `--prefix-match-unit`, also end a prefill step at the prompt's last match boundary. The partial-tail state saved there is what lets a follow-up turn resume within a few tokens of the previous prompt's end, instead of at its last full 784-token block. Without `--prefix-match-unit` it does nothing. |
+| `VLLM_RDNA_PROMPT_TAIL_BACKOFF` | `4` | How many tokens before the prompt end the partial-tail state is placed. A chat follow-up re-renders the previous generation prompt (Qwen's empty think block is 4 tokens), so a state saved at the very end would sit past where the next prompt diverges. `0` restores upstream. |
 
 ---
 
