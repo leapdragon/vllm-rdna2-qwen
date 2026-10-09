@@ -145,7 +145,9 @@ K/V cache as int8 with one fp32 scale per token and head (absmax/127). This abou
 capacity at unchanged decode and prefill speed: on 4 × V620 at `GPUUTIL=0.93`, 482k → 939k tokens. Needle retrieval
 at 32k/64k was unchanged (10/10), and greedy output stays within near-tie noise of the fp16 cache. The QSA indexer
 caches stay fp16; they are about 3 % of the per-token bytes. gfx1030 has no fp8 hardware, so use int8 rather than
-the fp8 cache types. Changing the flag changes the compile cache key, so expect one cold boot.
+the fp8 cache types. Changing the flag changes the compile cache key, so expect one cold boot. Trade-off: the hybrid model's shared block size is set so an attention page holds at least one Mamba state, so
+halving the bytes per token doubles the block (784 → 1568 tokens). Prefix-cache hits on follow-up turns are then 2×
+coarser, and up to ~1.5k tokens of a cached conversation are recomputed per turn instead of ~0.8k.
 
 ---
 
