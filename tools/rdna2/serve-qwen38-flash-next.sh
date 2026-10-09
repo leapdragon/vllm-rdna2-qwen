@@ -225,4 +225,8 @@ if [ "${DRYRUN:-0}" = "1" ]; then
   printf '%q ' "${CMD[@]}"; echo
   exit 0
 fi
-exec "${CMD[@]}"
+# VLLM_SERVE_PREFIX: an optional wrapper for profiling runs, e.g.
+#   VLLM_SERVE_PREFIX="rocprofv3 --kernel-trace -f csv -d /path/out -P 420:4:1 --"
+# (rocprofv3 follows the spawned workers; -P collects one 4 s window 420 s after start). Unset = no wrapper.
+# shellcheck disable=SC2086
+exec ${VLLM_SERVE_PREFIX:-} "${CMD[@]}"

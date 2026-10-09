@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1341,7 +1342,14 @@ class FusedMoEKernelModularImpl:
         if current_platform.is_rocm():
             from vllm._aiter_ops import rocm_aiter_ops
 
-            if use_output_alias and rocm_aiter_ops.is_fused_moe_enabled():
+            # gfx1030 fork (2026-10-09): the alias is as safe for the Triton / skinny int4 experts as it is on
+            # CUDA (output_alias is a fresh empty_like and the shapes match), and it saves one device copy per
+            # MoE layer per step (48 launches per decode step on Qwen3.8-Flash-Next). VLLM_RDNA_MOE_ALIAS=0
+            # restores the aiter-only gate.
+            if use_output_alias and (
+                rocm_aiter_ops.is_fused_moe_enabled()
+                or os.environ.get("VLLM_RDNA_MOE_ALIAS", "1") == "1"
+            ):
                 fused_out = output_alias
         elif use_output_alias:
             fused_out = output_alias
