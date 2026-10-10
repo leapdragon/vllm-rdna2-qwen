@@ -1,0 +1,14 @@
+# Pinned source builds for gfx1030 (pip constraints; exact local versions). Do not upgrade casually.
+#
+# Triton: upstream dropped RDNA1/RDNA2 target support on 2026-09-30 (triton-lang/triton PR #12042: gfx1030 becomes an
+# "unknown" ISA family, its buffer-op / isRDNA / shared-tile predicates removed). ROCm/triton syncs from upstream, so
+# a newer Triton changes the code generated for every custom kernel in this fork (QSA, MoE W4A8, W8A8, GDN, and the
+# num_stages=1 tuning) or stops supporting the target. This build is ROCm/triton release/internal/3.7.x @ f0b55c0,
+# built by tools/rdna2/build-torch-rocm714.sh (TRITON_REF) and by containers/Dockerfile.base (same ref).
+# torch / torchvision are pinned with it: upgrading torch from an index pulls in a different Triton.
+#
+# Used by: the host venv's pip.conf (`constraint = <this file>`), and tools/rdna2/serve-qwen38-flash-next.sh, which
+# refuses to start when the installed Triton differs (override: ALLOW_TRITON_DRIFT=1).
+triton==3.7.1+gitf0b55c07
+torch==2.12.0+git6bbd260
+torchvision==0.27.1+df56172

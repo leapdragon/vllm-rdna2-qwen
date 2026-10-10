@@ -44,6 +44,12 @@ adds that stop and places the tail 4 tokens before the prompt end, past the gene
 re-renders. With `--prefix-match-unit 16`, follow-ups recompute ~50–90 tokens. Resumed output matches a full
 recompute to within run-to-run noise.
 
+**2026-10-09 — Triton pinned.** Upstream Triton removed RDNA1/RDNA2 target support (triton-lang/triton #12042,
+2026-09-30): gfx1030 becomes an unknown ISA family. Every custom kernel here (QSA, W4A8 MoE, W8A8, GDN) is Triton,
+so `tools/rdna2/constraints-gfx1030.txt` pins the validated source builds: Triton 3.7.1 (ROCm/triton @ f0b55c0), and
+torch and torchvision with it. Use it as a pip constraint (the host venv's `pip.conf` does). The serve script refuses
+to start on any other Triton unless `ALLOW_TRITON_DRIFT=1`. Container images already build that exact ref.
+
 ## How to see exactly what this fork changed (on GitHub)
 
 The branch has three layers, and GitHub's compare view can show each:

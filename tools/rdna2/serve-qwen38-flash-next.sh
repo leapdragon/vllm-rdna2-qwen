@@ -205,6 +205,19 @@ if [[ " ${EXTRA_ARGS:-} " == *" --kv-offloading-size "* ]]; then
   fi
 fi
 
+# Triton pin (2026-10-09): upstream Triton dropped gfx1030 (triton-lang/triton #12042). Refuse to start on a
+# Triton other than the validated build in tools/rdna2/constraints-gfx1030.txt -- a newer one changes every custom
+# kernel's codegen. ALLOW_TRITON_DRIFT=1 overrides (for deliberate Triton experiments).
+_tpin=$(sed -n 's/^triton==//p' "$(dirname "$0")/constraints-gfx1030.txt" 2>/dev/null)
+_tnow=$(python3 -c 'import triton; print(triton.__version__)' 2>/dev/null || true)
+_tdist=$(python3 -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || true)
+if [ -n "$_tpin" ] && [ "$_tdist" != "$_tpin" ]; then
+  echo "ERROR: installed Triton is '${_tdist:-none}' (${_tnow:-?}); the validated gfx1030 build is $_tpin." >&2
+  echo "  Upstream Triton no longer supports gfx1030; reinstall the pinned wheel (tools/rdna2/build-torch-rocm714.sh)" >&2
+  echo "  or set ALLOW_TRITON_DRIFT=1 to run anyway." >&2
+  [ "${ALLOW_TRITON_DRIFT:-0}" = "1" ] || exit 1
+fi
+
 CMD=(python3 -m vllm.entrypoints.openai.api_server
   --model "$MODEL" --served-model-name qwen38-flash-next
   --dtype float16

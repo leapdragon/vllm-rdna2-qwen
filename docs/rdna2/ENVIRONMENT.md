@@ -181,6 +181,7 @@ Any `VLLM_RDNA_QSA_*` override is logged as a warning at startup.
 | `VLLM_RDNA_MAMBA_RETENTION_STOPS` | `1` | End prefill steps exactly at the ends of the linear-attention state blocks (784 tokens) that the prefix cache retains. The saved state is only exact when a step ends on a block boundary. Without this, a follow-up turn on a long conversation could re-prefill tens of thousands of tokens (e.g. 31 s instead of seconds to first token). |
 | `VLLM_RDNA_MAMBA_TAIL_STOP` | `1` | With `--prefix-match-unit`, also end a prefill step at the prompt's last match boundary. The partial-tail state saved there is what lets a follow-up turn resume within a few tokens of the previous prompt's end, instead of at its last full 784-token block. Without `--prefix-match-unit` it does nothing. |
 | `VLLM_RDNA_PROMPT_TAIL_BACKOFF` | `4` | How many tokens before the prompt end the partial-tail state is placed. A chat follow-up re-renders the previous generation prompt (Qwen's empty think block is 4 tokens), so a state saved at the very end would sit past where the next prompt diverges. `0` restores upstream. |
+| `ALLOW_TRITON_DRIFT` | `0` | The serve script refuses to start unless the installed Triton is the pinned gfx1030 build in `tools/rdna2/constraints-gfx1030.txt`. Upstream Triton dropped RDNA2 targets on 2026-09-30, so a newer Triton changes how every custom kernel is compiled. Set `1` only for deliberate Triton experiments. |
 
 ---
 
