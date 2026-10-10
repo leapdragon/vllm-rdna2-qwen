@@ -597,9 +597,29 @@ def filter_duplicate_safetensors_files(
     hf_weights_files_set = set(hf_weights_files)
     missing_files = weight_files_in_index - hf_weights_files_set
     if missing_files:
-        raise FileNotFoundError(
-            f"Weight files referenced in index but missing: {missing_files}"
-        )
+        # When the n-gram PLE table is served from the quantized sidecar
+        # (VLLM_PLE_CPU_OFFLOAD + VLLM_PLE_QUANT_DIR), its checkpoint shard is
+        # intentionally not downloaded; the index still references it. Drop a
+        # missing file only when every weight it holds is a PLE n-gram shard.
+        if envs.VLLM_PLE_CPU_OFFLOAD and envs.VLLM_PLE_QUANT_DIR:
+            ple_marker = "ple.ple_embedding.ngram_embedding.shard_"
+            file_to_weights: dict[str, list[str]] = {}
+            for weight_name, file_name in weight_map.items():
+                file_to_weights.setdefault(
+                    os.path.join(hf_folder, file_name), []
+                ).append(weight_name)
+            droppable = {
+                f
+                for f in missing_files
+                if all(ple_marker in w for w in file_to_weights[f])
+            }
+            for dropped_file in droppable:
+                weight_files_in_index.discard(dropped_file)
+            missing_files = missing_files - droppable
+        if missing_files:
+            raise FileNotFoundError(
+                f"Weight files referenced in index but missing: {missing_files}"
+            )
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
